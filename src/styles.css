@@ -1,0 +1,22 @@
+.screen-stack {
+  display: grid;
+  gap: var(--gap-4);
+  padding: var(--pad-panel);
+}
+
+.hero-panel {
+  display: grid;
+  gap: var(--gap-2);
+  padding: 22px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.hero-panel h2 {
+  margin: 0;
+  font-size: 28px;
+  line-height: 1.15;
+  letter-spacing: -0.03em;
+}
