@@ -1,0 +1,34 @@
+{
+  "name": "chatworks",
+  "private": true,
+  "version": "0.1.0",
+  "description": "SceneWorks-styled local LLM serving desktop app.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "lint": "eslint src",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build"
+  },
+  "dependencies": {
+    "@sceneworks/ui": "0.2.0",
+    "@tauri-apps/api": "^2",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.4",
+    "@tauri-apps/cli": "^2",
+    "@vitejs/plugin-react": "4.7.0",
+    "eslint": "^9.39.4",
+    "eslint-plugin-react": "^7.37.5",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "globals": "^17.6.0",
+    "vite": "^6.4.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
