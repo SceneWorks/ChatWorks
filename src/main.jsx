@@ -507,6 +507,9 @@ function ModelsScreen() {
   const [tokenInput, setTokenInput] = useState("");
   const [progress, setProgress] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [cacheBusy, setCacheBusy] = useState(false);
+  const [cachedModels, setCachedModels] = useState([]);
+  const [adoptingPath, setAdoptingPath] = useState("");
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null);
   const [loadingId, setLoadingId] = useState("");
@@ -561,6 +564,41 @@ function ModelsScreen() {
       setError(String(cause));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function handleScanCache() {
+    if (cacheBusy) return;
+    setCacheBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const models = await invoke("list_cached_hf_models");
+      setCachedModels(models);
+      setNotice(models.length ? `Found ${models.length} supported cached model${models.length === 1 ? "" : "s"}.` : "No supported cached HuggingFace models found.");
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setCacheBusy(false);
+    }
+  }
+
+  async function handleAdoptCached(candidate) {
+    if (adoptingPath) return;
+    setAdoptingPath(candidate.localPath);
+    setError(null);
+    setNotice(null);
+    const option = QUANTIZE_OPTIONS.find((item) => item.id === quantizeId) ?? QUANTIZE_OPTIONS[0];
+    try {
+      const next = await invoke("adopt_cached_hf_model", {
+        request: { localPath: candidate.localPath, quantize: option.value },
+      });
+      setRegistry(next);
+      setNotice(`${candidate.name} added from the HuggingFace cache.`);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setAdoptingPath("");
     }
   }
 
@@ -670,6 +708,47 @@ function ModelsScreen() {
         {error ? <p className="form-error" role="alert">{error}</p> : null}
         {notice ? <p className="form-notice">{notice}</p> : null}
       </form>
+
+      <div className="panel">
+        <div className="panel-head">
+          <p className="eyebrow">Cache</p>
+          <h2>Adopt cached HuggingFace models</h2>
+          <p className="view-copy">
+            Scan your local HuggingFace cache and add supported snapshots to ChatWorks without downloading them again.
+          </p>
+        </div>
+        <div className="panel-actions">
+          <button className="ghost-btn" disabled={cacheBusy} onClick={handleScanCache} type="button">
+            {cacheBusy ? "Scanning…" : "Scan HuggingFace cache"}
+          </button>
+        </div>
+        {cachedModels.length ? (
+          <ul className="model-list">
+            {cachedModels.map((model) => {
+              const alreadyRegistered = registry.models.some((entry) => entry.localPath === model.localPath);
+              return (
+                <li className="model-row" key={model.localPath}>
+                  <div className="model-row-main">
+                    <span className="model-row-name">{model.name}</span>
+                    <span className="model-row-meta">
+                      {model.repo} · {model.providerFamily} · {model.supportsVision ? "Vision" : "Text"}
+                    </span>
+                  </div>
+                  <span className="model-row-meta">{formatBytes(model.sizeBytes)}</span>
+                  <button
+                    className="ghost-btn"
+                    disabled={Boolean(adoptingPath) || alreadyRegistered}
+                    onClick={() => handleAdoptCached(model)}
+                    type="button"
+                  >
+                    {alreadyRegistered ? "Registered" : adoptingPath === model.localPath ? "Adding…" : "Add"}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        ) : null}
+      </div>
 
       <div className="panel">
         <div className="panel-head">

@@ -9,11 +9,13 @@ use chatworks::engine::{
     EngineHandle, EngineStatus, GenerateRequest, GenerateResponse, LoadModelRequest,
 };
 use chatworks::model_registry::{
-    clear_hf_token as clear_hf_token_inner, hf_token_status as hf_token_status_inner,
-    import_hf_model as import_hf_model_inner,
+    adopt_cached_hf_model as adopt_cached_hf_model_inner, clear_hf_token as clear_hf_token_inner,
+    hf_token_status as hf_token_status_inner, import_hf_model as import_hf_model_inner,
+    list_cached_hf_models as list_cached_hf_models_inner,
     list_registered_models as list_registered_models_inner,
     load_registered_model as load_registered_model_inner, set_hf_token as set_hf_token_inner,
-    HfTokenStatus, ImportHfModelRequest, ModelRegistry, SetHfTokenRequest,
+    AdoptCachedModelRequest, CachedModelCandidate, HfTokenStatus, ImportHfModelRequest,
+    ModelRegistry, SetHfTokenRequest,
 };
 use chatworks::server::{OpenAiServerConfig, OpenAiServerHandle, OpenAiServerStatus};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -129,6 +131,19 @@ async fn import_hf_model(
 }
 
 #[tauri::command]
+fn list_cached_hf_models() -> Result<Vec<CachedModelCandidate>, String> {
+    list_cached_hf_models_inner()
+}
+
+#[tauri::command]
+fn adopt_cached_hf_model(
+    app: AppHandle,
+    request: AdoptCachedModelRequest,
+) -> Result<ModelRegistry, String> {
+    adopt_cached_hf_model_inner(&app, request)
+}
+
+#[tauri::command]
 fn load_registered_model(
     app: AppHandle,
     engine: State<'_, EngineHandle>,
@@ -205,6 +220,8 @@ fn main() {
             api_auth_token,
             list_registered_models,
             import_hf_model,
+            list_cached_hf_models,
+            adopt_cached_hf_model,
             load_registered_model,
             hf_token_status,
             set_hf_token,
