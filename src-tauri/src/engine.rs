@@ -22,7 +22,7 @@ impl EngineHandle {
         Self::spawn_with_loader(load_for_model)
     }
 
-    fn spawn_with_loader(loader: Loader) -> Self {
+    pub(crate) fn spawn_with_loader(loader: Loader) -> Self {
         let (tx, rx) = mpsc::channel();
         thread::Builder::new()
             .name("chatworks-engine".to_string())
