@@ -211,6 +211,7 @@ pub fn load_registered_model(
         .find(|model| model.id == model_id)
         .cloned()
         .ok_or_else(|| format!("model {model_id:?} is not in the registry"))?;
+    validate_snapshot(Path::new(&entry.local_path))?;
     let status = engine.load_model(LoadModelRequest {
         source: entry.local_path.clone(),
         display_name: Some(entry.name.clone()),
@@ -306,11 +307,13 @@ async fn import_hf_model_inner(
                     total_bytes,
                 },
             );
+            validate_config_file_if_available(&snapshot_dir, &file.rfilename)?;
             continue;
         }
         download
             .download_file(file, &target, &mut downloaded_bytes)
             .await?;
+        validate_config_file_if_available(&snapshot_dir, &file.rfilename)?;
     }
 
     emit_progress(
@@ -556,11 +559,40 @@ fn validate_snapshot(path: &Path) -> Result<(), String> {
     if !has_safetensors {
         return Err("downloaded snapshot is missing safetensors weights".to_string());
     }
+    validate_text_snapshot_config(path)
+}
+
+fn validate_config_file_if_available(snapshot_dir: &Path, file_name: &str) -> Result<(), String> {
+    if file_name == "config.json" {
+        validate_text_snapshot_config(snapshot_dir)?;
+    }
+    Ok(())
+}
+
+fn validate_text_snapshot_config(path: &Path) -> Result<(), String> {
+    let config_path = path.join("config.json");
+    let body = fs::read_to_string(config_path).map_err(|error| error.to_string())?;
+    let config =
+        serde_json::from_str::<serde_json::Value>(&body).map_err(|error| error.to_string())?;
+    if config.get("vision_config").is_some() && !is_joycaption_config(&config) {
+        let model_type = config
+            .get("model_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        return Err(format!(
+            "unsupported model type {model_type}: this multimodal/VLM snapshot is not supported by the linked MLX providers"
+        ));
+    }
     Ok(())
 }
 
 fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, String> {
-    validate_snapshot(path)?;
+    if let Err(error) = validate_snapshot(path) {
+        if error.starts_with("unsupported model type ") {
+            return Ok(None);
+        }
+        return Err(error);
+    }
     let Some((repo, revision)) = parse_hf_cache_snapshot(path) else {
         return Ok(None);
     };
@@ -602,6 +634,10 @@ fn is_joycaption_snapshot(path: &Path) -> Result<bool, String> {
     let body = fs::read_to_string(path.join("config.json")).map_err(|error| error.to_string())?;
     let config =
         serde_json::from_str::<serde_json::Value>(&body).map_err(|error| error.to_string())?;
+    Ok(is_joycaption_config(&config))
+}
+
+fn is_joycaption_config(config: &serde_json::Value) -> bool {
     let architecture = config
         .get("architectures")
         .and_then(|value| value.as_array())
@@ -614,7 +650,7 @@ fn is_joycaption_snapshot(path: &Path) -> Result<bool, String> {
         .and_then(|value| value.as_str())
         .unwrap_or_default()
         .to_lowercase();
-    Ok(architecture.contains("llava") || model_type.contains("llava"))
+    architecture.contains("llava") || model_type.contains("llava")
 }
 
 fn hf_cache_dirs() -> Vec<PathBuf> {
@@ -890,6 +926,53 @@ mod tests {
     }
 
     #[test]
+    fn accepts_text_only_snapshot_config() {
+        let dir = snapshot_dir("text-only");
+        write_snapshot_file(
+            &dir,
+            "config.json",
+            r#"{"model_type":"qwen3","hidden_size":8}"#,
+        );
+        write_snapshot_file(&dir, "tokenizer.json", "{}");
+        write_snapshot_file(&dir, "model.safetensors", "weights");
+
+        assert!(validate_snapshot(&dir).is_ok());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_multimodal_snapshot_config() {
+        let dir = snapshot_dir("multimodal");
+        write_snapshot_file(
+            &dir,
+            "config.json",
+            r#"{"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text"},"vision_config":{"model_type":"qwen3_5"}}"#,
+        );
+        write_snapshot_file(&dir, "tokenizer.json", "{}");
+        write_snapshot_file(&dir, "model.safetensors", "weights");
+
+        let error = validate_snapshot(&dir).unwrap_err();
+        assert!(error.contains("unsupported model type qwen3_5"));
+        assert!(error.contains("not supported by the linked MLX providers"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn accepts_joycaption_snapshot_config() {
+        let dir = snapshot_dir("joycaption");
+        write_snapshot_file(
+            &dir,
+            "config.json",
+            r#"{"architectures":["LlavaForConditionalGeneration"],"model_type":"llava","text_config":{"model_type":"llama","hidden_size":8},"vision_config":{"hidden_size":8}}"#,
+        );
+        write_snapshot_file(&dir, "tokenizer.json", "{}");
+        write_snapshot_file(&dir, "model.safetensors", "weights");
+
+        assert!(validate_snapshot(&dir).is_ok());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn parses_hf_cache_snapshot_paths() {
         let path = PathBuf::from(
             "/tmp/hub/models--fancyfeast--llama-joycaption-beta-one-hf-llava/snapshots/abc123",
@@ -1004,5 +1087,9 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn write_snapshot_file(dir: &Path, name: &str, body: &str) {
+        fs::write(dir.join(name), body).unwrap();
     }
 }
