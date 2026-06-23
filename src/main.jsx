@@ -11,6 +11,7 @@ import {
   ErrorBoundary,
   Icon,
   Logo,
+  Markdown,
   StatusDot,
 } from "@sceneworks/ui";
 import "./styles.css";
@@ -122,11 +123,308 @@ function EmptyScreen({ eyebrow, title, children }) {
   );
 }
 
-function ChatScreen() {
+const DEFAULT_CHAT_PARAMS = {
+  systemPrompt: "You are a helpful local assistant.",
+  temperature: "0.7",
+  topP: "0.9",
+  maxTokens: "512",
+  disableThinking: true,
+};
+
+function buildLocalApiBase(serverStatus) {
+  if (!serverStatus?.running) return "http://127.0.0.1:8000";
+  const host = serverStatus.host === "0.0.0.0" || serverStatus.host === "::" ? "127.0.0.1" : serverStatus.host;
+  return `http://${host}:${serverStatus.port}`;
+}
+
+function supportsThinking(engineStatus) {
+  return engineStatus?.loaded?.provider?.capabilities?.supports_thinking === true;
+}
+
+function stripThinkBlocks(value) {
+  return value.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<think>[\s\S]*$/i, "").trimStart();
+}
+
+function parseNumber(value) {
+  if (value === "") return undefined;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : undefined;
+}
+
+function readSseMessages(buffer, onData) {
+  let remaining = buffer;
+  let index = remaining.indexOf("\n\n");
+  while (index >= 0) {
+    const rawEvent = remaining.slice(0, index);
+    remaining = remaining.slice(index + 2);
+    const data = rawEvent
+      .split("\n")
+      .filter((line) => line.startsWith("data:"))
+      .map((line) => line.slice(5).trim())
+      .join("\n");
+    if (data) onData(data);
+    index = remaining.indexOf("\n\n");
+  }
+  return remaining;
+}
+
+function chatRequestBody({ engineStatus, messages, params, thinkingCapable }) {
+  const requestMessages = [];
+  if (params.systemPrompt.trim()) {
+    requestMessages.push({ role: "system", content: params.systemPrompt.trim() });
+  }
+  requestMessages.push(...messages.map(({ role, content }) => ({ role, content })));
+  const body = {
+    model: engineStatus?.loaded?.name ?? "chatworks",
+    messages: requestMessages,
+    stream: true,
+  };
+  const temperature = parseNumber(params.temperature);
+  const topP = parseNumber(params.topP);
+  const maxTokens = parseNumber(params.maxTokens);
+  if (temperature !== undefined) body.temperature = temperature;
+  if (topP !== undefined) body.top_p = topP;
+  if (maxTokens !== undefined) body.max_tokens = maxTokens;
+  if (thinkingCapable) body.disable_thinking = params.disableThinking;
+  return body;
+}
+
+function MessageContent({ content, thinking, stripThinking }) {
+  const visibleContent = stripThinking ? stripThinkBlocks(content) : content;
+  if (!visibleContent.trim()) return <p className="thinking-hidden">Thinking hidden.</p>;
   return (
-    <EmptyScreen eyebrow="Streaming chat" title="Chat UI shell">
-      The chat surface will dogfood the local OpenAI-compatible API once the server slice lands.
-    </EmptyScreen>
+    <>
+      {!stripThinking && thinking ? (
+        <details className="thinking-block">
+          <summary>Reasoning</summary>
+          <Markdown content={thinking} />
+        </details>
+      ) : null}
+      <Markdown content={visibleContent} />
+    </>
+  );
+}
+
+function ChatScreen() {
+  const { engineStatus, refreshEngineStatus } = useApp();
+  const [serverStatus, setServerStatus] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [draft, setDraft] = useState("");
+  const [params, setParams] = useState(DEFAULT_CHAT_PARAMS);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState(null);
+  const thinkingCapable = supportsThinking(engineStatus);
+  const apiBase = buildLocalApiBase(serverStatus);
+  const canSend = Boolean(engineStatus?.loaded) && !busy && draft.trim();
+
+  const refreshServerStatus = useCallback(() => {
+    return invoke("openai_server_status")
+      .then((status) => {
+        setServerStatus(status);
+        return status;
+      })
+      .catch(() => {
+        setServerStatus(null);
+        return null;
+      });
+  }, []);
+
+  useEffect(() => {
+    refreshServerStatus();
+  }, [refreshServerStatus]);
+
+  async function handleSubmit(eventArg) {
+    eventArg.preventDefault();
+    if (!canSend) return;
+    setBusy(true);
+    setError(null);
+    const userMessage = { role: "user", content: draft.trim() };
+    const nextMessages = [...messages, userMessage];
+    const assistantMessage = { role: "assistant", content: "", thinking: "" };
+    setMessages([...nextMessages, assistantMessage]);
+    setDraft("");
+    try {
+      const status = await refreshServerStatus();
+      const nextEngineStatus = await refreshEngineStatus();
+      const response = await fetch(`${buildLocalApiBase(status)}/v1/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(
+          chatRequestBody({
+            engineStatus: nextEngineStatus ?? engineStatus,
+            messages: nextMessages,
+            params,
+            thinkingCapable,
+          }),
+        ),
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => null);
+        throw new Error(body?.error?.message ?? `OpenAI API returned HTTP ${response.status}`);
+      }
+      if (!response.body) throw new Error("OpenAI API did not return a stream");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let content = "";
+      let thinking = "";
+      let done = false;
+      while (!done) {
+        const chunk = await reader.read();
+        done = chunk.done;
+        buffer += decoder.decode(chunk.value ?? new Uint8Array(), { stream: !done });
+        buffer = readSseMessages(buffer, (data) => {
+          if (data === "[DONE]") return;
+          const eventData = JSON.parse(data);
+          if (eventData.error) throw new Error(eventData.error.message);
+          const choice = eventData.choices?.[0];
+          const contentDelta = choice?.delta?.content ?? "";
+          const thinkingDelta = choice?.delta?.reasoning_content ?? "";
+          if (!contentDelta && !thinkingDelta) return;
+          content += contentDelta;
+          thinking += thinkingDelta;
+          setMessages([...nextMessages, { ...assistantMessage, content, thinking }]);
+        });
+      }
+    } catch (cause) {
+      setError(String(cause?.message ?? cause));
+      setMessages(nextMessages);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function updateParam(key, value) {
+    setParams((current) => ({ ...current, [key]: value }));
+  }
+
+  return (
+    <section className="chat-layout">
+      <div className="panel chat-panel">
+        <div className="panel-head chat-head">
+          <div>
+            <p className="eyebrow">Streaming chat</p>
+            <h2>{engineStatus?.loaded ? engineStatus.loaded.name : "Load a model to chat"}</h2>
+            <p className="view-copy">Dogfoods {apiBase}/v1/chat/completions over SSE.</p>
+          </div>
+          <span className={serverStatus?.running ? "status-pill" : "status-pill warning"}>
+            <StatusDot ok={Boolean(serverStatus?.running)} />
+            {serverStatus?.running ? "API online" : "API offline"}
+          </span>
+        </div>
+
+        <div className="message-list" aria-live="polite">
+          {messages.length ? (
+            messages.map((message, index) => (
+              <article className={`message-bubble ${message.role}`} key={`${message.role}-${index}`}>
+                <div className="message-role">{message.role}</div>
+                <MessageContent
+                  content={message.content}
+                  thinking={message.thinking}
+                  stripThinking={thinkingCapable && params.disableThinking}
+                />
+              </article>
+            ))
+          ) : (
+            <div className="empty-panel">Ask a question to start a multi-turn chat with the served model.</div>
+          )}
+        </div>
+
+        {error ? <p className="form-error" role="alert">{error}</p> : null}
+
+        <form className="composer" onSubmit={handleSubmit}>
+          <textarea
+            disabled={!engineStatus?.loaded || busy}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                event.currentTarget.form?.requestSubmit();
+              }
+            }}
+            placeholder={engineStatus?.loaded ? "Message the local model…" : "Load a model from Models first"}
+            rows={3}
+            value={draft}
+          />
+          <button className="primary-btn" disabled={!canSend} type="submit">
+            {busy ? "Streaming…" : "Send"}
+          </button>
+        </form>
+      </div>
+
+      <aside className="panel chat-settings">
+        <div className="panel-head">
+          <p className="eyebrow">Conversation overrides</p>
+          <h2>Sampling</h2>
+          <p className="view-copy">Applies only to this chat session.</p>
+        </div>
+        <div className="field">
+          <label htmlFor="system-prompt">System prompt</label>
+          <textarea
+            id="system-prompt"
+            onChange={(event) => updateParam("systemPrompt", event.target.value)}
+            rows={5}
+            value={params.systemPrompt}
+          />
+        </div>
+        <div className="field-grid">
+          <div className="field">
+            <label htmlFor="temperature">Temperature</label>
+            <input
+              id="temperature"
+              inputMode="decimal"
+              onChange={(event) => updateParam("temperature", event.target.value)}
+              type="number"
+              step="0.1"
+              min="0"
+              max="2"
+              value={params.temperature}
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="top-p">Top P</label>
+            <input
+              id="top-p"
+              inputMode="decimal"
+              onChange={(event) => updateParam("topP", event.target.value)}
+              type="number"
+              step="0.05"
+              min="0"
+              max="1"
+              value={params.topP}
+            />
+          </div>
+          <div className="field">
+            <label htmlFor="max-tokens">Max tokens</label>
+            <input
+              id="max-tokens"
+              inputMode="numeric"
+              onChange={(event) => updateParam("maxTokens", event.target.value)}
+              type="number"
+              step="1"
+              min="1"
+              value={params.maxTokens}
+            />
+          </div>
+        </div>
+        {thinkingCapable ? (
+          <label className="toggle-row">
+            <input
+              checked={params.disableThinking}
+              onChange={(event) => updateParam("disableThinking", event.target.checked)}
+              type="checkbox"
+            />
+            <span>
+              Disable thinking
+              <small>No-think request flag and hidden &lt;think&gt; output.</small>
+            </span>
+          </label>
+        ) : null}
+        <button className="ghost-btn" disabled={busy || !messages.length} onClick={() => setMessages([])} type="button">
+          Clear conversation
+        </button>
+      </aside>
+    </section>
   );
 }
 
