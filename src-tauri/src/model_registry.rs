@@ -1,8 +1,10 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use core_llm::LoadSpec;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
@@ -74,6 +76,29 @@ pub struct ImportProgress {
     pub total_bytes: Option<u64>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedModelCandidate {
+    pub id: String,
+    pub name: String,
+    pub repo: String,
+    pub revision: String,
+    pub local_path: String,
+    pub provider_id: String,
+    pub provider_family: String,
+    pub supports_vision: bool,
+    pub file_count: usize,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdoptCachedModelRequest {
+    pub local_path: String,
+    #[serde(default)]
+    pub quantize: Option<QuantizeRequest>,
+}
+
 #[derive(Clone, Debug)]
 struct HfModelRef {
     repo: String,
@@ -94,6 +119,59 @@ struct HfSibling {
 
 pub fn list_registered_models(app: &AppHandle) -> Result<ModelRegistry, String> {
     read_registry(&registry_path(app)?)
+}
+
+pub fn list_cached_hf_models() -> Result<Vec<CachedModelCandidate>, String> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+    for cache_dir in hf_cache_dirs() {
+        for snapshot in cached_snapshot_dirs(&cache_dir)? {
+            let key = snapshot.to_string_lossy().to_string();
+            if !seen.insert(key) {
+                continue;
+            }
+            if let Some(candidate) = cached_model_candidate(&snapshot)? {
+                candidates.push(candidate);
+            }
+        }
+    }
+    candidates.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.revision.cmp(&b.revision))
+    });
+    Ok(candidates)
+}
+
+pub fn adopt_cached_hf_model(
+    app: &AppHandle,
+    request: AdoptCachedModelRequest,
+) -> Result<ModelRegistry, String> {
+    let path = PathBuf::from(request.local_path.trim());
+    let candidate = cached_model_candidate(&path)?.ok_or_else(|| {
+        "cached snapshot is not supported by the linked MLX providers".to_string()
+    })?;
+    let model_ref = HfModelRef {
+        repo: candidate.repo.clone(),
+        revision: candidate.revision.clone(),
+    };
+    let entry = ModelEntry {
+        id: model_id(&model_ref, request.quantize),
+        name: model_name(&model_ref, request.quantize),
+        repo: candidate.repo,
+        revision: candidate.revision,
+        source_url: model_ref.source_url(),
+        local_path: candidate.local_path,
+        quantize: request.quantize,
+        imported_at: now_secs(),
+        file_count: candidate.file_count,
+        size_bytes: candidate.size_bytes,
+    };
+    let manifest = registry_path(app)?;
+    let mut registry = read_registry(&manifest)?;
+    upsert_model(&mut registry, entry);
+    write_registry(&manifest, &registry)?;
+    Ok(registry)
 }
 
 pub async fn import_hf_model(
@@ -481,6 +559,154 @@ fn validate_snapshot(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, String> {
+    validate_snapshot(path)?;
+    let Some((repo, revision)) = parse_hf_cache_snapshot(path) else {
+        return Ok(None);
+    };
+    let Some(provider) = matching_provider(path)? else {
+        return Ok(None);
+    };
+    if provider.capabilities.supports_vision && !is_joycaption_snapshot(path)? {
+        return Ok(None);
+    }
+    let model_ref = HfModelRef { repo, revision };
+    let file_count = snapshot_file_count(path)?;
+    let size_bytes = snapshot_size_bytes(path);
+    Ok(Some(CachedModelCandidate {
+        id: model_id(&model_ref, None),
+        name: model_name(&model_ref, None),
+        repo: model_ref.repo,
+        revision: model_ref.revision,
+        local_path: path.to_string_lossy().to_string(),
+        provider_id: provider.id,
+        provider_family: provider.family,
+        supports_vision: provider.capabilities.supports_vision,
+        file_count,
+        size_bytes,
+    }))
+}
+
+fn matching_provider(path: &Path) -> Result<Option<core_llm::TextLlmDescriptor>, String> {
+    let source = path.to_string_lossy().to_string();
+    let spec = LoadSpec {
+        source,
+        quantize: None,
+    };
+    Ok(core_llm::textllms()
+        .find(|registration| (registration.can_load)(&spec))
+        .map(|registration| (registration.descriptor)()))
+}
+
+fn is_joycaption_snapshot(path: &Path) -> Result<bool, String> {
+    let body = fs::read_to_string(path.join("config.json")).map_err(|error| error.to_string())?;
+    let config =
+        serde_json::from_str::<serde_json::Value>(&body).map_err(|error| error.to_string())?;
+    let architecture = config
+        .get("architectures")
+        .and_then(|value| value.as_array())
+        .and_then(|items| items.first())
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    let model_type = config
+        .get("model_type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    Ok(architecture.contains("llava") || model_type.contains("llava"))
+}
+
+fn hf_cache_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(value) = env_path("HUGGINGFACE_HUB_CACHE") {
+        dirs.push(value);
+    }
+    if let Some(value) = env_path("HF_HOME") {
+        dirs.push(value.join("hub"));
+    }
+    dirs.push(home_dir().join(".cache").join("huggingface").join("hub"));
+    dedupe_paths(dirs)
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(path.to_string_lossy().to_string()))
+        .collect()
+}
+
+fn cached_snapshot_dirs(cache_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut snapshots = Vec::new();
+    if !cache_dir.is_dir() {
+        return Ok(snapshots);
+    }
+    for model_dir in fs::read_dir(cache_dir).map_err(|error| error.to_string())? {
+        let model_dir = model_dir.map_err(|error| error.to_string())?.path();
+        if !model_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("models--"))
+        {
+            continue;
+        }
+        let snapshots_dir = model_dir.join("snapshots");
+        if !snapshots_dir.is_dir() {
+            continue;
+        }
+        for snapshot in fs::read_dir(snapshots_dir).map_err(|error| error.to_string())? {
+            let snapshot = snapshot.map_err(|error| error.to_string())?.path();
+            if snapshot.is_dir() {
+                snapshots.push(snapshot);
+            }
+        }
+    }
+    Ok(snapshots)
+}
+
+fn parse_hf_cache_snapshot(path: &Path) -> Option<(String, String)> {
+    let revision = path.file_name()?.to_str()?.to_string();
+    let snapshots_dir = path.parent()?;
+    if snapshots_dir.file_name()?.to_str()? != "snapshots" {
+        return None;
+    }
+    let model_dir = snapshots_dir.parent()?;
+    let encoded = model_dir.file_name()?.to_str()?.strip_prefix("models--")?;
+    let repo = encoded.replace("--", "/");
+    Some((repo, revision))
+}
+
+fn snapshot_file_count(path: &Path) -> Result<usize, String> {
+    Ok(fs::read_dir(path)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .count())
+}
+
+fn snapshot_size_bytes(path: &Path) -> Option<u64> {
+    let mut total = 0_u64;
+    for entry in fs::read_dir(path).ok()?.filter_map(Result::ok) {
+        let metadata = entry.metadata().ok()?;
+        if metadata.is_file() {
+            total = total.checked_add(metadata.len())?;
+        }
+    }
+    Some(total)
+}
+
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path().app_data_dir().map_err(|error| error.to_string())
 }
@@ -664,6 +890,76 @@ mod tests {
     }
 
     #[test]
+    fn parses_hf_cache_snapshot_paths() {
+        let path = PathBuf::from(
+            "/tmp/hub/models--fancyfeast--llama-joycaption-beta-one-hf-llava/snapshots/abc123",
+        );
+        let (repo, revision) = parse_hf_cache_snapshot(&path).unwrap();
+        assert_eq!(repo, "fancyfeast/llama-joycaption-beta-one-hf-llava");
+        assert_eq!(revision, "abc123");
+        assert!(parse_hf_cache_snapshot(Path::new("/tmp/not-a-snapshot")).is_none());
+    }
+
+    #[test]
+    fn finds_cached_snapshot_dirs() {
+        let root = snapshot_dir("hf-cache");
+        let snapshot = root
+            .join("models--Qwen--Qwen3-0.6B")
+            .join("snapshots")
+            .join("rev1");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::create_dir_all(root.join("not-a-model").join("snapshots").join("ignored")).unwrap();
+
+        let found = cached_snapshot_dirs(&root).unwrap();
+        assert_eq!(found, vec![snapshot]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn builds_cached_candidate_for_supported_snapshot() {
+        let root = snapshot_dir("hf-candidate");
+        let snapshot = root
+            .join("models--Qwen--Qwen3-0.6B")
+            .join("snapshots")
+            .join("rev1");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(
+            snapshot.join("config.json"),
+            r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3","hidden_size":8}"#,
+        )
+        .unwrap();
+        fs::write(snapshot.join("tokenizer.json"), "{}").unwrap();
+        fs::write(snapshot.join("model.safetensors"), "weights").unwrap();
+
+        let candidate = cached_model_candidate(&snapshot).unwrap().unwrap();
+        assert_eq!(candidate.repo, "Qwen/Qwen3-0.6B");
+        assert_eq!(candidate.revision, "rev1");
+        assert_eq!(candidate.provider_id, "mlx-llama");
+        assert!(!candidate.supports_vision);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn skips_non_joycaption_vision_candidate() {
+        let root = snapshot_dir("hf-qwen-vlm");
+        let snapshot = root
+            .join("models--Qwen--Qwen3.6-27B")
+            .join("snapshots")
+            .join("rev1");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(
+            snapshot.join("config.json"),
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text"},"vision_config":{"model_type":"qwen3_5"}}"#,
+        )
+        .unwrap();
+        fs::write(snapshot.join("tokenizer.json"), "{}").unwrap();
+        fs::write(snapshot.join("model.safetensors"), "weights").unwrap();
+
+        assert!(cached_model_candidate(&snapshot).unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn registry_upsert_replaces_existing_entry() {
         let mut registry = ModelRegistry::default();
         let model_ref = HfModelRef::parse("Qwen/Qwen3-0.6B").unwrap();
@@ -701,5 +997,12 @@ mod tests {
         assert_eq!(registry.models.len(), 1);
         assert_eq!(registry.models[0].name, "new");
         assert_eq!(registry.models[0].file_count, 4);
+    }
+
+    fn snapshot_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("chatworks-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }
