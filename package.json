@@ -10,7 +10,8 @@
     "preview": "vite preview --host 127.0.0.1",
     "lint": "eslint src",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri:build": "tauri build",
+    "tauri:build:macos": "tauri build --target aarch64-apple-darwin --bundles app"
   },
   "dependencies": {
     "@sceneworks/ui": "0.2.0",
