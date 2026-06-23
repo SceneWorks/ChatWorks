@@ -11,7 +11,7 @@
     "lint": "eslint src",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
-    "tauri:build:macos": "tauri build --target aarch64-apple-darwin --bundles app"
+    "tauri:build:macos": "tauri build --target aarch64-apple-darwin --bundles app dmg"
   },
   "dependencies": {
     "@sceneworks/ui": "0.2.0",
