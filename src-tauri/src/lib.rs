@@ -2,3 +2,4 @@
 use mlx_llm as _;
 
 pub mod engine;
+pub mod server;
