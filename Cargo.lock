@@ -563,7 +563,7 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#e98d1263600fdc663cfbc2d311d3bf0b4b0ef65c"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#b26440b26fc43d5b78e04f04645d7b72b731bea4"
 dependencies = [
  "inventory",
  "minijinja",
@@ -2244,7 +2244,7 @@ dependencies = [
 [[package]]
 name = "mlx-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/mlx-llm?branch=main#c36edd8fbdbefabeea6d326951d0437aa5e9aa1a"
+source = "git+https://github.com/SceneWorks/mlx-llm?branch=main#c98b6282f4adb5f048dd824668a58b1e06594778"
 dependencies = [
  "core-llm",
  "half",
@@ -2388,7 +2388,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -2878,15 +2878,6 @@ checksum = "b00f26d3400549137f92511a46ac1cd8ce37cb5598a96d382381458b992a5d24"
 dependencies = [
  "toml_datetime 0.6.3",
  "toml_edit 0.20.2",
-]
-
-[[package]]
-name = "proc-macro-crate"
-version = "3.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f"
-dependencies = [
- "toml_edit 0.25.12+spec-1.1.0",
 ]
 
 [[package]]
@@ -4418,18 +4409,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "toml_edit"
-version = "0.25.12+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2153edc6955a6c354fad8f5efd38b6a8769bdccf9fe50f8e1329f81b0baa5d7"
-dependencies = [
- "indexmap 2.14.0",
- "toml_datetime 1.1.1+spec-1.1.0",
- "toml_parser",
- "winnow 1.0.3",
-]
-
-[[package]]
 name = "toml_parser"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5395,9 +5374,6 @@ name = "winnow"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0592e1c9d151f854e6fd382574c3a0855250e1d9b2f99d9281c6e6391af352f1"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "winreg"

@@ -3,8 +3,9 @@ use std::sync::mpsc;
 use std::thread;
 
 use core_llm::{
-    load_for_model, CancelFlag, Content, FinishReason, LoadSpec, Message, Quantize, Role, Sampling,
-    StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest, Usage,
+    load_for_model, CancelFlag, Channel, Content, FinishReason, LoadSpec, Message, Quantize, Role,
+    Sampling, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest,
+    ThinkingMode, Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -175,6 +176,7 @@ impl EngineActor {
             .map_err(|error| error.to_string())?;
         Ok(GenerateResponse {
             text: output.text,
+            thinking: output.thinking,
             usage: UsagePayload::from(output.usage),
             finish_reason: output
                 .finish_reason
@@ -252,6 +254,8 @@ pub struct GenerateRequest {
     pub seed: Option<u64>,
     #[serde(default)]
     pub stop: Vec<String>,
+    #[serde(default)]
+    pub thinking: ThinkingRequest,
 }
 
 impl GenerateRequest {
@@ -269,6 +273,7 @@ impl GenerateRequest {
             max_new_tokens: self.max_new_tokens,
             seed: self.seed,
             constraint: None,
+            thinking: self.thinking.into(),
             stop: self.stop,
             cancel: CancelFlag::new(),
         })
@@ -277,6 +282,25 @@ impl GenerateRequest {
 
 fn default_max_new_tokens() -> u32 {
     512
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingRequest {
+    #[default]
+    Auto,
+    Enabled,
+    Disabled,
+}
+
+impl From<ThinkingRequest> for ThinkingMode {
+    fn from(value: ThinkingRequest) -> Self {
+        match value {
+            ThinkingRequest::Auto => ThinkingMode::Auto,
+            ThinkingRequest::Enabled => ThinkingMode::Enabled,
+            ThinkingRequest::Disabled => ThinkingMode::Disabled,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -290,6 +314,7 @@ impl GenerateMessage {
         Ok(Message {
             role: role_from_str(&self.role)?,
             content: vec![Content::Text(self.content)],
+            thinking: None,
         })
     }
 }
@@ -379,6 +404,7 @@ pub struct CapabilitySummary {
     pub max_new_tokens: u32,
     pub supports_system_prompt: bool,
     pub supports_vision: bool,
+    pub supports_thinking: bool,
     pub supported_constraints: Vec<String>,
 }
 
@@ -389,6 +415,7 @@ impl From<TextLlmCapabilities> for CapabilitySummary {
             max_new_tokens: value.max_new_tokens,
             supports_system_prompt: value.supports_system_prompt,
             supports_vision: value.supports_vision,
+            supports_thinking: value.supports_thinking,
             supported_constraints: value
                 .supported_constraints
                 .into_iter()
@@ -401,6 +428,7 @@ impl From<TextLlmCapabilities> for CapabilitySummary {
 #[derive(Clone, Debug, Serialize)]
 pub struct GenerateResponse {
     pub text: String,
+    pub thinking: Option<String>,
     pub usage: UsagePayload,
     pub finish_reason: String,
 }
@@ -412,6 +440,7 @@ pub enum StreamPayload {
         id: u32,
         text: String,
         index: usize,
+        channel: StreamChannel,
     },
     Done {
         finish_reason: String,
@@ -419,10 +448,36 @@ pub enum StreamPayload {
     },
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamChannel {
+    Content,
+    Thinking,
+}
+
+impl From<Channel> for StreamChannel {
+    fn from(value: Channel) -> Self {
+        match value {
+            Channel::Content => Self::Content,
+            Channel::Thinking => Self::Thinking,
+        }
+    }
+}
+
 impl From<StreamEvent> for StreamPayload {
     fn from(value: StreamEvent) -> Self {
         match value {
-            StreamEvent::Token { id, text, index } => Self::Token { id, text, index },
+            StreamEvent::Token {
+                id,
+                text,
+                index,
+                channel,
+            } => Self::Token {
+                id,
+                text,
+                index,
+                channel: channel.into(),
+            },
             StreamEvent::Done {
                 finish_reason,
                 usage,
@@ -499,6 +554,7 @@ mod tests {
                 id: 1,
                 text: "ok".to_string(),
                 index: 0,
+                channel: Channel::Content,
             });
             let usage = Usage {
                 prompt_tokens: 2,
@@ -510,6 +566,7 @@ mod tests {
             });
             Ok(TextLlmOutput {
                 text: "ok".to_string(),
+                thinking: None,
                 usage,
                 finish_reason: Some(FinishReason::Stop),
             })
@@ -558,6 +615,7 @@ mod tests {
                     max_new_tokens: 8,
                     seed: None,
                     stop: Vec::new(),
+                    thinking: ThinkingRequest::Auto,
                 },
                 |event| events.push(event),
             )
@@ -582,6 +640,7 @@ mod tests {
                 max_new_tokens: 8,
                 seed: None,
                 stop: Vec::new(),
+                thinking: ThinkingRequest::Auto,
             },
             |_| {},
         );

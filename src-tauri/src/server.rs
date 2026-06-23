@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -17,7 +17,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::engine::{
     EngineHandle, GenerateMessage, GenerateRequest, GenerateResponse, LoadedModelStatus,
-    SamplingRequest, StreamPayload, UsagePayload,
+    SamplingRequest, StreamChannel, StreamPayload, ThinkingRequest, UsagePayload,
 };
 
 pub const DEFAULT_OPENAI_HOST: &str = "127.0.0.1";
@@ -246,9 +246,38 @@ async fn run_server(
 
 fn openai_router(engine: EngineHandle, auth_token: Option<String>) -> Router {
     Router::new()
-        .route("/v1/models", get(models))
-        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/models", get(models).options(cors_preflight))
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions).options(cors_preflight),
+        )
         .with_state(ApiState { engine, auth_token })
+        .layer(axum::middleware::from_fn(apply_cors_headers))
+}
+
+async fn cors_preflight() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+async fn apply_cors_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    headers.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("authorization, content-type"),
+    );
+    response
 }
 
 #[derive(Clone)]
@@ -306,8 +335,13 @@ fn stream_chat_completion(
 
     tokio::task::spawn_blocking(move || {
         let result = engine.generate(generate_request, |payload| {
-            if let StreamPayload::Token { text, .. } = payload {
-                let chunk = OpenAiChatChunk::token(id.clone(), created, model.clone(), text);
+            if let StreamPayload::Token { text, channel, .. } = payload {
+                let chunk = match channel {
+                    StreamChannel::Content => OpenAiChatChunk::token(id.clone(), created, model.clone(), text),
+                    StreamChannel::Thinking => {
+                        OpenAiChatChunk::reasoning(id.clone(), created, model.clone(), text)
+                    }
+                };
                 let _ = tx.blocking_send(Ok(sse_json(&chunk)));
             }
         });
@@ -342,6 +376,7 @@ fn sse_json<T: Serialize>(value: &T) -> Event {
         )),
     }
 }
+
 
 fn authorize(headers: &HeaderMap, token: Option<&str>) -> Result<(), ApiError> {
     let Some(token) = token else {
@@ -512,6 +547,8 @@ struct OpenAiChatRequest {
     seed: Option<u64>,
     #[serde(default)]
     stop: Option<StopValue>,
+    #[serde(default)]
+    disable_thinking: bool,
 }
 
 impl OpenAiChatRequest {
@@ -545,6 +582,11 @@ impl OpenAiChatRequest {
                 .unwrap_or(512),
             seed: self.seed,
             stop: self.stop.map(StopValue::into_vec).unwrap_or_default(),
+            thinking: if self.disable_thinking {
+                ThinkingRequest::Disabled
+            } else {
+                ThinkingRequest::Auto
+            },
         })
     }
 }
@@ -643,6 +685,7 @@ impl OpenAiChatResponse {
                 message: Some(OpenAiResponseMessage {
                     role: "assistant",
                     content: response.text,
+                    reasoning_content: response.thinking,
                 }),
                 delta: None,
                 finish_reason: Some(response.finish_reason),
@@ -675,6 +718,26 @@ impl OpenAiChatChunk {
                 message: None,
                 delta: Some(OpenAiDelta {
                     content: Some(content),
+                    reasoning_content: None,
+                }),
+                finish_reason: None,
+            }],
+            usage: None,
+        }
+    }
+
+    fn reasoning(id: String, created: u64, model: String, content: String) -> Self {
+        Self {
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model,
+            choices: vec![OpenAiChatChoice {
+                index: 0,
+                message: None,
+                delta: Some(OpenAiDelta {
+                    content: None,
+                    reasoning_content: Some(content),
                 }),
                 finish_reason: None,
             }],
@@ -697,7 +760,10 @@ impl OpenAiChatChunk {
             choices: vec![OpenAiChatChoice {
                 index: 0,
                 message: None,
-                delta: Some(OpenAiDelta { content: None }),
+                delta: Some(OpenAiDelta {
+                    content: None,
+                    reasoning_content: None,
+                }),
                 finish_reason: Some(finish_reason),
             }],
             usage,
@@ -719,12 +785,16 @@ struct OpenAiChatChoice {
 struct OpenAiResponseMessage {
     role: &'static str,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Serialize)]
 struct OpenAiDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -766,8 +836,8 @@ fn timestamp_nanos() -> u128 {
 mod tests {
     use super::*;
     use core_llm::{
-        Content, FinishReason, LoadSpec, Role, TextLlm, TextLlmCapabilities, TextLlmDescriptor,
-        TextLlmOutput, TextLlmRequest, Usage,
+        Channel, Content, FinishReason, LoadSpec, Role, TextLlm, TextLlmCapabilities,
+        TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingMode, Usage,
     };
     use serde_json::{json, Value};
 
@@ -798,10 +868,22 @@ mod tests {
                 req.messages[0].content,
                 vec![Content::Text("hello".to_string())]
             );
+            let thinking = if req.thinking == ThinkingMode::Disabled {
+                None
+            } else {
+                on_event(core_llm::StreamEvent::Token {
+                    id: 9,
+                    text: "reason".to_string(),
+                    index: 0,
+                    channel: Channel::Thinking,
+                });
+                Some("reason".to_string())
+            };
             on_event(core_llm::StreamEvent::Token {
                 id: 1,
                 text: "ok".to_string(),
-                index: 0,
+                index: 1,
+                channel: Channel::Content,
             });
             let usage = Usage {
                 prompt_tokens: 2,
@@ -813,6 +895,7 @@ mod tests {
             });
             Ok(TextLlmOutput {
                 text: "ok".to_string(),
+                thinking,
                 usage,
                 finish_reason: Some(FinishReason::Stop),
             })
@@ -827,6 +910,7 @@ mod tests {
                 backend: "unit".to_string(),
                 capabilities: TextLlmCapabilities {
                     supports_system_prompt: true,
+                    supports_thinking: true,
                     max_new_tokens: 8,
                     ..Default::default()
                 },
@@ -893,6 +977,19 @@ mod tests {
         assert_eq!(generate.max_new_tokens, 7);
         assert_eq!(generate.seed, Some(42));
         assert_eq!(generate.stop, vec!["END"]);
+        assert!(matches!(generate.thinking, ThinkingRequest::Auto));
+    }
+
+    #[test]
+    fn maps_disable_thinking_to_core_thinking_mode() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "disable_thinking": true
+        }))
+        .unwrap();
+
+        let generate = request.into_generate().unwrap();
+        assert!(matches!(generate.thinking, ThinkingRequest::Disabled));
     }
 
     #[test]
@@ -935,6 +1032,15 @@ mod tests {
             format!(
                 "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth}Connection: close\r\n\r\n{body}",
                 body.len()
+            ),
+        )
+    }
+
+    fn http_options(addr: &str, path: &str) -> String {
+        http_request(
+            addr,
+            format!(
+                "OPTIONS {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://127.0.0.1:5173\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: content-type\r\nConnection: close\r\n\r\n"
             ),
         )
     }
@@ -987,7 +1093,37 @@ mod tests {
         );
         let body: Value = serde_json::from_str(response_body(&response)).unwrap();
         assert_eq!(body["choices"][0]["message"]["content"], "ok");
-        assert_eq!(body["usage"]["completion_tokens"], 1);
+        assert_eq!(body["choices"][0]["message"]["reasoning_content"], "reason");
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn omits_reasoning_when_thinking_disabled() {
+        let server = OpenAiServerHandle::new();
+        let status = server
+            .start(
+                OpenAiServerConfig {
+                    port: 0,
+                    ..Default::default()
+                },
+                loaded_fake_engine(),
+            )
+            .unwrap();
+        let addr = status.bound_addr.unwrap();
+        let response = http_post_json(
+            &addr,
+            "/v1/chat/completions",
+            json!({
+                "model": "fake-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "disable_thinking": true,
+                "max_tokens": 8
+            }),
+            None,
+        );
+        let body: Value = serde_json::from_str(response_body(&response)).unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "ok");
+        assert!(body["choices"][0]["message"]["reasoning_content"].is_null());
         server.stop().unwrap();
     }
 
@@ -1015,9 +1151,31 @@ mod tests {
             }),
             None,
         );
+        assert!(response.contains("access-control-allow-origin: *"));
         assert!(response.contains("data: {\"id\":\"chatcmpl-"));
+        assert!(response.contains("\"reasoning_content\":\"reason\""));
         assert!(response.contains("\"content\":\"ok\""));
         assert!(response.contains("data: [DONE]"));
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn accepts_cors_preflight() {
+        let server = OpenAiServerHandle::new();
+        let status = server
+            .start(
+                OpenAiServerConfig {
+                    port: 0,
+                    ..Default::default()
+                },
+                loaded_fake_engine(),
+            )
+            .unwrap();
+        let addr = status.bound_addr.unwrap();
+        let response = http_options(&addr, "/v1/chat/completions");
+        assert!(response.starts_with("HTTP/1.1 204 No Content"));
+        assert!(response.contains("access-control-allow-origin: *"));
+        assert!(response.contains("access-control-allow-methods: GET, POST, OPTIONS"));
         server.stop().unwrap();
     }
 
