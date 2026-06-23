@@ -15,6 +15,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::app_settings::SamplingDefaults;
 use crate::engine::{
     EngineHandle, GenerateMessage, GenerateRequest, GenerateResponse, LoadedModelStatus,
     SamplingRequest, StreamChannel, StreamPayload, ThinkingRequest, UsagePayload,
@@ -35,6 +36,8 @@ pub struct OpenAiServerConfig {
     pub allow_lan: bool,
     #[serde(default)]
     pub auth_token: Option<String>,
+    #[serde(default)]
+    pub sampling_defaults: SamplingDefaults,
 }
 
 impl Default for OpenAiServerConfig {
@@ -44,6 +47,7 @@ impl Default for OpenAiServerConfig {
             port: default_port(),
             allow_lan: false,
             auth_token: None,
+            sampling_defaults: SamplingDefaults::default(),
         }
     }
 }
@@ -236,22 +240,33 @@ async fn run_server(
     };
     let bound_addr = listener.local_addr().map_err(|error| error.to_string())?;
     let _ = ready_tx.send(Ok(bound_addr));
-    axum::serve(listener, openai_router(engine, config.auth_token))
-        .with_graceful_shutdown(async {
-            let _ = shutdown_rx.await;
-        })
-        .await
-        .map_err(|error| error.to_string())
+    axum::serve(
+        listener,
+        openai_router(engine, config.auth_token, config.sampling_defaults),
+    )
+    .with_graceful_shutdown(async {
+        let _ = shutdown_rx.await;
+    })
+    .await
+    .map_err(|error| error.to_string())
 }
 
-fn openai_router(engine: EngineHandle, auth_token: Option<String>) -> Router {
+fn openai_router(
+    engine: EngineHandle,
+    auth_token: Option<String>,
+    sampling_defaults: SamplingDefaults,
+) -> Router {
     Router::new()
         .route("/v1/models", get(models).options(cors_preflight))
         .route(
             "/v1/chat/completions",
             post(chat_completions).options(cors_preflight),
         )
-        .with_state(ApiState { engine, auth_token })
+        .with_state(ApiState {
+            engine,
+            auth_token,
+            sampling_defaults,
+        })
         .layer(axum::middleware::from_fn(apply_cors_headers))
 }
 
@@ -284,6 +299,7 @@ async fn apply_cors_headers(
 struct ApiState {
     engine: EngineHandle,
     auth_token: Option<String>,
+    sampling_defaults: SamplingDefaults,
 }
 
 async fn models(
@@ -309,11 +325,11 @@ async fn chat_completions(
 ) -> Result<Response, ApiError> {
     authorize(&headers, state.auth_token.as_deref())?;
     if request.stream {
-        let stream = stream_chat_completion(state.engine, request)?;
+        let stream = stream_chat_completion(state.engine, request, &state.sampling_defaults)?;
         Ok(stream.into_response())
     } else {
         let model = request.model_name();
-        let generate_request = request.into_generate()?;
+        let generate_request = request.into_generate(&state.sampling_defaults)?;
         let response =
             tokio::task::spawn_blocking(move || state.engine.generate(generate_request, |_| {}))
                 .await
@@ -326,18 +342,21 @@ async fn chat_completions(
 fn stream_chat_completion(
     engine: EngineHandle,
     request: OpenAiChatRequest,
+    sampling_defaults: &SamplingDefaults,
 ) -> Result<impl IntoResponse, ApiError> {
     let model = request.model_name();
     let id = completion_id();
     let created = created_timestamp();
-    let generate_request = request.into_generate()?;
+    let generate_request = request.into_generate(sampling_defaults)?;
     let (tx, rx) = tokio_mpsc::channel::<Result<Event, Infallible>>(32);
 
     tokio::task::spawn_blocking(move || {
         let result = engine.generate(generate_request, |payload| {
             if let StreamPayload::Token { text, channel, .. } = payload {
                 let chunk = match channel {
-                    StreamChannel::Content => OpenAiChatChunk::token(id.clone(), created, model.clone(), text),
+                    StreamChannel::Content => {
+                        OpenAiChatChunk::token(id.clone(), created, model.clone(), text)
+                    }
                     StreamChannel::Thinking => {
                         OpenAiChatChunk::reasoning(id.clone(), created, model.clone(), text)
                     }
@@ -376,7 +395,6 @@ fn sse_json<T: Serialize>(value: &T) -> Event {
         )),
     }
 }
-
 
 fn authorize(headers: &HeaderMap, token: Option<&str>) -> Result<(), ApiError> {
     let Some(token) = token else {
@@ -548,7 +566,7 @@ struct OpenAiChatRequest {
     #[serde(default)]
     stop: Option<StopValue>,
     #[serde(default)]
-    disable_thinking: bool,
+    disable_thinking: Option<bool>,
 }
 
 impl OpenAiChatRequest {
@@ -559,19 +577,30 @@ impl OpenAiChatRequest {
             .unwrap_or_else(|| "chatworks".to_string())
     }
 
-    fn into_generate(self) -> Result<GenerateRequest, ApiError> {
+    fn into_generate(self, defaults: &SamplingDefaults) -> Result<GenerateRequest, ApiError> {
         if self.messages.is_empty() {
             return Err(ApiError::bad_request("messages must not be empty"));
         }
+        let has_system = self
+            .messages
+            .iter()
+            .any(|message| matches!(message.role.as_str(), "system" | "developer"));
+        let mut messages = Vec::new();
+        if !has_system && !defaults.system_prompt.trim().is_empty() {
+            messages.push(GenerateMessage {
+                role: "system".to_string(),
+                content: defaults.system_prompt.clone(),
+            });
+        }
+        for message in self.messages {
+            messages.push(message.into_generate()?);
+        }
+        let disable_thinking = self.disable_thinking.unwrap_or(defaults.disable_thinking);
         Ok(GenerateRequest {
-            messages: self
-                .messages
-                .into_iter()
-                .map(OpenAiChatMessage::into_generate)
-                .collect::<Result<Vec<_>, _>>()?,
+            messages,
             sampling: SamplingRequest {
-                temperature: self.temperature,
-                top_p: self.top_p,
+                temperature: Some(self.temperature.unwrap_or(defaults.temperature)),
+                top_p: Some(self.top_p.unwrap_or(defaults.top_p)),
                 top_k: None,
                 repetition_penalty: None,
                 repetition_context: None,
@@ -579,10 +608,10 @@ impl OpenAiChatRequest {
             max_new_tokens: self
                 .max_completion_tokens
                 .or(self.max_tokens)
-                .unwrap_or(512),
+                .unwrap_or(defaults.max_tokens),
             seed: self.seed,
             stop: self.stop.map(StopValue::into_vec).unwrap_or_default(),
-            thinking: if self.disable_thinking {
+            thinking: if disable_thinking {
                 ThinkingRequest::Disabled
             } else {
                 ThinkingRequest::Auto
@@ -930,6 +959,14 @@ mod tests {
         engine
     }
 
+    fn test_sampling_defaults() -> SamplingDefaults {
+        SamplingDefaults {
+            system_prompt: "".to_string(),
+            disable_thinking: false,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn rejects_unspecified_bind_without_lan_opt_in() {
         let config = OpenAiServerConfig {
@@ -968,7 +1005,12 @@ mod tests {
         }))
         .unwrap();
 
-        let generate = request.into_generate().unwrap();
+        let defaults = SamplingDefaults {
+            system_prompt: "".to_string(),
+            disable_thinking: false,
+            ..Default::default()
+        };
+        let generate = request.into_generate(&defaults).unwrap();
         assert_eq!(generate.messages.len(), 1);
         assert_eq!(generate.messages[0].role, "user");
         assert_eq!(generate.messages[0].content, "hello");
@@ -981,6 +1023,30 @@ mod tests {
     }
 
     #[test]
+    fn applies_sampling_defaults_when_request_omits_them() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+
+        let defaults = SamplingDefaults {
+            system_prompt: "be terse".to_string(),
+            temperature: 0.3,
+            top_p: 0.8,
+            max_tokens: 64,
+            disable_thinking: true,
+        };
+        let generate = request.into_generate(&defaults).unwrap();
+        assert_eq!(generate.messages.len(), 2);
+        assert_eq!(generate.messages[0].role, "system");
+        assert_eq!(generate.messages[0].content, "be terse");
+        assert_eq!(generate.sampling.temperature, Some(0.3));
+        assert_eq!(generate.sampling.top_p, Some(0.8));
+        assert_eq!(generate.max_new_tokens, 64);
+        assert!(matches!(generate.thinking, ThinkingRequest::Disabled));
+    }
+
+    #[test]
     fn maps_disable_thinking_to_core_thinking_mode() {
         let request: OpenAiChatRequest = serde_json::from_value(json!({
             "messages": [{"role": "user", "content": "hello"}],
@@ -988,7 +1054,7 @@ mod tests {
         }))
         .unwrap();
 
-        let generate = request.into_generate().unwrap();
+        let generate = request.into_generate(&SamplingDefaults::default()).unwrap();
         assert!(matches!(generate.thinking, ThinkingRequest::Disabled));
     }
 
@@ -1056,6 +1122,7 @@ mod tests {
             .start(
                 OpenAiServerConfig {
                     port: 0,
+                    sampling_defaults: test_sampling_defaults(),
                     ..Default::default()
                 },
                 loaded_fake_engine(),
@@ -1075,6 +1142,7 @@ mod tests {
             .start(
                 OpenAiServerConfig {
                     port: 0,
+                    sampling_defaults: test_sampling_defaults(),
                     ..Default::default()
                 },
                 loaded_fake_engine(),
@@ -1104,6 +1172,7 @@ mod tests {
             .start(
                 OpenAiServerConfig {
                     port: 0,
+                    sampling_defaults: test_sampling_defaults(),
                     ..Default::default()
                 },
                 loaded_fake_engine(),
@@ -1134,6 +1203,7 @@ mod tests {
             .start(
                 OpenAiServerConfig {
                     port: 0,
+                    sampling_defaults: test_sampling_defaults(),
                     ..Default::default()
                 },
                 loaded_fake_engine(),
@@ -1166,6 +1236,7 @@ mod tests {
             .start(
                 OpenAiServerConfig {
                     port: 0,
+                    sampling_defaults: test_sampling_defaults(),
                     ..Default::default()
                 },
                 loaded_fake_engine(),
