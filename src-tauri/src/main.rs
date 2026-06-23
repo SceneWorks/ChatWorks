@@ -3,6 +3,13 @@
 use chatworks::engine::{
     EngineHandle, EngineStatus, GenerateRequest, GenerateResponse, LoadModelRequest,
 };
+use chatworks::model_registry::{
+    clear_hf_token as clear_hf_token_inner, hf_token_status as hf_token_status_inner,
+    import_hf_model as import_hf_model_inner,
+    list_registered_models as list_registered_models_inner,
+    load_registered_model as load_registered_model_inner, set_hf_token as set_hf_token_inner,
+    HfTokenStatus, ImportHfModelRequest, ModelRegistry, SetHfTokenRequest,
+};
 use chatworks::server::{OpenAiServerConfig, OpenAiServerHandle, OpenAiServerStatus};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -56,6 +63,43 @@ fn openai_server_status(
     server.status()
 }
 
+#[tauri::command]
+fn list_registered_models(app: AppHandle) -> Result<ModelRegistry, String> {
+    list_registered_models_inner(&app)
+}
+
+#[tauri::command]
+async fn import_hf_model(
+    app: AppHandle,
+    request: ImportHfModelRequest,
+) -> Result<ModelRegistry, String> {
+    import_hf_model_inner(app, request).await
+}
+
+#[tauri::command]
+fn load_registered_model(
+    app: AppHandle,
+    engine: State<'_, EngineHandle>,
+    model_id: String,
+) -> Result<EngineStatus, String> {
+    load_registered_model_inner(&app, &engine, model_id)
+}
+
+#[tauri::command]
+fn hf_token_status() -> HfTokenStatus {
+    hf_token_status_inner()
+}
+
+#[tauri::command]
+fn set_hf_token(request: SetHfTokenRequest) -> Result<HfTokenStatus, String> {
+    set_hf_token_inner(request)
+}
+
+#[tauri::command]
+fn clear_hf_token() -> Result<HfTokenStatus, String> {
+    clear_hf_token_inner()
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -76,6 +120,12 @@ fn main() {
             start_openai_server,
             stop_openai_server,
             openai_server_status,
+            list_registered_models,
+            import_hf_model,
+            load_registered_model,
+            hf_token_status,
+            set_hf_token,
+            clear_hf_token,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the ChatWorks desktop shell");

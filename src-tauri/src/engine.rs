@@ -150,6 +150,7 @@ impl EngineActor {
         self.loaded = Some(LoadedModel {
             source: request.source,
             display_name: request.display_name,
+            quantize: request.quantize,
             provider,
             descriptor,
         });
@@ -196,6 +197,7 @@ impl EngineActor {
 struct LoadedModel {
     source: String,
     display_name: Option<String>,
+    quantize: Option<QuantizeRequest>,
     provider: Box<dyn TextLlm>,
     descriptor: TextLlmDescriptor,
 }
@@ -208,6 +210,7 @@ impl LoadedModel {
                 .display_name
                 .clone()
                 .unwrap_or_else(|| model_name(&self.source)),
+            quantize: self.quantize,
             provider: ProviderSummary::from(self.descriptor.clone()),
         }
     }
@@ -347,6 +350,7 @@ pub struct EngineStatus {
 pub struct LoadedModelStatus {
     pub source: String,
     pub name: String,
+    pub quantize: Option<QuantizeRequest>,
     pub provider: ProviderSummary,
 }
 
