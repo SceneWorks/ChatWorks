@@ -7,11 +7,11 @@
 
 ## Summary
 
-ChatWorks is a local LLM inference server that provides an OpenAI-compatible REST API, enabling clients built against the OpenAI SDK to interact with locally hosted language models. The project handles the full lifecycle of model management: importing models from Hugging Face (with token authentication), maintaining a local model registry, applying quantization, loading models into memory, and executing streaming text generation. It acts as a backend adapter layer that abstracts local AI model execution (likely via a framework such as llama.cpp, llama-rs, or a similar inference backend) behind the familiar OpenAI chat/completions API surface. Key technical responsibilities include: model registry CRUD operations, Hugging Face Hub integration with authentication, quantization configuration and execution, a streaming generation pipeline compatible with server-sent events or chunked responses, and API authentication. There is a single cohesive project within the repository with no identified cross-repository dependencies.
+ChatWorks is a local AI language model inference engine that provides an OpenAI-compatible REST API server. It handles loading language models (including importing models from Hugging Face), managing model state, and performing streaming text generation. The server exposes endpoints that mirror the OpenAI API contract, allowing clients built for OpenAI to point at locally-running models instead. The project appears to be a single cohesive system: a backend inference runtime combined with an API compatibility layer, enabling local or self-hosted LLM deployments without requiring changes to OpenAI-compatible client applications.
 
 ## Projects
 
 ### ChatWorks
 
-ChatWorks is a local LLM inference server project that exposes an OpenAI-compatible API, manages model loading and quantization, supports Hugging Face model imports, and provides a streaming generation pipeline. It acts as a backend engine that bridges local AI model execution with OpenAI-style client interfaces, including model registry management and token authentication for Hugging Face.
+ChatWorks is a project that implements a chat/language model inference engine with an OpenAI-compatible API server. It manages loading and running AI language models (including Hugging Face model imports), handles streaming text generation, and exposes an OpenAI-compatible REST API interface for clients to interact with locally-loaded models.
 
