@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useEffect, useMemo, useState } from "react";
 import ReactDOM from "react-dom/client";
+import { invoke } from "@tauri-apps/api/core";
 import "@sceneworks/ui/theme.css";
 import "@sceneworks/ui/shell.css";
 import { ACCENTS, DEFAULT_ACCENT, ErrorBoundary, Icon, Logo, StatusDot } from "@sceneworks/ui";
@@ -48,6 +49,7 @@ function AppProvider({ children }) {
   const [activeView, setActiveView] = useState(() => readStoredValue("chatworks-active-view", "Chat"));
   const [theme, setTheme] = useState(() => readStoredValue("chatworks-theme", "dark"));
   const [accent, setAccent] = useState(() => readStoredValue("chatworks-accent", DEFAULT_ACCENT));
+  const [engineStatus, setEngineStatus] = useState(null);
 
   useEffect(() => {
     const nextView = VIEWS[activeView] ? activeView : "Chat";
@@ -68,9 +70,23 @@ function AppProvider({ children }) {
     window.localStorage.setItem("chatworks-active-view", activeView);
   }, [activeView]);
 
+  useEffect(() => {
+    let mounted = true;
+    invoke("engine_status")
+      .then((status) => {
+        if (mounted) setEngineStatus(status);
+      })
+      .catch(() => {
+        if (mounted) setEngineStatus(null);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
   const value = useMemo(
-    () => ({ activeView, setActiveView, theme, setTheme, accent, setAccent }),
-    [accent, activeView, theme],
+    () => ({ activeView, setActiveView, theme, setTheme, accent, setAccent, engineStatus }),
+    [accent, activeView, engineStatus, theme],
   );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
@@ -127,8 +143,9 @@ function ActiveScreen() {
 }
 
 function AppShell() {
-  const { activeView, setActiveView, theme, setTheme, accent, setAccent } = useApp();
+  const { activeView, setActiveView, theme, setTheme, accent, setAccent, engineStatus } = useApp();
   const titleInfo = VIEWS[activeView] ?? VIEWS.Chat;
+  const loadedModel = engineStatus?.loaded;
 
   return (
     <main className="app">
@@ -177,11 +194,11 @@ function AppShell() {
           </div>
           <span className="topbar-spacer" />
           <div className="topbar-status">
-            <span className="status-pill warning">
-              <StatusDot ok={false} />
-              No model loaded
+            <span className={loadedModel ? "status-pill" : "status-pill warning"}>
+              <StatusDot ok={Boolean(loadedModel)} />
+              {loadedModel ? loadedModel.name : "No model loaded"}
             </span>
-            <span className="status-pill">API offline</span>
+            <span className="status-pill">Engine actor ready</span>
           </div>
           <div className="accent-picker" role="group" aria-label="Accent color">
             {ACCENTS.map((option) => (

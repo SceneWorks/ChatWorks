@@ -8,7 +8,14 @@ publish = false
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[features]
+default = ["mlx-provider"]
+mlx-provider = ["dep:mlx-llm"]
+
 [dependencies]
+core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
+mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", branch = "main", optional = true }
+serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = [] }
 
 [lints.rust]
