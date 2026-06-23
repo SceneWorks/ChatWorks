@@ -133,6 +133,7 @@ pub fn load_registered_model(
         .find(|model| model.id == model_id)
         .cloned()
         .ok_or_else(|| format!("model {model_id:?} is not in the registry"))?;
+    validate_snapshot(Path::new(&entry.local_path))?;
     let status = engine.load_model(LoadModelRequest {
         source: entry.local_path.clone(),
         display_name: Some(entry.name.clone()),
@@ -228,11 +229,13 @@ async fn import_hf_model_inner(
                     total_bytes,
                 },
             );
+            validate_config_file_if_available(&snapshot_dir, &file.rfilename)?;
             continue;
         }
         download
             .download_file(file, &target, &mut downloaded_bytes)
             .await?;
+        validate_config_file_if_available(&snapshot_dir, &file.rfilename)?;
     }
 
     emit_progress(
@@ -478,6 +481,30 @@ fn validate_snapshot(path: &Path) -> Result<(), String> {
     if !has_safetensors {
         return Err("downloaded snapshot is missing safetensors weights".to_string());
     }
+    validate_text_snapshot_config(path)
+}
+
+fn validate_config_file_if_available(snapshot_dir: &Path, file_name: &str) -> Result<(), String> {
+    if file_name == "config.json" {
+        validate_text_snapshot_config(snapshot_dir)?;
+    }
+    Ok(())
+}
+
+fn validate_text_snapshot_config(path: &Path) -> Result<(), String> {
+    let config_path = path.join("config.json");
+    let body = fs::read_to_string(config_path).map_err(|error| error.to_string())?;
+    let config =
+        serde_json::from_str::<serde_json::Value>(&body).map_err(|error| error.to_string())?;
+    if config.get("vision_config").is_some() {
+        let model_type = config
+            .get("model_type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        return Err(format!(
+            "unsupported model type {model_type}: ChatWorks v1 supports text-only LLM snapshots; multimodal/VLM snapshots with vision_config are not supported"
+        ));
+    }
     Ok(())
 }
 
@@ -664,6 +691,38 @@ mod tests {
     }
 
     #[test]
+    fn accepts_text_only_snapshot_config() {
+        let dir = snapshot_dir("text-only");
+        write_snapshot_file(
+            &dir,
+            "config.json",
+            r#"{"model_type":"qwen3","hidden_size":8}"#,
+        );
+        write_snapshot_file(&dir, "tokenizer.json", "{}");
+        write_snapshot_file(&dir, "model.safetensors", "weights");
+
+        assert!(validate_snapshot(&dir).is_ok());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_multimodal_snapshot_config() {
+        let dir = snapshot_dir("multimodal");
+        write_snapshot_file(
+            &dir,
+            "config.json",
+            r#"{"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text"},"vision_config":{"model_type":"qwen3_5"}}"#,
+        );
+        write_snapshot_file(&dir, "tokenizer.json", "{}");
+        write_snapshot_file(&dir, "model.safetensors", "weights");
+
+        let error = validate_snapshot(&dir).unwrap_err();
+        assert!(error.contains("unsupported model type qwen3_5"));
+        assert!(error.contains("text-only LLM snapshots"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn registry_upsert_replaces_existing_entry() {
         let mut registry = ModelRegistry::default();
         let model_ref = HfModelRef::parse("Qwen/Qwen3-0.6B").unwrap();
@@ -701,5 +760,16 @@ mod tests {
         assert_eq!(registry.models.len(), 1);
         assert_eq!(registry.models[0].name, "new");
         assert_eq!(registry.models[0].file_count, 4);
+    }
+
+    fn snapshot_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("chatworks-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_snapshot_file(dir: &Path, name: &str, body: &str) {
+        fs::write(dir.join(name), body).unwrap();
     }
 }
