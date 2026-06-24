@@ -942,6 +942,7 @@ mod tests {
             Ok(TextLlmOutput {
                 text: "ok".to_string(),
                 thinking,
+                tool_calls: Vec::new(),
                 usage,
                 finish_reason: Some(FinishReason::Stop),
             })

@@ -274,6 +274,8 @@ impl GenerateRequest {
             seed: self.seed,
             constraint: None,
             thinking: self.thinking.into(),
+            // No tools offered yet — request-level tool plumbing lands in sc-7771.
+            tools: Vec::new(),
             stop: self.stop,
             cancel: CancelFlag::new(),
         })
@@ -327,6 +329,7 @@ impl GenerateMessage {
             role: role_from_str(&self.role)?,
             content,
             thinking: None,
+            tool_calls: Vec::new(),
         })
     }
 }
@@ -594,6 +597,7 @@ mod tests {
             Ok(TextLlmOutput {
                 text: "ok".to_string(),
                 thinking: None,
+                tool_calls: Vec::new(),
                 usage,
                 finish_reason: Some(FinishReason::Stop),
             })
