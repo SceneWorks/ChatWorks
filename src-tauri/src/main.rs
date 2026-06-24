@@ -153,6 +153,16 @@ fn load_registered_model(
 }
 
 #[tauri::command]
+fn list_builtin_tools() -> Vec<serde_json::Value> {
+    chatworks::tools::builtin_tool_specs()
+}
+
+#[tauri::command]
+fn execute_tool(name: String, arguments: serde_json::Value) -> Result<String, String> {
+    chatworks::tools::execute_builtin_tool(&name, &arguments)
+}
+
+#[tauri::command]
 fn hf_token_status() -> HfTokenStatus {
     hf_token_status_inner()
 }
@@ -223,6 +233,8 @@ fn main() {
             list_cached_hf_models,
             adopt_cached_hf_model,
             load_registered_model,
+            list_builtin_tools,
+            execute_tool,
             hf_token_status,
             set_hf_token,
             clear_hf_token,

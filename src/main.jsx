@@ -180,6 +180,25 @@ function supportsVision(engineStatus) {
   return engineStatus?.loaded?.provider?.capabilities?.supports_vision === true;
 }
 
+function supportsTools(engineStatus) {
+  return engineStatus?.loaded?.provider?.capabilities?.supports_tools === true;
+}
+
+/// The maximum number of model→tool→model round-trips in a single send, to bound runaway loops.
+const MAX_TOOL_STEPS = 8;
+
+/// Parse an OpenAI tool call's `arguments` (a JSON-encoded string) into an object for `execute_tool`.
+function parseToolArguments(raw) {
+  if (raw && typeof raw === "object") return raw;
+  if (typeof raw !== "string" || !raw.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 function stripThinkBlocks(value) {
   return value.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<think>[\s\S]*$/i, "").trimStart();
 }
@@ -207,22 +226,43 @@ function readSseMessages(buffer, onData) {
   return remaining;
 }
 
-function chatRequestBody({ engineStatus, messages, params, thinkingCapable }) {
+/// Map an in-app message to the OpenAI wire shape: a `tool` result turn, an assistant turn carrying
+/// `tool_calls` (content `null`), a vision turn with `image_url` parts, or a plain text turn.
+function toOpenAiMessage({ role, content, images, tool_calls: toolCalls }) {
+  if (role === "tool") {
+    return { role: "tool", content: content ?? "" };
+  }
+  if (role === "assistant" && toolCalls && toolCalls.length) {
+    return {
+      role: "assistant",
+      content: content ? content : null,
+      tool_calls: toolCalls.map((call, index) => ({
+        id: call.id ?? `call_${index}`,
+        type: "function",
+        function: {
+          name: call.name,
+          arguments:
+            typeof call.arguments === "string"
+              ? call.arguments
+              : JSON.stringify(call.arguments ?? {}),
+        },
+      })),
+    };
+  }
+  if (images && images.length) {
+    const parts = images.map((url) => ({ type: "image_url", image_url: { url } }));
+    if (content) parts.push({ type: "text", text: content });
+    return { role, content: parts };
+  }
+  return { role, content };
+}
+
+function chatRequestBody({ engineStatus, messages, params, thinkingCapable, tools }) {
   const requestMessages = [];
   if (params.systemPrompt.trim()) {
     requestMessages.push({ role: "system", content: params.systemPrompt.trim() });
   }
-  requestMessages.push(
-    ...messages.map(({ role, content, images }) => {
-      // Vision turns send OpenAI content parts (image_url data URLs + text); text turns stay strings.
-      if (images && images.length) {
-        const parts = images.map((url) => ({ type: "image_url", image_url: { url } }));
-        if (content) parts.push({ type: "text", text: content });
-        return { role, content: parts };
-      }
-      return { role, content };
-    }),
-  );
+  requestMessages.push(...messages.map(toOpenAiMessage));
   const body = {
     model: engineStatus?.loaded?.name ?? "chatworks",
     messages: requestMessages,
@@ -235,7 +275,56 @@ function chatRequestBody({ engineStatus, messages, params, thinkingCapable }) {
   if (topP !== undefined) body.top_p = topP;
   if (maxTokens !== undefined) body.max_tokens = maxTokens;
   if (thinkingCapable) body.disable_thinking = params.disableThinking;
+  if (tools && tools.length) body.tools = tools;
   return body;
+}
+
+/// POST one chat completion and consume its SSE stream, calling `onUpdate` as content/reasoning
+/// arrive. Returns the final `{content, thinking, toolCalls, finishReason}`. The local server emits
+/// each tool call whole in the final chunk's `delta.tool_calls`, so calls need no fragment assembly.
+async function streamChatCompletion({ url, headers, body, onUpdate }) {
+  const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+  if (!response.ok) {
+    const errorBody = await response.json().catch(() => null);
+    throw new Error(errorBody?.error?.message ?? `OpenAI API returned HTTP ${response.status}`);
+  }
+  if (!response.body) throw new Error("OpenAI API did not return a stream");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let content = "";
+  let thinking = "";
+  const toolCalls = [];
+  let finishReason = null;
+  let done = false;
+  while (!done) {
+    const chunk = await reader.read();
+    done = chunk.done;
+    buffer += decoder.decode(chunk.value ?? new Uint8Array(), { stream: !done });
+    buffer = readSseMessages(buffer, (data) => {
+      if (data === "[DONE]") return;
+      const eventData = JSON.parse(data);
+      if (eventData.error) throw new Error(eventData.error.message);
+      const choice = eventData.choices?.[0];
+      if (!choice) return;
+      const callDeltas = choice.delta?.tool_calls;
+      if (Array.isArray(callDeltas)) {
+        for (const callDelta of callDeltas) {
+          const fn = callDelta.function ?? {};
+          toolCalls.push({ id: callDelta.id, name: fn.name ?? "", arguments: fn.arguments ?? "" });
+        }
+      }
+      if (choice.finish_reason) finishReason = choice.finish_reason;
+      const contentDelta = choice.delta?.content ?? "";
+      const thinkingDelta = choice.delta?.reasoning_content ?? "";
+      if (contentDelta || thinkingDelta) {
+        content += contentDelta;
+        thinking += thinkingDelta;
+        onUpdate({ content, thinking });
+      }
+    });
+  }
+  return { content, thinking, toolCalls, finishReason };
 }
 
 function MessageContent({ content, thinking, stripThinking }) {
@@ -254,6 +343,43 @@ function MessageContent({ content, thinking, stripThinking }) {
   );
 }
 
+/// Pretty-print a tool call's arguments (a JSON string or object) for display.
+function formatToolArguments(args) {
+  const value = parseToolArguments(args);
+  const text = JSON.stringify(value);
+  return text === "{}" ? "" : JSON.stringify(value, null, 0);
+}
+
+/// Render the tool calls an assistant turn requested.
+function ToolCallList({ calls }) {
+  return (
+    <div className="tool-calls">
+      {calls.map((call, index) => (
+        <div className="tool-call" key={index}>
+          <span className="tool-call-icon" aria-hidden="true">🛠</span>
+          <code className="tool-call-sig">
+            {call.name}({formatToolArguments(call.arguments)})
+          </code>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/// Render a tool-result turn (the executed output, an error, or a denial).
+function ToolResult({ message }) {
+  const status = message.denied ? "denied" : message.isError ? "error" : "ok";
+  return (
+    <div className={`tool-result tool-result-${status}`}>
+      <div className="tool-result-head">
+        {message.name ? <code>{message.name}</code> : null}
+        <span className="tool-result-tag">{status}</span>
+      </div>
+      <pre className="tool-result-body">{message.content}</pre>
+    </div>
+  );
+}
+
 function ChatScreen() {
   const { engineStatus, refreshEngineStatus, appSettings, apiAuthToken } = useApp();
   const [serverStatus, setServerStatus] = useState(null);
@@ -263,11 +389,46 @@ function ChatScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [attachments, setAttachments] = useState([]); // image data URLs for the next turn
+  const [toolSpecs, setToolSpecs] = useState([]); // OpenAI function-tool defs from the backend
+  const [toolsEnabled, setToolsEnabled] = useState(true); // offer tools when the model supports them
+  const [pendingApproval, setPendingApproval] = useState(null); // {calls, decisions, resolve}
   const thinkingCapable = supportsThinking(engineStatus);
   const visionCapable = supportsVision(engineStatus);
+  const toolsCapable = supportsTools(engineStatus);
   const apiBase = buildLocalApiBase(serverStatus);
   const canSend =
     Boolean(engineStatus?.loaded) && !busy && (Boolean(draft.trim()) || attachments.length > 0);
+
+  // Load the built-in tool definitions once; the chat loop offers them when tools are enabled.
+  useEffect(() => {
+    invoke("list_builtin_tools")
+      .then((specs) => setToolSpecs(Array.isArray(specs) ? specs : []))
+      .catch(() => setToolSpecs([]));
+  }, []);
+
+  // Resolve the pending approval promise once every proposed call has an Approve/Deny decision.
+  useEffect(() => {
+    if (pendingApproval && pendingApproval.decisions.every((decision) => decision !== null)) {
+      pendingApproval.resolve(pendingApproval.decisions);
+      setPendingApproval(null);
+    }
+  }, [pendingApproval]);
+
+  // Open the approval panel for a turn's tool calls; resolves with a per-call approve/deny array.
+  const requestApproval = useCallback((calls) => {
+    return new Promise((resolve) => {
+      setPendingApproval({ calls, decisions: calls.map(() => null), resolve });
+    });
+  }, []);
+
+  const decideApproval = useCallback((index, approved) => {
+    setPendingApproval((current) => {
+      if (!current) return current;
+      const decisions = current.decisions.slice();
+      decisions[index] = approved;
+      return { ...current, decisions };
+    });
+  }, []);
 
   const refreshServerStatus = useCallback(() => {
     return invoke("openai_server_status")
@@ -295,61 +456,94 @@ function ChatScreen() {
     setBusy(true);
     setError(null);
     const userMessage = { role: "user", content: draft.trim(), images: attachments };
-    const nextMessages = [...messages, userMessage];
-    const assistantMessage = { role: "assistant", content: "", thinking: "" };
-    setMessages([...nextMessages, assistantMessage]);
+    // `conversation` is the committed transcript; the in-flight assistant turn is appended for
+    // rendering and only committed once it finishes streaming.
+    let conversation = [...messages, userMessage];
+    setMessages(conversation);
     setDraft("");
     setAttachments([]);
     try {
       const status = await refreshServerStatus();
       const nextEngineStatus = await refreshEngineStatus();
+      const activeEngineStatus = nextEngineStatus ?? engineStatus;
+      const url = `${buildLocalApiBase(status)}/v1/chat/completions`;
       const headers = { "Content-Type": "application/json" };
       if (appSettings.server.authEnabled && apiAuthToken) {
         headers.Authorization = `Bearer ${apiAuthToken}`;
       }
-      const response = await fetch(`${buildLocalApiBase(status)}/v1/chat/completions`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(
-          chatRequestBody({
-            engineStatus: nextEngineStatus ?? engineStatus,
-            messages: nextMessages,
+      const offerTools = toolsEnabled && supportsTools(activeEngineStatus) && toolSpecs.length > 0;
+
+      let hitStepLimit = true;
+      for (let step = 0; step < MAX_TOOL_STEPS; step += 1) {
+        const committed = conversation;
+        const assistantMessage = { role: "assistant", content: "", thinking: "" };
+        setMessages([...committed, assistantMessage]);
+
+        const result = await streamChatCompletion({
+          url,
+          headers,
+          body: chatRequestBody({
+            engineStatus: activeEngineStatus,
+            messages: committed,
             params,
             thinkingCapable,
+            tools: offerTools ? toolSpecs : null,
           }),
-        ),
-      });
-      if (!response.ok) {
-        const body = await response.json().catch(() => null);
-        throw new Error(body?.error?.message ?? `OpenAI API returned HTTP ${response.status}`);
-      }
-      if (!response.body) throw new Error("OpenAI API did not return a stream");
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let content = "";
-      let thinking = "";
-      let done = false;
-      while (!done) {
-        const chunk = await reader.read();
-        done = chunk.done;
-        buffer += decoder.decode(chunk.value ?? new Uint8Array(), { stream: !done });
-        buffer = readSseMessages(buffer, (data) => {
-          if (data === "[DONE]") return;
-          const eventData = JSON.parse(data);
-          if (eventData.error) throw new Error(eventData.error.message);
-          const choice = eventData.choices?.[0];
-          const contentDelta = choice?.delta?.content ?? "";
-          const thinkingDelta = choice?.delta?.reasoning_content ?? "";
-          if (!contentDelta && !thinkingDelta) return;
-          content += contentDelta;
-          thinking += thinkingDelta;
-          setMessages([...nextMessages, { ...assistantMessage, content, thinking }]);
+          onUpdate: ({ content, thinking }) =>
+            setMessages([...committed, { ...assistantMessage, content, thinking }]),
         });
+
+        // Commit the assistant turn (with any tool calls it requested).
+        const finalAssistant = { role: "assistant", content: result.content, thinking: result.thinking };
+        if (result.toolCalls.length) finalAssistant.tool_calls = result.toolCalls;
+        conversation = [...committed, finalAssistant];
+        setMessages(conversation);
+
+        if (!result.toolCalls.length) {
+          hitStepLimit = false;
+          break;
+        }
+
+        // Human-in-the-loop: approve/deny each call, then execute the approved ones in the backend.
+        const decisions = await requestApproval(result.toolCalls);
+        const toolMessages = [];
+        for (let i = 0; i < result.toolCalls.length; i += 1) {
+          const call = result.toolCalls[i];
+          if (!decisions[i]) {
+            toolMessages.push({
+              role: "tool",
+              name: call.name,
+              content: "Tool call denied by the user.",
+              denied: true,
+            });
+            continue;
+          }
+          try {
+            const output = await invoke("execute_tool", {
+              name: call.name,
+              arguments: parseToolArguments(call.arguments),
+            });
+            toolMessages.push({ role: "tool", name: call.name, content: String(output) });
+          } catch (cause) {
+            toolMessages.push({
+              role: "tool",
+              name: call.name,
+              content: `Error: ${String(cause?.message ?? cause)}`,
+              isError: true,
+            });
+          }
+        }
+        conversation = [...conversation, ...toolMessages];
+        setMessages(conversation);
+        // Loop: re-send the transcript (now with the tool results) for the model's next turn.
+      }
+
+      if (hitStepLimit) {
+        setError(`Stopped after the tool-call step limit (${MAX_TOOL_STEPS}).`);
       }
     } catch (cause) {
       setError(String(cause?.message ?? cause));
-      setMessages(nextMessages);
+      setMessages(conversation); // drop the in-flight assistant placeholder, keep committed turns
     } finally {
       setBusy(false);
     }
@@ -385,27 +579,66 @@ function ChatScreen() {
 
         <div className="message-list" aria-live="polite">
           {messages.length ? (
-            messages.map((message, index) => (
-              <article className={`message-bubble ${message.role}`} key={`${message.role}-${index}`}>
-                <div className="message-role">{message.role}</div>
-                {message.images && message.images.length ? (
-                  <div className="message-images">
-                    {message.images.map((url, imageIndex) => (
-                      <img key={imageIndex} className="message-image" src={url} alt={`attachment ${imageIndex + 1}`} />
-                    ))}
-                  </div>
-                ) : null}
-                <MessageContent
-                  content={message.content}
-                  thinking={message.thinking}
-                  stripThinking={thinkingCapable && params.disableThinking}
-                />
-              </article>
-            ))
+            messages.map((message, index) => {
+              const hasToolCalls = Boolean(message.tool_calls && message.tool_calls.length);
+              return (
+                <article className={`message-bubble ${message.role}`} key={`${message.role}-${index}`}>
+                  <div className="message-role">{message.role}</div>
+                  {message.images && message.images.length ? (
+                    <div className="message-images">
+                      {message.images.map((url, imageIndex) => (
+                        <img key={imageIndex} className="message-image" src={url} alt={`attachment ${imageIndex + 1}`} />
+                      ))}
+                    </div>
+                  ) : null}
+                  {message.role === "tool" ? (
+                    <ToolResult message={message} />
+                  ) : (
+                    <>
+                      {message.content || !hasToolCalls ? (
+                        <MessageContent
+                          content={message.content}
+                          thinking={message.thinking}
+                          stripThinking={thinkingCapable && params.disableThinking}
+                        />
+                      ) : null}
+                      {hasToolCalls ? <ToolCallList calls={message.tool_calls} /> : null}
+                    </>
+                  )}
+                </article>
+              );
+            })
           ) : (
             <div className="empty-panel">Ask a question to start a multi-turn chat with the served model.</div>
           )}
         </div>
+
+        {pendingApproval ? (
+          <div className="tool-approval" role="alertdialog" aria-label="Approve tool calls">
+            <p className="tool-approval-title">The model wants to run a tool. Approve to execute it locally.</p>
+            {pendingApproval.calls.map((call, index) => (
+              <div className="tool-approval-row" key={index}>
+                <code className="tool-call-sig">
+                  {call.name}({formatToolArguments(call.arguments)})
+                </code>
+                {pendingApproval.decisions[index] === null ? (
+                  <span className="tool-approval-actions">
+                    <button className="primary-btn" type="button" onClick={() => decideApproval(index, true)}>
+                      Approve
+                    </button>
+                    <button className="ghost-btn" type="button" onClick={() => decideApproval(index, false)}>
+                      Deny
+                    </button>
+                  </span>
+                ) : (
+                  <span className="tool-approval-decided">
+                    {pendingApproval.decisions[index] ? "Approved" : "Denied"}
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        ) : null}
 
         {error ? <p className="form-error" role="alert">{error}</p> : null}
 
@@ -541,6 +774,21 @@ function ChatScreen() {
             <span>
               Disable thinking
               <small>No-think request flag and hidden &lt;think&gt; output.</small>
+            </span>
+          </label>
+        ) : null}
+        {toolsCapable ? (
+          <label className="toggle-row">
+            <input
+              checked={toolsEnabled}
+              onChange={(event) => setToolsEnabled(event.target.checked)}
+              type="checkbox"
+            />
+            <span>
+              Enable tools
+              <small>
+                Offer {toolSpecs.length} built-in tool{toolSpecs.length === 1 ? "" : "s"}; each call needs your approval.
+              </small>
             </span>
           </label>
         ) : null}
