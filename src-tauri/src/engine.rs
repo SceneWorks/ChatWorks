@@ -5,9 +5,10 @@ use std::thread;
 use core_llm::{
     load_for_model, CancelFlag, Channel, Content, FinishReason, ImageRef, LoadSpec, Message,
     Quantize, Role, Sampling, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor,
-    TextLlmRequest, ThinkingMode, Usage,
+    TextLlmRequest, ThinkingMode, ToolCall, ToolSpec, Usage,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 pub type EngineResult<T> = Result<T, String>;
 
@@ -177,6 +178,11 @@ impl EngineActor {
         Ok(GenerateResponse {
             text: output.text,
             thinking: output.thinking,
+            tool_calls: output
+                .tool_calls
+                .into_iter()
+                .map(GenerateToolCall::from)
+                .collect(),
             usage: UsagePayload::from(output.usage),
             finish_reason: output
                 .finish_reason
@@ -256,6 +262,12 @@ pub struct GenerateRequest {
     pub stop: Vec<String>,
     #[serde(default)]
     pub thinking: ThinkingRequest,
+    /// Tools / functions offered to the model. Rendered into the prompt by the chat template and used
+    /// to type-coerce the model's parsed tool calls. Honored only by providers advertising
+    /// `supports_tools`; a non-empty `tools` on a provider without it is rejected by the provider's
+    /// `validate` (surfaced as a 400). Empty ⇒ no tool section, behavior unchanged.
+    #[serde(default)]
+    pub tools: Vec<GenerateTool>,
 }
 
 impl GenerateRequest {
@@ -274,11 +286,65 @@ impl GenerateRequest {
             seed: self.seed,
             constraint: None,
             thinking: self.thinking.into(),
-            // No tools offered yet — request-level tool plumbing lands in sc-7771.
-            tools: Vec::new(),
+            tools: self
+                .tools
+                .into_iter()
+                .map(GenerateTool::into_core)
+                .collect(),
             stop: self.stop,
             cancel: CancelFlag::new(),
         })
+    }
+}
+
+/// A function offered to the model, mirroring [`core_llm::ToolSpec`] (the OpenAI function-tool shape).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GenerateTool {
+    /// The function name the model calls.
+    pub name: String,
+    /// What the function does and when to use it.
+    #[serde(default)]
+    pub description: String,
+    /// JSON-Schema for the call arguments (typically an `{"type":"object","properties":{…}}` object);
+    /// rendered into the prompt verbatim and used to type-coerce parsed arguments.
+    #[serde(default = "default_tool_parameters")]
+    pub parameters: Value,
+}
+
+impl GenerateTool {
+    fn into_core(self) -> ToolSpec {
+        ToolSpec::new(self.name, self.description, self.parameters)
+    }
+}
+
+/// A no-argument function's default schema (an empty object), matching the `transformers` convention.
+fn default_tool_parameters() -> Value {
+    serde_json::json!({"type": "object", "properties": {}})
+}
+
+/// A tool / function call: an assistant turn's call (multi-turn input) and the model's parsed output,
+/// mirroring [`core_llm::ToolCall`].
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GenerateToolCall {
+    /// The called function's name.
+    pub name: String,
+    /// The call arguments as an ordered name→value map (insertion order preserved).
+    #[serde(default)]
+    pub arguments: Map<String, Value>,
+}
+
+impl GenerateToolCall {
+    fn into_core(self) -> ToolCall {
+        ToolCall::new(self.name, self.arguments)
+    }
+}
+
+impl From<ToolCall> for GenerateToolCall {
+    fn from(value: ToolCall) -> Self {
+        Self {
+            name: value.name,
+            arguments: value.arguments,
+        }
     }
 }
 
@@ -313,6 +379,11 @@ pub struct GenerateMessage {
     /// Decoded to RGB8 and placed *before* the text block, matching the Qwen-VL convention.
     #[serde(default)]
     pub images: Vec<String>,
+    /// An assistant turn's tool / function calls, re-rendered by the chat template to continue a
+    /// multi-step tool exchange (paired with the following `tool`-role result turn). Empty for
+    /// non-tool turns.
+    #[serde(default)]
+    pub tool_calls: Vec<GenerateToolCall>,
 }
 
 impl GenerateMessage {
@@ -329,7 +400,11 @@ impl GenerateMessage {
             role: role_from_str(&self.role)?,
             content,
             thinking: None,
-            tool_calls: Vec::new(),
+            tool_calls: self
+                .tool_calls
+                .into_iter()
+                .map(GenerateToolCall::into_core)
+                .collect(),
         })
     }
 }
@@ -435,6 +510,7 @@ pub struct CapabilitySummary {
     pub supports_system_prompt: bool,
     pub supports_vision: bool,
     pub supports_thinking: bool,
+    pub supports_tools: bool,
     pub supported_constraints: Vec<String>,
 }
 
@@ -446,6 +522,7 @@ impl From<TextLlmCapabilities> for CapabilitySummary {
             supports_system_prompt: value.supports_system_prompt,
             supports_vision: value.supports_vision,
             supports_thinking: value.supports_thinking,
+            supports_tools: value.supports_tools,
             supported_constraints: value
                 .supported_constraints
                 .into_iter()
@@ -459,6 +536,8 @@ impl From<TextLlmCapabilities> for CapabilitySummary {
 pub struct GenerateResponse {
     pub text: String,
     pub thinking: Option<String>,
+    /// Tool / function calls the model emitted (empty if none, or if the request offered no tools).
+    pub tool_calls: Vec<GenerateToolCall>,
     pub usage: UsagePayload,
     pub finish_reason: String,
 }
@@ -642,12 +721,14 @@ mod tests {
                         role: "user".to_string(),
                         content: "hello".to_string(),
                         images: Vec::new(),
+                        tool_calls: Vec::new(),
                     }],
                     sampling: SamplingRequest::default(),
                     max_new_tokens: 8,
                     seed: None,
                     stop: Vec::new(),
                     thinking: ThinkingRequest::Auto,
+                    tools: Vec::new(),
                 },
                 |event| events.push(event),
             )
@@ -668,12 +749,14 @@ mod tests {
                     role: "user".to_string(),
                     content: "hello".to_string(),
                     images: Vec::new(),
+                    tool_calls: Vec::new(),
                 }],
                 sampling: SamplingRequest::default(),
                 max_new_tokens: 8,
                 seed: None,
                 stop: Vec::new(),
                 thinking: ThinkingRequest::Auto,
+                tools: Vec::new(),
             },
             |_| {},
         );

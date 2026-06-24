@@ -11,14 +11,16 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::app_settings::SamplingDefaults;
 use crate::engine::{
-    EngineHandle, GenerateMessage, GenerateRequest, GenerateResponse, LoadedModelStatus,
-    SamplingRequest, StreamChannel, StreamPayload, ThinkingRequest, UsagePayload,
+    EngineHandle, GenerateMessage, GenerateRequest, GenerateResponse, GenerateTool,
+    GenerateToolCall, LoadedModelStatus, SamplingRequest, StreamChannel, StreamPayload,
+    ThinkingRequest, UsagePayload,
 };
 
 pub const DEFAULT_OPENAI_HOST: &str = "127.0.0.1";
@@ -367,12 +369,23 @@ fn stream_chat_completion(
 
         match result {
             Ok(response) => {
+                // The provider surfaces tool calls only at end-of-generation, so emit them whole in
+                // the final chunk and finish with `tool_calls` (end granularity is correct here).
+                let (finish_reason, tool_calls) = if response.tool_calls.is_empty() {
+                    (response.finish_reason, Vec::new())
+                } else {
+                    (
+                        "tool_calls".to_string(),
+                        tool_calls_delta(response.tool_calls),
+                    )
+                };
                 let finish = OpenAiChatChunk::finish(
                     id.clone(),
                     created,
                     model.clone(),
-                    response.finish_reason,
+                    finish_reason,
                     Some(OpenAiUsage::from(response.usage)),
+                    tool_calls,
                 );
                 let _ = tx.blocking_send(Ok(sse_json(&finish)));
                 let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
@@ -567,6 +580,11 @@ struct OpenAiChatRequest {
     stop: Option<StopValue>,
     #[serde(default)]
     disable_thinking: Option<bool>,
+    /// Tools / functions offered to the model, in the OpenAI function-tool shape
+    /// (`{"type":"function","function":{"name","description","parameters"}}`). Threaded to the
+    /// provider, which rejects them with a 400 if it does not advertise tool support.
+    #[serde(default)]
+    tools: Option<Vec<OpenAiTool>>,
 }
 
 impl OpenAiChatRequest {
@@ -591,11 +609,18 @@ impl OpenAiChatRequest {
                 role: "system".to_string(),
                 content: defaults.system_prompt.clone(),
                 images: Vec::new(),
+                tool_calls: Vec::new(),
             });
         }
         for message in self.messages {
             messages.push(message.into_generate()?);
         }
+        let tools = self
+            .tools
+            .unwrap_or_default()
+            .into_iter()
+            .map(OpenAiTool::into_generate)
+            .collect::<Result<Vec<_>, _>>()?;
         let disable_thinking = self.disable_thinking.unwrap_or(defaults.disable_thinking);
         Ok(GenerateRequest {
             messages,
@@ -617,24 +642,114 @@ impl OpenAiChatRequest {
             } else {
                 ThinkingRequest::Auto
             },
+            tools,
         })
     }
 }
 
+/// An offered tool in the OpenAI function-tool shape. Only `type: "function"` is supported.
+#[derive(Deserialize)]
+struct OpenAiTool {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    function: OpenAiFunctionDef,
+}
+
+#[derive(Deserialize)]
+struct OpenAiFunctionDef {
+    name: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    parameters: Option<Value>,
+}
+
+impl OpenAiTool {
+    fn into_generate(self) -> Result<GenerateTool, ApiError> {
+        if let Some(kind) = self.kind.as_deref() {
+            if kind != "function" {
+                return Err(ApiError::bad_request(format!(
+                    "unsupported tool type '{kind}' (only 'function' is supported)"
+                )));
+            }
+        }
+        Ok(GenerateTool {
+            name: self.function.name,
+            description: self.function.description.unwrap_or_default(),
+            parameters: self
+                .function
+                .parameters
+                .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}})),
+        })
+    }
+}
+
+/// An inbound chat message. `content` is optional: an assistant tool-call turn carries `tool_calls`
+/// with `content: null`. OpenAI's `tool_call_id` (on `tool`-role result turns) and a tool call's
+/// `id` / `type` are accepted but not forwarded — the core contract carries no call id and Qwen3.6's
+/// chat template renders tool results positionally, so the id never reaches the rendered prompt.
 #[derive(Deserialize)]
 struct OpenAiChatMessage {
     role: String,
-    content: OpenAiMessageContent,
+    #[serde(default)]
+    content: Option<OpenAiMessageContent>,
+    #[serde(default)]
+    tool_calls: Vec<OpenAiToolCall>,
 }
 
 impl OpenAiChatMessage {
     fn into_generate(self) -> Result<GenerateMessage, ApiError> {
-        let (content, images) = self.content.into_parts()?;
+        let (content, images) = match self.content {
+            Some(content) => content.into_parts()?,
+            None => (String::new(), Vec::new()),
+        };
         Ok(GenerateMessage {
             role: self.role,
             content,
             images,
+            tool_calls: self
+                .tool_calls
+                .into_iter()
+                .map(OpenAiToolCall::into_generate)
+                .collect::<Result<Vec<_>, _>>()?,
         })
+    }
+}
+
+/// A prior assistant turn's tool call in the OpenAI shape; its `arguments` is a JSON-encoded string.
+#[derive(Deserialize)]
+struct OpenAiToolCall {
+    function: OpenAiFunctionCall,
+}
+
+#[derive(Deserialize)]
+struct OpenAiFunctionCall {
+    name: String,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+impl OpenAiToolCall {
+    fn into_generate(self) -> Result<GenerateToolCall, ApiError> {
+        Ok(GenerateToolCall {
+            name: self.function.name,
+            arguments: parse_tool_arguments(self.function.arguments)?,
+        })
+    }
+}
+
+/// Decode an OpenAI tool call's JSON-encoded `arguments` string into the argument map. Absent or
+/// empty ⇒ no arguments; a string that is not a JSON object is a 400 (rather than a silent guess).
+fn parse_tool_arguments(raw: Option<String>) -> Result<Map<String, Value>, ApiError> {
+    match raw {
+        None => Ok(Map::new()),
+        Some(value) if value.trim().is_empty() => Ok(Map::new()),
+        Some(value) => serde_json::from_str::<Value>(&value)
+            .ok()
+            .and_then(|parsed| parsed.as_object().cloned())
+            .ok_or_else(|| {
+                ApiError::bad_request("tool_call function.arguments must be a JSON object string")
+            }),
     }
 }
 
@@ -721,6 +836,27 @@ struct OpenAiChatResponse {
 
 impl OpenAiChatResponse {
     fn from_generate(model: String, response: GenerateResponse) -> Self {
+        let GenerateResponse {
+            text,
+            thinking,
+            tool_calls,
+            usage,
+            finish_reason,
+        } = response;
+        let has_tool_calls = !tool_calls.is_empty();
+        // A tool-call turn finishes with `tool_calls`, overriding the engine's stop/length reason.
+        let finish_reason = if has_tool_calls {
+            "tool_calls".to_string()
+        } else {
+            finish_reason
+        };
+        // OpenAI sets `content` to null on a pure tool-call turn (no preamble text); a turn that
+        // produced answer text before the call keeps that text.
+        let content = if text.is_empty() && has_tool_calls {
+            None
+        } else {
+            Some(text)
+        };
         Self {
             id: completion_id(),
             object: "chat.completion",
@@ -730,13 +866,14 @@ impl OpenAiChatResponse {
                 index: 0,
                 message: Some(OpenAiResponseMessage {
                     role: "assistant",
-                    content: response.text,
-                    reasoning_content: response.thinking,
+                    content,
+                    reasoning_content: thinking,
+                    tool_calls: tool_calls_message(tool_calls),
                 }),
                 delta: None,
-                finish_reason: Some(response.finish_reason),
+                finish_reason: Some(finish_reason),
             }],
-            usage: OpenAiUsage::from(response.usage),
+            usage: OpenAiUsage::from(usage),
         }
     }
 }
@@ -765,6 +902,7 @@ impl OpenAiChatChunk {
                 delta: Some(OpenAiDelta {
                     content: Some(content),
                     reasoning_content: None,
+                    tool_calls: Vec::new(),
                 }),
                 finish_reason: None,
             }],
@@ -784,6 +922,7 @@ impl OpenAiChatChunk {
                 delta: Some(OpenAiDelta {
                     content: None,
                     reasoning_content: Some(content),
+                    tool_calls: Vec::new(),
                 }),
                 finish_reason: None,
             }],
@@ -797,6 +936,7 @@ impl OpenAiChatChunk {
         model: String,
         finish_reason: String,
         usage: Option<OpenAiUsage>,
+        tool_calls: Vec<OpenAiToolCallDelta>,
     ) -> Self {
         Self {
             id,
@@ -809,6 +949,7 @@ impl OpenAiChatChunk {
                 delta: Some(OpenAiDelta {
                     content: None,
                     reasoning_content: None,
+                    tool_calls,
                 }),
                 finish_reason: Some(finish_reason),
             }],
@@ -830,9 +971,15 @@ struct OpenAiChatChoice {
 #[derive(Serialize)]
 struct OpenAiResponseMessage {
     role: &'static str,
-    content: String,
+    /// The answer text. Serialized as `null` (present, not omitted) on a pure tool-call turn, matching
+    /// OpenAI; a text turn (incl. an empty one) carries the string, so the text path stays byte-identical.
+    content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
+    /// The model's tool calls, in the OpenAI shape. Skipped (not emitted) when empty so a text-only
+    /// response stays byte-identical.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<OpenAiToolCallOut>,
 }
 
 #[derive(Serialize)]
@@ -841,6 +988,79 @@ struct OpenAiDelta {
     content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<String>,
+    /// Tool calls, surfaced in one delta on the final chunk (the provider produces calls only at
+    /// end-of-generation). Skipped when empty so text/reasoning chunks stay byte-identical.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tool_calls: Vec<OpenAiToolCallDelta>,
+}
+
+/// A model tool call on a non-streaming response message (OpenAI `message.tool_calls[*]`).
+#[derive(Serialize)]
+struct OpenAiToolCallOut {
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: OpenAiFunctionCallOut,
+}
+
+/// A model tool call on a streaming delta (OpenAI `delta.tool_calls[*]`) — adds the `index` that
+/// correlates fragments across chunks (we emit each call whole in one chunk, so it is just its slot).
+#[derive(Serialize)]
+struct OpenAiToolCallDelta {
+    index: u32,
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: OpenAiFunctionCallOut,
+}
+
+#[derive(Serialize)]
+struct OpenAiFunctionCallOut {
+    name: String,
+    /// The arguments as the JSON-encoded string OpenAI carries on the wire.
+    arguments: String,
+}
+
+impl OpenAiFunctionCallOut {
+    fn from_call(call: GenerateToolCall) -> Self {
+        Self {
+            arguments: serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_string()),
+            name: call.name,
+        }
+    }
+}
+
+/// Synthesize the OpenAI call id (the provider does not assign one); the index keeps it unique within
+/// a single response even at nanosecond granularity.
+fn tool_call_id(index: usize) -> String {
+    format!("call_{}_{index}", timestamp_nanos())
+}
+
+/// The model's tool calls as non-streaming `message.tool_calls`.
+fn tool_calls_message(calls: Vec<GenerateToolCall>) -> Vec<OpenAiToolCallOut> {
+    calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, call)| OpenAiToolCallOut {
+            id: tool_call_id(index),
+            kind: "function",
+            function: OpenAiFunctionCallOut::from_call(call),
+        })
+        .collect()
+}
+
+/// The model's tool calls as streaming `delta.tool_calls`.
+fn tool_calls_delta(calls: Vec<GenerateToolCall>) -> Vec<OpenAiToolCallDelta> {
+    calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, call)| OpenAiToolCallDelta {
+            index: index as u32,
+            id: tool_call_id(index),
+            kind: "function",
+            function: OpenAiFunctionCallOut::from_call(call),
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -975,6 +1195,96 @@ mod tests {
             })
             .unwrap();
         engine
+    }
+
+    /// A tool-capable provider that echoes the offered tools back as a single `get_weather(Paris)`
+    /// call, so the OpenAI tool_calls + finish_reason path can be exercised without real weights.
+    struct FakeToolProvider {
+        descriptor: TextLlmDescriptor,
+    }
+
+    impl TextLlm for FakeToolProvider {
+        fn descriptor(&self) -> &TextLlmDescriptor {
+            &self.descriptor
+        }
+
+        fn validate(&self, req: &TextLlmRequest) -> core_llm::Result<()> {
+            self.descriptor
+                .capabilities
+                .validate_request(&self.descriptor.id, req)
+        }
+
+        fn generate(
+            &self,
+            req: &TextLlmRequest,
+            on_event: &mut dyn FnMut(core_llm::StreamEvent),
+        ) -> core_llm::Result<TextLlmOutput> {
+            self.validate(req)?;
+            // The tools must have been threaded through to the core request.
+            assert_eq!(req.tools.len(), 1);
+            assert_eq!(req.tools[0].name, "get_weather");
+            let usage = Usage {
+                prompt_tokens: 3,
+                generated_tokens: 4,
+            };
+            on_event(core_llm::StreamEvent::Done {
+                finish_reason: FinishReason::Stop,
+                usage,
+            });
+            let mut arguments = serde_json::Map::new();
+            arguments.insert("location".to_string(), json!("Paris"));
+            Ok(TextLlmOutput {
+                text: String::new(),
+                thinking: None,
+                tool_calls: vec![core_llm::ToolCall::new("get_weather", arguments)],
+                usage,
+                finish_reason: Some(FinishReason::Stop),
+            })
+        }
+    }
+
+    fn fake_tool_loader(_: &LoadSpec) -> core_llm::Result<Box<dyn TextLlm>> {
+        Ok(Box::new(FakeToolProvider {
+            descriptor: TextLlmDescriptor {
+                id: "fake-tools".to_string(),
+                family: "test".to_string(),
+                backend: "unit".to_string(),
+                capabilities: TextLlmCapabilities {
+                    supports_system_prompt: true,
+                    supports_tools: true,
+                    max_new_tokens: 64,
+                    ..Default::default()
+                },
+            },
+        }))
+    }
+
+    fn loaded_tool_engine() -> EngineHandle {
+        let engine = EngineHandle::spawn_with_loader(fake_tool_loader);
+        engine
+            .load_model(crate::engine::LoadModelRequest {
+                source: "/tmp/fake-tools".to_string(),
+                display_name: Some("fake-tools".to_string()),
+                quantize: None,
+            })
+            .unwrap();
+        engine
+    }
+
+    /// The OpenAI `get_weather` function tool used by the tool-calling tests.
+    fn weather_tool() -> Value {
+        json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get the weather for a city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"]
+                }
+            }
+        })
     }
 
     fn test_sampling_defaults() -> SamplingDefaults {
@@ -1286,6 +1596,189 @@ mod tests {
         assert!(denied.starts_with("HTTP/1.1 401 Unauthorized"));
         let allowed = http_get(&addr, "/v1/models", Some("secret"));
         assert!(allowed.starts_with("HTTP/1.1 200 OK"));
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn threads_offered_tools_into_generate_request() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "weather in Paris?"}],
+            "tools": [weather_tool()]
+        }))
+        .unwrap();
+        let generate = request.into_generate(&test_sampling_defaults()).unwrap();
+        assert_eq!(generate.tools.len(), 1);
+        assert_eq!(generate.tools[0].name, "get_weather");
+        assert_eq!(generate.tools[0].description, "Get the weather for a city");
+        assert_eq!(
+            generate.tools[0].parameters["properties"]["location"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn rejects_non_function_tool_type() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "retrieval", "function": {"name": "x"}}]
+        }))
+        .unwrap();
+        let err = request
+            .into_generate(&test_sampling_defaults())
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn round_trips_assistant_tool_calls_and_tool_result() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [
+                {"role": "user", "content": "weather in Paris?"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function", "function": {
+                        "name": "get_weather", "arguments": "{\"location\":\"Paris\"}"
+                    }}
+                ]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny, 24C"}
+            ]
+        }))
+        .unwrap();
+        let generate = request.into_generate(&test_sampling_defaults()).unwrap();
+        assert_eq!(generate.messages.len(), 3);
+        // The assistant turn carries the tool call and no textual content.
+        assert_eq!(generate.messages[1].role, "assistant");
+        assert_eq!(generate.messages[1].content, "");
+        assert_eq!(generate.messages[1].tool_calls.len(), 1);
+        assert_eq!(generate.messages[1].tool_calls[0].name, "get_weather");
+        assert_eq!(
+            generate.messages[1].tool_calls[0].arguments["location"],
+            "Paris"
+        );
+        // The tool result round-trips as a `tool`-role text turn (already mapped to Role::Tool).
+        assert_eq!(generate.messages[2].role, "tool");
+        assert_eq!(generate.messages[2].content, "sunny, 24C");
+    }
+
+    #[test]
+    fn rejects_non_object_tool_call_arguments() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "assistant", "tool_calls": [
+                {"type": "function", "function": {"name": "get_weather", "arguments": "not json"}}
+            ]}]
+        }))
+        .unwrap();
+        let err = request
+            .into_generate(&test_sampling_defaults())
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn returns_tool_calls_with_finish_reason() {
+        let server = OpenAiServerHandle::new();
+        let status = server
+            .start(
+                OpenAiServerConfig {
+                    port: 0,
+                    sampling_defaults: test_sampling_defaults(),
+                    ..Default::default()
+                },
+                loaded_tool_engine(),
+            )
+            .unwrap();
+        let addr = status.bound_addr.unwrap();
+        let response = http_post_json(
+            &addr,
+            "/v1/chat/completions",
+            json!({
+                "model": "fake-tools",
+                "messages": [{"role": "user", "content": "weather in Paris?"}],
+                "tools": [weather_tool()],
+                "max_tokens": 16
+            }),
+            None,
+        );
+        let body: Value = serde_json::from_str(response_body(&response)).unwrap();
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        // A pure tool-call turn carries `content: null` (present, OpenAI-style), not "".
+        assert!(body["choices"][0]["message"]["content"].is_null());
+        let call = &body["choices"][0]["message"]["tool_calls"][0];
+        assert_eq!(call["type"], "function");
+        assert!(call["id"].as_str().unwrap().starts_with("call_"));
+        assert_eq!(call["function"]["name"], "get_weather");
+        // OpenAI carries arguments as a JSON-encoded string; it must decode to the call args.
+        let args: Value =
+            serde_json::from_str(call["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["location"], "Paris");
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn streams_tool_calls_at_finish() {
+        let server = OpenAiServerHandle::new();
+        let status = server
+            .start(
+                OpenAiServerConfig {
+                    port: 0,
+                    sampling_defaults: test_sampling_defaults(),
+                    ..Default::default()
+                },
+                loaded_tool_engine(),
+            )
+            .unwrap();
+        let addr = status.bound_addr.unwrap();
+        let response = http_post_json(
+            &addr,
+            "/v1/chat/completions",
+            json!({
+                "model": "fake-tools",
+                "messages": [{"role": "user", "content": "weather in Paris?"}],
+                "tools": [weather_tool()],
+                "stream": true,
+                "max_tokens": 16
+            }),
+            None,
+        );
+        assert!(response.contains("\"finish_reason\":\"tool_calls\""));
+        assert!(response.contains("\"name\":\"get_weather\""));
+        assert!(response.contains("\"index\":0"));
+        assert!(response.contains("Paris"));
+        assert!(response.contains("data: [DONE]"));
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn rejects_tools_on_provider_without_tool_support() {
+        let server = OpenAiServerHandle::new();
+        let status = server
+            .start(
+                OpenAiServerConfig {
+                    port: 0,
+                    sampling_defaults: test_sampling_defaults(),
+                    ..Default::default()
+                },
+                loaded_fake_engine(),
+            )
+            .unwrap();
+        let addr = status.bound_addr.unwrap();
+        let response = http_post_json(
+            &addr,
+            "/v1/chat/completions",
+            json!({
+                "model": "fake-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [weather_tool()],
+                "max_tokens": 8
+            }),
+            None,
+        );
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        let body: Value = serde_json::from_str(response_body(&response)).unwrap();
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("tool"),
+            "expected a tool-support error, got: {message}"
+        );
         server.stop().unwrap();
     }
 }
