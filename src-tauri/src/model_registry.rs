@@ -149,7 +149,7 @@ pub fn adopt_cached_hf_model(
 ) -> Result<ModelRegistry, String> {
     let path = PathBuf::from(request.local_path.trim());
     let candidate = cached_model_candidate(&path)?.ok_or_else(|| {
-        "cached snapshot is not supported by the linked MLX providers".to_string()
+        "cached snapshot is not supported by the linked inference providers".to_string()
     })?;
     let model_ref = HfModelRef {
         repo: candidate.repo.clone(),
@@ -321,7 +321,7 @@ async fn import_hf_model_inner(
         ImportProgress {
             job_id: job_id.to_string(),
             stage: "convert".to_string(),
-            message: "Preparing MLX snapshot".to_string(),
+            message: "Preparing model snapshot".to_string(),
             progress: 0.96,
             downloaded_bytes,
             total_bytes,
@@ -586,7 +586,7 @@ fn validate_text_snapshot_config(path: &Path) -> Result<(), String> {
             .and_then(|value| value.as_str())
             .unwrap_or("unknown");
         return Err(format!(
-            "unsupported model type {model_type}: this multimodal/VLM snapshot is not supported by the linked MLX providers"
+            "unsupported model type {model_type}: this multimodal/VLM snapshot is not supported by the linked inference providers"
         ));
     }
     Ok(())
@@ -698,7 +698,10 @@ fn env_path(name: &str) -> Option<PathBuf> {
 }
 
 fn home_dir() -> PathBuf {
+    // `HOME` on macOS/Linux; `USERPROFILE` on Windows, where the HuggingFace cache lives under
+    // `%USERPROFILE%\.cache\huggingface\hub` (huggingface_hub resolves `~` the same way).
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
 }
@@ -968,7 +971,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_multimodal_snapshot_config() {
-        // A VLM the linked MLX providers don't serve (not LLaVA/JoyCaption, not Qwen3.6) is still
+        // A VLM the linked providers don't serve (not LLaVA/JoyCaption, not Qwen3.6) is still
         // rejected with the clear error (sc-7618).
         let dir = snapshot_dir("multimodal");
         write_snapshot_file(
@@ -981,7 +984,7 @@ mod tests {
 
         let error = validate_snapshot(&dir).unwrap_err();
         assert!(error.contains("unsupported model type gemma3"));
-        assert!(error.contains("not supported by the linked MLX providers"));
+        assert!(error.contains("not supported by the linked inference providers"));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1063,7 +1066,11 @@ mod tests {
         let candidate = cached_model_candidate(&snapshot).unwrap().unwrap();
         assert_eq!(candidate.repo, "Qwen/Qwen3-0.6B");
         assert_eq!(candidate.revision, "rev1");
+        // The matched provider id depends on the platform's linked backend.
+        #[cfg(target_os = "macos")]
         assert_eq!(candidate.provider_id, "mlx-llama");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(candidate.provider_id, "candle-llama");
         assert!(!candidate.supports_vision);
         let _ = fs::remove_dir_all(root);
     }
@@ -1090,6 +1097,9 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    // Qwen3.6 vision is served only by the `mlx-llama` provider (macOS). On the Candle backend
+    // (Windows/Linux) there is no vision provider, so the same snapshot is skipped instead.
+    #[cfg(target_os = "macos")]
     #[test]
     fn builds_vision_candidate_for_qwen35_snapshot() {
         // A cached Qwen3.6 VLM snapshot is selectable and advertises vision (so the UI offers image
@@ -1112,6 +1122,28 @@ mod tests {
         assert_eq!(candidate.repo, "Qwen/Qwen3.6-27B");
         assert_eq!(candidate.provider_id, "mlx-llama");
         assert!(candidate.supports_vision);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn skips_qwen35_vision_candidate_without_vision_provider() {
+        // The Candle backend has no vision provider, so a Qwen3.6 VLM snapshot is not selectable.
+        let root = snapshot_dir("hf-qwen35-vlm");
+        let snapshot = root
+            .join("models--Qwen--Qwen3.6-27B")
+            .join("snapshots")
+            .join("rev1");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(
+            snapshot.join("config.json"),
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text","hidden_size":8},"vision_config":{"model_type":"qwen3_5"}}"#,
+        )
+        .unwrap();
+        fs::write(snapshot.join("tokenizer.json"), "{}").unwrap();
+        fs::write(snapshot.join("model.safetensors"), "weights").unwrap();
+
+        assert!(cached_model_candidate(&snapshot).unwrap().is_none());
         let _ = fs::remove_dir_all(root);
     }
 
