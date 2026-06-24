@@ -590,6 +590,7 @@ impl OpenAiChatRequest {
             messages.push(GenerateMessage {
                 role: "system".to_string(),
                 content: defaults.system_prompt.clone(),
+                images: Vec::new(),
             });
         }
         for message in self.messages {
@@ -628,9 +629,11 @@ struct OpenAiChatMessage {
 
 impl OpenAiChatMessage {
     fn into_generate(self) -> Result<GenerateMessage, ApiError> {
+        let (content, images) = self.content.into_parts()?;
         Ok(GenerateMessage {
             role: self.role,
-            content: self.content.into_text()?,
+            content,
+            images,
         })
     }
 }
@@ -643,14 +646,33 @@ enum OpenAiMessageContent {
 }
 
 impl OpenAiMessageContent {
-    fn into_text(self) -> Result<String, ApiError> {
+    /// Split OpenAI content into concatenated text and the ordered image-URL attachments. A plain
+    /// string is text with no images (the text path stays byte-identical).
+    fn into_parts(self) -> Result<(String, Vec<String>), ApiError> {
         match self {
-            Self::Text(value) => Ok(value),
-            Self::Parts(parts) => parts
-                .into_iter()
-                .map(OpenAiContentPart::into_text)
-                .collect::<Result<Vec<_>, _>>()
-                .map(|values| values.join("")),
+            Self::Text(value) => Ok((value, Vec::new())),
+            Self::Parts(parts) => {
+                let mut text = String::new();
+                let mut images = Vec::new();
+                for part in parts {
+                    match part.kind.as_str() {
+                        "text" => text.push_str(&part.text.unwrap_or_default()),
+                        "image_url" => {
+                            let url = part
+                                .image_url
+                                .map(|image| image.url)
+                                .ok_or_else(|| ApiError::bad_request("image_url part is missing its url"))?;
+                            images.push(url);
+                        }
+                        other => {
+                            return Err(ApiError::bad_request(format!(
+                                "unsupported content part type '{other}'"
+                            )))
+                        }
+                    }
+                }
+                Ok((text, images))
+            }
         }
     }
 }
@@ -661,19 +683,14 @@ struct OpenAiContentPart {
     kind: String,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    image_url: Option<OpenAiImageUrl>,
 }
 
-impl OpenAiContentPart {
-    fn into_text(self) -> Result<String, ApiError> {
-        if self.kind == "text" {
-            Ok(self.text.unwrap_or_default())
-        } else {
-            Err(ApiError::bad_request(format!(
-                "unsupported content part type '{}'",
-                self.kind
-            )))
-        }
-    }
+/// The OpenAI vision part: `{"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}`.
+#[derive(Deserialize)]
+struct OpenAiImageUrl {
+    url: String,
 }
 
 #[derive(Deserialize)]

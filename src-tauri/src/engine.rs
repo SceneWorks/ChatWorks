@@ -3,9 +3,9 @@ use std::sync::mpsc;
 use std::thread;
 
 use core_llm::{
-    load_for_model, CancelFlag, Channel, Content, FinishReason, LoadSpec, Message, Quantize, Role,
-    Sampling, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest,
-    ThinkingMode, Usage,
+    load_for_model, CancelFlag, Channel, Content, FinishReason, ImageRef, LoadSpec, Message,
+    Quantize, Role, Sampling, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor,
+    TextLlmRequest, ThinkingMode, Usage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -307,16 +307,43 @@ impl From<ThinkingRequest> for ThinkingMode {
 pub struct GenerateMessage {
     pub role: String,
     pub content: String,
+    /// Image attachments for a vision model, as `data:<mime>;base64,<data>` URLs (or raw base64).
+    /// Decoded to RGB8 and placed *before* the text block, matching the Qwen-VL convention.
+    #[serde(default)]
+    pub images: Vec<String>,
 }
 
 impl GenerateMessage {
     fn into_core(self) -> EngineResult<Message> {
+        // Images first, then text — the order the chat templates / vision providers expect.
+        let mut content = Vec::with_capacity(self.images.len() + 1);
+        for image in &self.images {
+            content.push(Content::Image(decode_image(image)?));
+        }
+        if !self.content.is_empty() || content.is_empty() {
+            content.push(Content::Text(self.content));
+        }
         Ok(Message {
             role: role_from_str(&self.role)?,
-            content: vec![Content::Text(self.content)],
+            content,
             thinking: None,
         })
     }
+}
+
+/// Decode an image attachment (`data:<mime>;base64,<data>` URL or bare base64) to an RGB8 [`ImageRef`].
+fn decode_image(data: &str) -> EngineResult<ImageRef> {
+    use base64::Engine as _;
+    // Strip the optional `data:<mime>;base64,` prefix.
+    let b64 = data.rsplit_once(',').map(|(_, rest)| rest).unwrap_or(data).trim();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|error| format!("invalid base64 image attachment: {error}"))?;
+    let rgb = image::load_from_memory(&bytes)
+        .map_err(|error| format!("could not decode image attachment: {error}"))?
+        .to_rgb8();
+    let (width, height) = rgb.dimensions();
+    ImageRef::new(width, height, rgb.into_raw())
 }
 
 fn role_from_str(role: &str) -> EngineResult<Role> {
@@ -610,6 +637,7 @@ mod tests {
                     messages: vec![GenerateMessage {
                         role: "user".to_string(),
                         content: "hello".to_string(),
+                        images: Vec::new(),
                     }],
                     sampling: SamplingRequest::default(),
                     max_new_tokens: 8,
@@ -635,6 +663,7 @@ mod tests {
                 messages: vec![GenerateMessage {
                     role: "user".to_string(),
                     content: "hello".to_string(),
+                    images: Vec::new(),
                 }],
                 sampling: SamplingRequest::default(),
                 max_new_tokens: 8,

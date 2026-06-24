@@ -176,6 +176,10 @@ function supportsThinking(engineStatus) {
   return engineStatus?.loaded?.provider?.capabilities?.supports_thinking === true;
 }
 
+function supportsVision(engineStatus) {
+  return engineStatus?.loaded?.provider?.capabilities?.supports_vision === true;
+}
+
 function stripThinkBlocks(value) {
   return value.replace(/<think>[\s\S]*?<\/think>/gi, "").replace(/<think>[\s\S]*$/i, "").trimStart();
 }
@@ -208,7 +212,17 @@ function chatRequestBody({ engineStatus, messages, params, thinkingCapable }) {
   if (params.systemPrompt.trim()) {
     requestMessages.push({ role: "system", content: params.systemPrompt.trim() });
   }
-  requestMessages.push(...messages.map(({ role, content }) => ({ role, content })));
+  requestMessages.push(
+    ...messages.map(({ role, content, images }) => {
+      // Vision turns send OpenAI content parts (image_url data URLs + text); text turns stay strings.
+      if (images && images.length) {
+        const parts = images.map((url) => ({ type: "image_url", image_url: { url } }));
+        if (content) parts.push({ type: "text", text: content });
+        return { role, content: parts };
+      }
+      return { role, content };
+    }),
+  );
   const body = {
     model: engineStatus?.loaded?.name ?? "chatworks",
     messages: requestMessages,
@@ -248,9 +262,12 @@ function ChatScreen() {
   const [params, setParams] = useState(() => paramsFromSettings(appSettings.sampling));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
+  const [attachments, setAttachments] = useState([]); // image data URLs for the next turn
   const thinkingCapable = supportsThinking(engineStatus);
+  const visionCapable = supportsVision(engineStatus);
   const apiBase = buildLocalApiBase(serverStatus);
-  const canSend = Boolean(engineStatus?.loaded) && !busy && draft.trim();
+  const canSend =
+    Boolean(engineStatus?.loaded) && !busy && (Boolean(draft.trim()) || attachments.length > 0);
 
   const refreshServerStatus = useCallback(() => {
     return invoke("openai_server_status")
@@ -277,11 +294,12 @@ function ChatScreen() {
     if (!canSend) return;
     setBusy(true);
     setError(null);
-    const userMessage = { role: "user", content: draft.trim() };
+    const userMessage = { role: "user", content: draft.trim(), images: attachments };
     const nextMessages = [...messages, userMessage];
     const assistantMessage = { role: "assistant", content: "", thinking: "" };
     setMessages([...nextMessages, assistantMessage]);
     setDraft("");
+    setAttachments([]);
     try {
       const status = await refreshServerStatus();
       const nextEngineStatus = await refreshEngineStatus();
@@ -341,6 +359,15 @@ function ChatScreen() {
     setParams((current) => ({ ...current, [key]: value }));
   }
 
+  function addImageFiles(fileList) {
+    const files = Array.from(fileList || []).filter((file) => file && file.type.startsWith("image/"));
+    files.forEach((file) => {
+      const reader = new FileReader();
+      reader.onload = () => setAttachments((current) => [...current, reader.result]); // data: URL
+      reader.readAsDataURL(file);
+    });
+  }
+
   return (
     <section className="chat-layout">
       <div className="panel chat-panel">
@@ -361,6 +388,13 @@ function ChatScreen() {
             messages.map((message, index) => (
               <article className={`message-bubble ${message.role}`} key={`${message.role}-${index}`}>
                 <div className="message-role">{message.role}</div>
+                {message.images && message.images.length ? (
+                  <div className="message-images">
+                    {message.images.map((url, imageIndex) => (
+                      <img key={imageIndex} className="message-image" src={url} alt={`attachment ${imageIndex + 1}`} />
+                    ))}
+                  </div>
+                ) : null}
                 <MessageContent
                   content={message.content}
                   thinking={message.thinking}
@@ -376,6 +410,22 @@ function ChatScreen() {
         {error ? <p className="form-error" role="alert">{error}</p> : null}
 
         <form className="composer" onSubmit={handleSubmit}>
+          {visionCapable && attachments.length ? (
+            <div className="composer-attachments">
+              {attachments.map((url, index) => (
+                <div className="composer-thumb" key={index}>
+                  <img src={url} alt={`attachment ${index + 1}`} />
+                  <button
+                    type="button"
+                    aria-label="Remove image"
+                    onClick={() => setAttachments((current) => current.filter((_, i) => i !== index))}
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : null}
           <textarea
             disabled={!engineStatus?.loaded || busy}
             onChange={(event) => setDraft(event.target.value)}
@@ -385,13 +435,44 @@ function ChatScreen() {
                 event.currentTarget.form?.requestSubmit();
               }
             }}
+            onPaste={
+              visionCapable
+                ? (event) => {
+                    const files = Array.from(event.clipboardData?.items ?? [])
+                      .filter((item) => item.type.startsWith("image/"))
+                      .map((item) => item.getAsFile());
+                    if (files.length) {
+                      event.preventDefault();
+                      addImageFiles(files);
+                    }
+                  }
+                : undefined
+            }
             placeholder={engineStatus?.loaded ? "Message the local model…" : "Load a model from Models first"}
             rows={3}
             value={draft}
           />
-          <button className="primary-btn" disabled={!canSend} type="submit">
-            {busy ? "Streaming…" : "Send"}
-          </button>
+          <div className="composer-actions">
+            {visionCapable ? (
+              <label className="ghost-btn" title="Attach image">
+                <input
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  style={{ display: "none" }}
+                  disabled={!engineStatus?.loaded || busy}
+                  onChange={(event) => {
+                    addImageFiles(event.target.files);
+                    event.target.value = "";
+                  }}
+                />
+                Image
+              </label>
+            ) : null}
+            <button className="primary-btn" disabled={!canSend} type="submit">
+              {busy ? "Streaming…" : "Send"}
+            </button>
+          </div>
         </form>
       </div>
 

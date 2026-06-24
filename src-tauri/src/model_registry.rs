@@ -574,7 +574,13 @@ fn validate_text_snapshot_config(path: &Path) -> Result<(), String> {
     let body = fs::read_to_string(config_path).map_err(|error| error.to_string())?;
     let config =
         serde_json::from_str::<serde_json::Value>(&body).map_err(|error| error.to_string())?;
-    if config.get("vision_config").is_some() && !is_joycaption_config(&config) {
+    // A `vision_config` wrapper is supported when a linked provider can serve it: LLaVA/JoyCaption,
+    // or Qwen3.6 (`qwen3_5`) which the `mlx-llama` provider now handles as a full VLM (sc-7633).
+    // Anything else multimodal is still rejected with the clear error (sc-7618).
+    if config.get("vision_config").is_some()
+        && !is_joycaption_config(&config)
+        && !is_qwen35_vision_config(&config)
+    {
         let model_type = config
             .get("model_type")
             .and_then(|value| value.as_str())
@@ -613,7 +619,9 @@ fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, S
         local_path: path.to_string_lossy().to_string(),
         provider_id: provider.id,
         provider_family: provider.family,
-        supports_vision: provider.capabilities.supports_vision,
+        // The static provider descriptor is weightless, so the `mlx-llama` Qwen3.6 VLM advertises
+        // vision only once loaded; detect it from the snapshot config so the UI offers image input.
+        supports_vision: provider.capabilities.supports_vision || is_qwen35_vision_snapshot(path)?,
         file_count,
         size_bytes,
     }))
@@ -651,6 +659,24 @@ fn is_joycaption_config(config: &serde_json::Value) -> bool {
         .unwrap_or_default()
         .to_lowercase();
     architecture.contains("llava") || model_type.contains("llava")
+}
+
+/// Whether `path` is a Qwen3.6 (`qwen3_5`) vision wrapper — a `vision_config` carried alongside the
+/// `qwen3_5` text decoder, which `mlx-llama` serves as a full VLM (sc-7633).
+fn is_qwen35_vision_snapshot(path: &Path) -> Result<bool, String> {
+    let body = fs::read_to_string(path.join("config.json")).map_err(|error| error.to_string())?;
+    let config =
+        serde_json::from_str::<serde_json::Value>(&body).map_err(|error| error.to_string())?;
+    Ok(is_qwen35_vision_config(&config))
+}
+
+fn is_qwen35_vision_config(config: &serde_json::Value) -> bool {
+    let model_type = config
+        .get("model_type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    model_type.starts_with("qwen3_5") && config.get("vision_config").is_some()
 }
 
 fn hf_cache_dirs() -> Vec<PathBuf> {
@@ -941,19 +967,39 @@ mod tests {
     }
 
     #[test]
-    fn rejects_multimodal_snapshot_config() {
+    fn rejects_unsupported_multimodal_snapshot_config() {
+        // A VLM the linked MLX providers don't serve (not LLaVA/JoyCaption, not Qwen3.6) is still
+        // rejected with the clear error (sc-7618).
         let dir = snapshot_dir("multimodal");
         write_snapshot_file(
             &dir,
             "config.json",
-            r#"{"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text"},"vision_config":{"model_type":"qwen3_5"}}"#,
+            r#"{"model_type":"gemma3","text_config":{"model_type":"gemma3_text"},"vision_config":{"model_type":"siglip"}}"#,
         );
         write_snapshot_file(&dir, "tokenizer.json", "{}");
         write_snapshot_file(&dir, "model.safetensors", "weights");
 
         let error = validate_snapshot(&dir).unwrap_err();
-        assert!(error.contains("unsupported model type qwen3_5"));
+        assert!(error.contains("unsupported model type gemma3"));
         assert!(error.contains("not supported by the linked MLX providers"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn accepts_qwen35_vision_snapshot_config() {
+        // Qwen3.6 (`qwen3_5`) carries a `vision_config`; the `mlx-llama` provider now serves it as a
+        // full VLM (sc-7633), so validation must accept it (no longer the sc-7618 reject).
+        let dir = snapshot_dir("qwen35-vision");
+        write_snapshot_file(
+            &dir,
+            "config.json",
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text"},"vision_config":{"model_type":"qwen3_5"}}"#,
+        );
+        write_snapshot_file(&dir, "tokenizer.json", "{}");
+        write_snapshot_file(&dir, "model.safetensors", "weights");
+
+        assert!(validate_snapshot(&dir).is_ok());
+        assert!(is_qwen35_vision_snapshot(&dir).unwrap());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1023,8 +1069,32 @@ mod tests {
     }
 
     #[test]
-    fn skips_non_joycaption_vision_candidate() {
-        let root = snapshot_dir("hf-qwen-vlm");
+    fn skips_unsupported_vision_candidate() {
+        // A VLM the providers don't serve is dropped from the cached-model list (the validate reject
+        // maps to `Ok(None)`), so it never shows up as selectable.
+        let root = snapshot_dir("hf-unsupported-vlm");
+        let snapshot = root
+            .join("models--google--gemma-3-vlm")
+            .join("snapshots")
+            .join("rev1");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(
+            snapshot.join("config.json"),
+            r#"{"architectures":["Gemma3ForConditionalGeneration"],"model_type":"gemma3","text_config":{"model_type":"gemma3_text"},"vision_config":{"model_type":"siglip"}}"#,
+        )
+        .unwrap();
+        fs::write(snapshot.join("tokenizer.json"), "{}").unwrap();
+        fs::write(snapshot.join("model.safetensors"), "weights").unwrap();
+
+        assert!(cached_model_candidate(&snapshot).unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn builds_vision_candidate_for_qwen35_snapshot() {
+        // A cached Qwen3.6 VLM snapshot is selectable and advertises vision (so the UI offers image
+        // input), routed to the `mlx-llama` provider.
+        let root = snapshot_dir("hf-qwen35-vlm");
         let snapshot = root
             .join("models--Qwen--Qwen3.6-27B")
             .join("snapshots")
@@ -1032,13 +1102,16 @@ mod tests {
         fs::create_dir_all(&snapshot).unwrap();
         fs::write(
             snapshot.join("config.json"),
-            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text"},"vision_config":{"model_type":"qwen3_5"}}"#,
+            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text","hidden_size":8},"vision_config":{"model_type":"qwen3_5"}}"#,
         )
         .unwrap();
         fs::write(snapshot.join("tokenizer.json"), "{}").unwrap();
         fs::write(snapshot.join("model.safetensors"), "weights").unwrap();
 
-        assert!(cached_model_candidate(&snapshot).unwrap().is_none());
+        let candidate = cached_model_candidate(&snapshot).unwrap().unwrap();
+        assert_eq!(candidate.repo, "Qwen/Qwen3.6-27B");
+        assert_eq!(candidate.provider_id, "mlx-llama");
+        assert!(candidate.supports_vision);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -14,8 +14,10 @@ mlx-provider = ["dep:mlx-llm"]
 
 [dependencies]
 axum = "0.8"
+base64 = "0.22"
 core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
 futures-util = "0.3"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", branch = "main", optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
@@ -24,6 +26,9 @@ serde_json = "1"
 tauri = { version = "2", features = [] }
 tokio = { version = "1", features = ["net", "rt-multi-thread", "sync"] }
 tokio-stream = "0.1"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [lints.rust]
 unsafe_code = "allow"
