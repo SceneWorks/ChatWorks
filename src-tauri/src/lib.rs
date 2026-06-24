@@ -11,3 +11,4 @@ pub mod app_settings;
 pub mod engine;
 pub mod model_registry;
 pub mod server;
+pub mod tools;

@@ -362,6 +362,113 @@
   margin-top: var(--gap-2);
 }
 
+/* Tool calling (sc-7772a) */
+.message-bubble.tool {
+  align-self: start;
+  border-color: color-mix(in oklch, var(--accent) 30%, var(--border));
+  background: color-mix(in oklch, var(--surface) 82%, var(--accent));
+}
+
+.tool-calls {
+  display: grid;
+  gap: var(--gap-1);
+}
+
+.tool-call {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  padding: 8px 10px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--r-md);
+  background: var(--surface);
+}
+
+.tool-call-sig {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.tool-result-head {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-2);
+  margin-bottom: 6px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.tool-result-tag {
+  padding: 1px 8px;
+  border-radius: var(--r-pill);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  background: color-mix(in oklch, var(--success) 22%, var(--surface));
+  color: var(--text);
+}
+
+.tool-result-error .tool-result-tag {
+  background: color-mix(in oklch, var(--danger) 24%, var(--surface));
+}
+
+.tool-result-denied .tool-result-tag {
+  background: var(--surface-2);
+  color: var(--text-muted);
+}
+
+.tool-result-body {
+  margin: 0;
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.tool-approval {
+  display: grid;
+  gap: var(--gap-2);
+  margin-top: var(--gap-2);
+  padding: 12px 14px;
+  border: 1px solid color-mix(in oklch, var(--accent) 50%, var(--border));
+  border-radius: var(--r-lg);
+  background: color-mix(in oklch, var(--accent) 8%, var(--surface-2));
+}
+
+.tool-approval-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.tool-approval-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap-2);
+  flex-wrap: wrap;
+}
+
+.tool-approval-actions {
+  display: flex;
+  gap: var(--gap-2);
+}
+
+.tool-approval-decided {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
 .composer {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
