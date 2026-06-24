@@ -733,7 +733,7 @@ function ModelsScreen() {
           <h2>Add a model from HuggingFace</h2>
           <p className="view-copy">
             Paste a HuggingFace model URL or <code>owner/repo</code>. ChatWorks downloads the snapshot,
-            prepares it for MLX, and adds it to your local registry.
+            prepares it for local inference, and adds it to your local registry.
           </p>
         </div>
         <div className="field">
