@@ -5,6 +5,12 @@ use chatworks::app_settings::{
     read_api_auth_token, save_api_auth_token, save_app_settings as save_app_settings_inner,
     AppSettings,
 };
+use chatworks::conversations::{
+    delete_conversation as delete_conversation_inner, get_conversation as get_conversation_inner,
+    list_conversations as list_conversations_inner,
+    rename_conversation as rename_conversation_inner,
+    save_conversation as save_conversation_inner, Conversation, ConversationMetadata,
+};
 use chatworks::engine::{
     EngineHandle, EngineStatus, GenerateRequest, GenerateResponse, LoadModelRequest,
 };
@@ -177,6 +183,35 @@ fn clear_hf_token() -> Result<HfTokenStatus, String> {
     clear_hf_token_inner()
 }
 
+#[tauri::command]
+fn list_conversations(app: AppHandle) -> Result<Vec<ConversationMetadata>, String> {
+    list_conversations_inner(&app)
+}
+
+#[tauri::command]
+fn get_conversation(app: AppHandle, id: String) -> Result<Conversation, String> {
+    get_conversation_inner(&app, &id)
+}
+
+#[tauri::command]
+fn save_conversation(app: AppHandle, conversation: Conversation) -> Result<Conversation, String> {
+    save_conversation_inner(&app, conversation)
+}
+
+#[tauri::command]
+fn rename_conversation(
+    app: AppHandle,
+    id: String,
+    title: String,
+) -> Result<ConversationMetadata, String> {
+    rename_conversation_inner(&app, &id, &title)
+}
+
+#[tauri::command]
+fn delete_conversation(app: AppHandle, id: String) -> Result<(), String> {
+    delete_conversation_inner(&app, &id)
+}
+
 fn server_config_from_settings(settings: &AppSettings) -> OpenAiServerConfig {
     OpenAiServerConfig {
         host: settings.server.host.clone(),
@@ -238,6 +273,11 @@ fn main() {
             hf_token_status,
             set_hf_token,
             clear_hf_token,
+            list_conversations,
+            get_conversation,
+            save_conversation,
+            rename_conversation,
+            delete_conversation,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the ChatWorks desktop shell");
