@@ -644,7 +644,7 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#1b2c768c986a78dfa03e13318959ba1c36cf6887"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#a49ca6d9738d5e0786f29634d57c8d1bd1939c38"
 dependencies = [
  "inventory",
  "minijinja",
@@ -2540,7 +2540,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=44929a001ab8a8837403a71c65cf064224de0cdc#44929a001ab8a8837403a71c65cf064224de0cdc"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=38e1cc1730a11b1e40c2c8ecda01606763a12d51#38e1cc1730a11b1e40c2c8ecda01606763a12d51"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -2552,7 +2552,7 @@ dependencies = [
 [[package]]
 name = "mlx-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/mlx-llm?branch=main#78f8c76153009f84b321eafb3809e4aa12ce9c2d"
+source = "git+https://github.com/SceneWorks/mlx-llm?branch=main#9f10d09f50f21050b743f78e3900e2bc31b651dd"
 dependencies = [
  "core-llm",
  "half",
@@ -2565,7 +2565,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=44929a001ab8a8837403a71c65cf064224de0cdc#44929a001ab8a8837403a71c65cf064224de0cdc"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=38e1cc1730a11b1e40c2c8ecda01606763a12d51#38e1cc1730a11b1e40c2c8ecda01606763a12d51"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -2718,7 +2718,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 1.3.1",
+ "proc-macro-crate 2.0.2",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -3094,7 +3094,7 @@ dependencies = [
 [[package]]
 name = "pmetal-mlx-rs"
 version = "0.25.8"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=44929a001ab8a8837403a71c65cf064224de0cdc#44929a001ab8a8837403a71c65cf064224de0cdc"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=38e1cc1730a11b1e40c2c8ecda01606763a12d51#38e1cc1730a11b1e40c2c8ecda01606763a12d51"
 dependencies = [
  "dyn-clone",
  "half",
@@ -3117,7 +3117,7 @@ dependencies = [
 [[package]]
 name = "pmetal-mlx-sys"
 version = "0.2.4"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=44929a001ab8a8837403a71c65cf064224de0cdc#44929a001ab8a8837403a71c65cf064224de0cdc"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=38e1cc1730a11b1e40c2c8ecda01606763a12d51#38e1cc1730a11b1e40c2c8ecda01606763a12d51"
 dependencies = [
  "bindgen",
  "cc",
