@@ -4,7 +4,7 @@ use std::sync::{mpsc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -25,6 +25,7 @@ use crate::engine::{
 
 pub const DEFAULT_OPENAI_HOST: &str = "127.0.0.1";
 pub const DEFAULT_OPENAI_PORT: u16 = 8000;
+const OPENAI_JSON_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
 pub type ServerResult<T> = Result<T, String>;
 
@@ -269,6 +270,7 @@ fn openai_router(
             auth_token,
             sampling_defaults,
         })
+        .layer(DefaultBodyLimit::max(OPENAI_JSON_BODY_LIMIT_BYTES))
         .layer(axum::middleware::from_fn(apply_cors_headers))
 }
 
@@ -773,10 +775,9 @@ impl OpenAiMessageContent {
                     match part.kind.as_str() {
                         "text" => text.push_str(&part.text.unwrap_or_default()),
                         "image_url" => {
-                            let url = part
-                                .image_url
-                                .map(|image| image.url)
-                                .ok_or_else(|| ApiError::bad_request("image_url part is missing its url"))?;
+                            let url = part.image_url.map(|image| image.url).ok_or_else(|| {
+                                ApiError::bad_request("image_url part is missing its url")
+                            })?;
                             images.push(url);
                         }
                         other => {
@@ -1554,6 +1555,35 @@ mod tests {
         assert!(response.contains("\"reasoning_content\":\"reason\""));
         assert!(response.contains("\"content\":\"ok\""));
         assert!(response.contains("data: [DONE]"));
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn accepts_vision_sized_json_bodies() {
+        let server = OpenAiServerHandle::new();
+        let status = server
+            .start(
+                OpenAiServerConfig {
+                    port: 0,
+                    sampling_defaults: test_sampling_defaults(),
+                    ..Default::default()
+                },
+                loaded_fake_engine(),
+            )
+            .unwrap();
+        let addr = status.bound_addr.unwrap();
+        let response = http_post_json(
+            &addr,
+            "/v1/chat/completions",
+            json!({
+                "model": "fake-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 8,
+                "vision_payload_padding": "x".repeat(3 * 1024 * 1024)
+            }),
+            None,
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         server.stop().unwrap();
     }
 
