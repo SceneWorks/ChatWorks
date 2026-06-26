@@ -644,7 +644,7 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#8b6e8a458b6f06be9244f6f09e0f3d99210c97ab"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#94aa0d8024e50cc92b00964b461fbfd9b6f759ca"
 dependencies = [
  "inventory",
  "minijinja",
@@ -2552,7 +2552,7 @@ dependencies = [
 [[package]]
 name = "mlx-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/mlx-llm?branch=main#dfbcb78a362e1d1e42ec264eda067c9bfbc7f3c7"
+source = "git+https://github.com/SceneWorks/mlx-llm?branch=main#7041411f395e43c542770d1cfb3c3945c8c9a875"
 dependencies = [
  "core-llm",
  "half",
@@ -2718,7 +2718,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 2.0.2",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
