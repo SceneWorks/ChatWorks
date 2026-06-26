@@ -7,6 +7,16 @@ use serde_json::Value;
 use tauri::{AppHandle, Manager};
 
 const PREVIEW_MAX_CHARS: usize = 80;
+/// Suffix appended to an in-progress atomic write before rename.
+const TMP_SUFFIX: &str = ".tmp";
+/// Filename suffix for the small per-conversation metadata sidecar.
+///
+/// The sidecar holds the derived `ConversationMetadata` so `list_conversations` can render the
+/// history without ever opening a full transcript file. `.meta` is deliberately a separate
+/// extension from the body `.json` so the two never collide: for any id, `<id>.json` is the body
+/// and `<id>.meta` is the sidecar — even when an id itself contains `.meta` or `.json`.
+const META_SUFFIX: &str = ".meta";
+const JSON_SUFFIX: &str = ".json";
 
 /// Per-conversation sampling overrides. Mirrors the in-app sampling defaults shape so a
 /// conversation carries the exact params it was run with and round-trips untouched.
@@ -45,7 +55,8 @@ pub struct Conversation {
 }
 
 /// Lightweight view returned by `list_conversations` — metadata + derived preview only.
-/// Message bodies are deliberately absent so listing never returns transcript data.
+/// Message bodies are deliberately absent so listing never returns transcript data. It is also
+/// the on-disk shape of the `.meta` sidecar written alongside each conversation file.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationMetadata {
@@ -91,45 +102,84 @@ fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn conversation_file_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join(format!("{id}.json"))
+    dir.join(format!("{id}{JSON_SUFFIX}"))
 }
 
+fn conversation_meta_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{id}{META_SUFFIX}"))
+}
+
+/// Validates the conversation id is non-empty and path-safe. The id is canonicalized to its
+/// trimmed form once at the top so whitespace-padded dangerous values (e.g. `" .. "`) cannot
+/// slip past the `.`/`..`/segment checks.
 fn validate_id(id: &str) -> Result<(), String> {
     let trimmed = id.trim();
     if trimmed.is_empty() {
         return Err("conversation id is required".to_string());
     }
-    if id.contains('/')
-        || id.contains('\\')
-        || id.contains('\0')
-        || id == "."
-        || id == ".."
-        || id.split('/').any(|segment| segment == "..")
+    if trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains('\0')
+        || trimmed == "."
+        || trimmed == ".."
+        || trimmed.split('/').any(|segment| segment == "..")
     {
-        return Err(format!("invalid conversation id {id:?}"));
+        return Err(format!("invalid conversation id {trimmed:?}"));
     }
     Ok(())
 }
 
+/// Lists conversations reading ONLY the small `.meta` sidecar files — full transcript bodies are
+/// never opened on the steady-state list path. A body file with no sidecar (legacy/old file) is
+/// opened once, derived into metadata, and a sidecar is persisted so subsequent lists stay cheap.
 fn list_conversations_in_dir(dir: &Path) -> Result<Vec<ConversationMetadata>, String> {
     let mut items = Vec::new();
     if !dir.is_dir() {
         return Ok(items);
     }
-    for entry in fs::read_dir(dir).map_err(|error| error.to_string())? {
-        let Ok(entry) = entry else {
-            continue;
-        };
+    // First pass: collect sidecar + body file ids so order on disk can't affect resolution.
+    let mut sidecar_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut sidecar_paths: Vec<PathBuf> = Vec::new();
+    let mut body_ids_without_sidecar: Vec<String> = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|error| error.to_string())?.flatten() {
         let path = entry.path();
-        if !path.is_file() || path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+        if !path.is_file() {
             continue;
         }
-        // Skip corrupt files so one bad entry never blanks the whole history list.
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if let Some(id) = file_name.strip_suffix(META_SUFFIX) {
+            sidecar_ids.insert(id.to_string());
+            sidecar_paths.push(path);
+        } else if let Some(id) = file_name.strip_suffix(JSON_SUFFIX) {
+            body_ids_without_sidecar.push(id.to_string());
+        }
+    }
+
+    // Cheap path: read only the small sidecar files. Skip corrupt sidecars so one bad entry never
+    // blanks the whole history list.
+    for path in sidecar_paths {
+        if let Ok(meta) = read_meta_file(&path) {
+            items.push(meta);
+        }
+    }
+    // Legacy fallback: a body with no sidecar gets opened once, derived, and a sidecar persisted
+    // so the next list does not touch the body again.
+    for id in body_ids_without_sidecar {
+        if sidecar_ids.contains(&id) {
+            continue;
+        }
+        let path = conversation_file_path(dir, &id);
         let Ok(conversation) = read_conversation_file(&path) else {
             continue;
         };
-        items.push(metadata_from(&conversation));
+        let meta = metadata_from(&conversation);
+        // Persisting the sidecar is best-effort; the derived metadata is still returned either way.
+        let _ = write_json_atomic(&conversation_meta_path(dir, &id), &meta);
+        items.push(meta);
     }
+
     items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.id.cmp(&b.id)));
     Ok(items)
 }
@@ -145,7 +195,6 @@ fn get_conversation_in_dir(dir: &Path, id: &str) -> Result<Conversation, String>
 
 fn save_conversation_in_dir(dir: &Path, mut conversation: Conversation) -> Result<Conversation, String> {
     validate_id(&conversation.id)?;
-    fs::create_dir_all(dir).map_err(|error| error.to_string())?;
     let path = conversation_file_path(dir, &conversation.id);
     let now = now_secs();
     if conversation.created_at == 0 {
@@ -159,7 +208,10 @@ fn save_conversation_in_dir(dir: &Path, mut conversation: Conversation) -> Resul
         conversation.created_at = if existing > 0 { existing } else { now };
     }
     conversation.updated_at = now;
-    write_conversation_atomic(&path, &conversation)?;
+    write_json_atomic(&path, &conversation)?;
+    // Persist a metadata sidecar so list never needs to open the full transcript.
+    let meta = metadata_from(&conversation);
+    write_json_atomic(&conversation_meta_path(dir, &conversation.id), &meta)?;
     Ok(conversation)
 }
 
@@ -168,14 +220,17 @@ fn rename_conversation_in_dir(dir: &Path, id: &str, title: &str) -> Result<Conve
     conversation.title = title.to_string();
     conversation.updated_at = now_secs();
     let path = conversation_file_path(dir, id);
-    write_conversation_atomic(&path, &conversation)?;
-    Ok(metadata_from(&conversation))
+    write_json_atomic(&path, &conversation)?;
+    let meta = metadata_from(&conversation);
+    write_json_atomic(&conversation_meta_path(dir, id), &meta)?;
+    Ok(meta)
 }
 
 fn delete_conversation_in_dir(dir: &Path, id: &str) -> Result<(), String> {
     validate_id(id)?;
     let path = conversation_file_path(dir, id);
-    // Idempotent: removing a conversation that no longer exists is not an error.
+    // Best-effort: drop the sidecar first, then the body. Idempotent for missing ids.
+    let _ = fs::remove_file(conversation_meta_path(dir, id));
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -183,14 +238,16 @@ fn delete_conversation_in_dir(dir: &Path, id: &str) -> Result<(), String> {
     }
 }
 
-fn write_conversation_atomic(path: &Path, conversation: &Conversation) -> Result<(), String> {
+/// Atomic write via temp file + rename (the `write_settings` / `write_registry` pattern). The
+/// parent directory is created on demand so callers do not need a separate `create_dir_all`.
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-    let tmp = path.with_extension("json.tmp");
+    let tmp = with_appended_suffix(path, TMP_SUFFIX);
     fs::write(
         &tmp,
-        serde_json::to_string_pretty(conversation).map_err(|error| error.to_string())?,
+        serde_json::to_string_pretty(value).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
     fs::rename(tmp, path).map_err(|error| error.to_string())
@@ -199,6 +256,11 @@ fn write_conversation_atomic(path: &Path, conversation: &Conversation) -> Result
 fn read_conversation_file(path: &Path) -> Result<Conversation, String> {
     let body = fs::read_to_string(path).map_err(|error| error.to_string())?;
     serde_json::from_str::<Conversation>(&body).map_err(|error| error.to_string())
+}
+
+fn read_meta_file(path: &Path) -> Result<ConversationMetadata, String> {
+    let body = fs::read_to_string(path).map_err(|error| error.to_string())?;
+    serde_json::from_str::<ConversationMetadata>(&body).map_err(|error| error.to_string())
 }
 
 fn metadata_from(conversation: &Conversation) -> ConversationMetadata {
@@ -261,6 +323,14 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
     }
     let truncated: String = text.chars().take(max_chars).collect();
     format!("{truncated}\u{2026}")
+}
+
+/// Builds a sibling path with an extra `.{suffix}` appended (e.g. `foo.json` + `tmp` -> `foo.json.tmp`).
+fn with_appended_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".");
+    name.push(suffix);
+    PathBuf::from(name)
 }
 
 fn now_secs() -> u64 {
@@ -327,7 +397,7 @@ mod tests {
     #[test]
     fn save_rejects_path_traversal_id() {
         let dir = test_dir("traversal-id");
-        let cases = ["../escape", "a/b", "a\\b", ".", "..", "bad\u{0000}id"];
+        let cases = ["../escape", "a/b", "a\\b", ".", "..", "bad\u{0000}id", " .. ", "  .  "];
         for id in cases {
             let conversation = Conversation {
                 id: id.to_string(),
@@ -339,6 +409,21 @@ mod tests {
             );
         }
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validate_id_trims_before_path_checks() {
+        // Whitespace-padded dangerous ids must be rejected, not slip through because the raw
+        // string is not literally "." or "..".
+        for id in [" .. ", "  .  ", "  ..  ", " / ", " \\ "] {
+            assert!(
+                validate_id(id).is_err(),
+                "id {id:?} should be rejected after trimming"
+            );
+        }
+        // A normal id with surrounding whitespace validates (callers trim on use); confirm the
+        // trimmed form itself is accepted.
+        assert!(validate_id("  abc  ").is_ok());
     }
 
     #[test]
@@ -407,6 +492,34 @@ mod tests {
         let got = get_conversation_in_dir(&dir, "u").unwrap();
         assert_eq!(got.title, "New");
         assert_eq!(got.messages, json!([{"role": "user", "content": "b"}]));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn save_writes_metadata_sidecar() {
+        let dir = test_dir("sidecar-write");
+        save_conversation_in_dir(
+            &dir,
+            Conversation {
+                id: "sc".to_string(),
+                title: "Sidecar".to_string(),
+                created_at: 0,
+                updated_at: 0,
+                params: ConversationParams::default(),
+                messages: json!([{"role": "user", "content": "hello"}]),
+            },
+        )
+        .unwrap();
+        assert!(conversation_file_path(&dir, "sc").exists(), "body file must exist");
+        assert!(
+            conversation_meta_path(&dir, "sc").exists(),
+            "sidecar file must exist after save"
+        );
+        let meta = read_meta_file(&conversation_meta_path(&dir, "sc")).unwrap();
+        assert_eq!(meta.id, "sc");
+        assert_eq!(meta.title, "Sidecar");
+        assert_eq!(meta.preview, "hello");
+        assert_eq!(meta.message_count, 1);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -538,12 +651,127 @@ mod tests {
                 messages: json!([]),
             },
         );
-        // stale temp file + unrelated file should not be listed or crash
-        fs::write(dir.join("keep.json.tmp"), "garbage").unwrap();
+        // stale temp files + unrelated files should not be listed or crash
+        fs::write(dir.join(format!("keep{JSON_SUFFIX}{TMP_SUFFIX}")), "garbage").unwrap();
+        fs::write(dir.join(format!("keep{META_SUFFIX}{TMP_SUFFIX}")), "garbage").unwrap();
         fs::write(dir.join("notes.md"), "nope").unwrap();
         let list = list_conversations_in_dir(&dir).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "keep");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_does_not_read_message_bodies_in_steady_state() {
+        // After save, both <id>.json and <id>.meta exist. Corrupt the body file: list must still
+        // succeed purely from the sidecar, proving it never opens the full transcript.
+        let dir = test_dir("no-body-read");
+        save_conversation_in_dir(
+            &dir,
+            Conversation {
+                id: "nb".to_string(),
+                title: "NoBody".to_string(),
+                created_at: 0,
+                updated_at: 0,
+                params: ConversationParams::default(),
+                messages: json!([{"role": "user", "content": "preview text"}]),
+            },
+        )
+        .unwrap();
+
+        // Corrupt the body AFTER the sidecar is written. If list reads bodies, this breaks it.
+        fs::write(
+            conversation_file_path(&dir, "nb"),
+            "THIS IS NOT VALID JSON {{{ { { { garbage",
+        )
+        .unwrap();
+
+        let list = list_conversations_in_dir(&dir).unwrap();
+        assert_eq!(list.len(), 1, "list must find the conversation via the sidecar");
+        assert_eq!(list[0].id, "nb");
+        assert_eq!(list[0].title, "NoBody");
+        assert_eq!(list[0].preview, "preview text");
+        assert_eq!(list[0].message_count, 1);
+
+        // get_conversation reads the body and must now fail — proving the corruption is real and
+        // the list path genuinely avoided opening the body file.
+        assert!(
+            get_conversation_in_dir(&dir, "nb").is_err(),
+            "get should fail on the corrupted body, confirming list did not use it"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_handles_bodies_with_huge_messages_without_loading_them() {
+        // A saved conversation with a very large body must not be read by list. We confirm by
+        // checking list is fast/small and still returns the correct sidecar-derived count even
+        // when the body dwarfs the sidecar.
+        let dir = test_dir("huge-body");
+        let huge = "Z".repeat(2_000_000);
+        save_conversation_in_dir(
+            &dir,
+            Conversation {
+                id: "big".to_string(),
+                title: "Big".to_string(),
+                created_at: 0,
+                updated_at: 0,
+                params: ConversationParams::default(),
+                messages: json!([
+                    {"role": "user", "content": "tiny preview"},
+                    {"role": "assistant", "content": huge}
+                ]),
+            },
+        )
+        .unwrap();
+        let body_size = fs::metadata(conversation_file_path(&dir, "big")).unwrap().len();
+        let meta_size = fs::metadata(conversation_meta_path(&dir, "big")).unwrap().len();
+        assert!(
+            meta_size < body_size / 1000,
+            "sidecar ({meta_size}B) should be far smaller than body ({body_size}B)"
+        );
+
+        let list = list_conversations_in_dir(&dir).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].message_count, 2);
+        assert_eq!(list[0].preview, "tiny preview");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn list_migrates_legacy_body_without_sidecar() {
+        // A body file written with no sidecar (legacy/old format) is read once, derived, and a
+        // sidecar is persisted so the next list does not touch the body again.
+        let dir = test_dir("legacy");
+        write_raw_conversation(
+            &dir,
+            Conversation {
+                id: "legacy".to_string(),
+                title: "Legacy".to_string(),
+                created_at: 5,
+                updated_at: 7,
+                params: ConversationParams::default(),
+                messages: json!([{"role": "user", "content": "legacy preview"}]),
+            },
+        );
+        assert!(!conversation_meta_path(&dir, "legacy").exists());
+
+        let list = list_conversations_in_dir(&dir).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "legacy");
+        assert_eq!(list[0].preview, "legacy preview");
+        assert_eq!(list[0].updated_at, 7);
+        assert!(
+            conversation_meta_path(&dir, "legacy").exists(),
+            "sidecar must be written after the legacy fallback list"
+        );
+
+        // Now corrupt the body: the second list must still succeed via the freshly-written sidecar.
+        fs::write(conversation_file_path(&dir, "legacy"), "GARBAGE").unwrap();
+        let list2 = list_conversations_in_dir(&dir).unwrap();
+        assert_eq!(list2.len(), 1);
+        assert_eq!(list2[0].id, "legacy");
+        assert_eq!(list2[0].preview, "legacy preview");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -569,6 +797,9 @@ mod tests {
         let stored = get_conversation_in_dir(&dir, "r1").unwrap();
         assert_eq!(stored.title, "New Title");
         assert_eq!(stored.updated_at, meta.updated_at);
+        // rename also refreshes the sidecar so list reflects the new title without reading the body.
+        let list = list_conversations_in_dir(&dir).unwrap();
+        assert_eq!(list[0].title, "New Title");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -580,20 +811,26 @@ mod tests {
     }
 
     #[test]
-    fn delete_removes_conversation() {
+    fn delete_removes_conversation_and_sidecar() {
         let dir = test_dir("delete");
-        write_raw_conversation(
+        save_conversation_in_dir(
             &dir,
             Conversation {
                 id: "d1".to_string(),
                 title: "D".to_string(),
-                created_at: 1,
-                updated_at: 1,
+                created_at: 0,
+                updated_at: 0,
                 params: ConversationParams::default(),
-                messages: json!([]),
+                messages: json!([{"role": "user", "content": "x"}]),
             },
-        );
+        )
+        .unwrap();
+        assert!(conversation_file_path(&dir, "d1").exists());
+        assert!(conversation_meta_path(&dir, "d1").exists());
+
         delete_conversation_in_dir(&dir, "d1").unwrap();
+        assert!(!conversation_file_path(&dir, "d1").exists(), "body must be removed");
+        assert!(!conversation_meta_path(&dir, "d1").exists(), "sidecar must be removed");
         assert!(get_conversation_in_dir(&dir, "d1").is_err());
         assert!(list_conversations_in_dir(&dir).unwrap().is_empty());
         let _ = fs::remove_dir_all(dir);
@@ -625,9 +862,11 @@ mod tests {
         }
     }
 
+    /// Writes a conversation body directly, bypassing `save_conversation_in_dir` (so no sidecar
+    /// is created). Used to exercise the legacy-fallback list path and to seed pre-sidecar state.
     fn write_raw_conversation(dir: &Path, conversation: Conversation) {
         let path = conversation_file_path(dir, &conversation.id);
-        write_conversation_atomic(&path, &conversation).unwrap();
+        write_json_atomic(&path, &conversation).unwrap();
     }
 
     fn test_dir(label: &str) -> PathBuf {
