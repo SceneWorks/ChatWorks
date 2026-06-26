@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -164,6 +164,262 @@ function paramsFromSettings(sampling) {
     maxTokens: String(sampling.maxTokens ?? ""),
     disableThinking: Boolean(sampling.disableThinking),
   };
+}
+
+/// Cap for frontend-derived conversation titles. Matches the backend preview cap
+/// (conversations.rs `PREVIEW_MAX_CHARS`) so a frontend-derived title and the server-derived
+/// preview/title stay byte-consistent.
+const CONVERSATION_TITLE_MAX_CHARS = 80;
+
+/// Convert the frontend's per-session `params` — stringified numbers bound to the Sampling inputs —
+/// into the typed `ConversationParams` shape the Tauri `save_conversation` command expects
+/// (systemPrompt: String, temperature/topP: f32, maxTokens: u32, disableThinking: bool). The Rust
+/// serde types reject JSON strings, so the conversion is mandatory before persisting.
+function paramsToConversation(params) {
+  return {
+    systemPrompt: params.systemPrompt ?? "",
+    temperature: parseNumber(params.temperature) ?? 0,
+    topP: parseNumber(params.topP) ?? 0,
+    maxTokens: parseNumber(params.maxTokens) ?? 0,
+    disableThinking: Boolean(params.disableThinking),
+  };
+}
+
+/// Inverse of `paramsToConversation`: restore typed conversation params back into the string-input
+/// shape the Sampling panel binds to. Mirrors `paramsFromSettings` so a loaded conversation drops
+/// into the panel exactly like a fresh chat seeded from the app defaults.
+function paramsFromConversation(params) {
+  const p = params ?? {};
+  return {
+    systemPrompt: p.systemPrompt ?? "",
+    temperature: String(p.temperature ?? ""),
+    topP: String(p.topP ?? ""),
+    maxTokens: String(p.maxTokens ?? ""),
+    disableThinking: Boolean(p.disableThinking),
+  };
+}
+
+/// Derive a conversation title from the first user message: collapse whitespace and cap at
+/// `CONVERSATION_TITLE_MAX_CHARS` code points with an ellipsis. This is the lazy-save title used on
+/// the first send of a new chat; once set it is preserved across upserts.
+function deriveConversationTitle(messages) {
+  for (const message of messages ?? []) {
+    if (message?.role !== "user") continue;
+    const text = String(message.content ?? "").replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    return truncateForTitle(text, CONVERSATION_TITLE_MAX_CHARS);
+  }
+  return "New conversation";
+}
+
+function truncateForTitle(text, maxChars) {
+  const chars = Array.from(text);
+  if (chars.length <= maxChars) return text;
+  return `${chars.slice(0, maxChars).join("")}\u{2026}`;
+}
+
+const ConversationsContext = createContext(null);
+const ChatStateContext = createContext(null);
+
+/// Owns the full conversation lifecycle and the per-chat ephemeral state, calling story A's five
+/// Tauri commands (`list_conversations`, `get_conversation`, `save_conversation`,
+/// `rename_conversation`, `delete_conversation`) via `invoke`.
+///
+/// The state is split across two contexts on purpose so the high-frequency transcript updates
+/// (streaming tokens) do not re-render subscribers that only care about the metadata cache / active
+/// id (e.g. the history nav in story C):
+///   - `ConversationsContext` (rarely changes): active id, metadata cache, and the lifecycle
+///     actions (`selectConversation`, `startNewChat`, `persistConversation`, `renameConversation`,
+///     `deleteConversation`, `refreshConversations`).
+///   - `ChatStateContext` (changes every token): `messages`, `draft`, `params`, `attachments`,
+///     `videoAttachments` and their setters.
+///
+/// App start opens a fresh, unsaved new chat (activeConversationId === null) and loads the history
+/// metadata cache independently — there is no auto-resume.
+function ConversationsProvider({ children }) {
+  const { appSettings } = useApp();
+  const defaultParams = useMemo(() => paramsFromSettings(appSettings.sampling), [appSettings]);
+
+  const [activeConversationId, setActiveConversationId] = useState(null);
+  const [conversations, setConversations] = useState([]);
+  const [messages, setMessages] = useState([]);
+  const [draft, setDraft] = useState("");
+  const [params, setParams] = useState(defaultParams);
+  const [attachments, setAttachments] = useState([]);
+  const [videoAttachments, setVideoAttachments] = useState([]);
+
+  // Refs let the action callbacks read the latest state without depending on it, which keeps the
+  // ConversationsContext value referentially stable across streaming-driven `messages` updates.
+  const activeIdRef = useRef(activeConversationId);
+  const conversationsRef = useRef(conversations);
+  const messagesRef = useRef(messages);
+  const paramsRef = useRef(params);
+  useEffect(() => {
+    activeIdRef.current = activeConversationId;
+  }, [activeConversationId]);
+  useEffect(() => {
+    conversationsRef.current = conversations;
+  }, [conversations]);
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+  useEffect(() => {
+    paramsRef.current = params;
+  }, [params]);
+
+  // Metadata cache (from `list_conversations`) so the nav renders without a refetch; refreshed
+  // after every save/rename/delete.
+  const refreshConversations = useCallback(() => {
+    return invoke("list_conversations")
+      .then((list) => {
+        setConversations(Array.isArray(list) ? list : []);
+        return list;
+      })
+      .catch(() => {
+        setConversations([]);
+        return [];
+      });
+  }, []);
+
+  useEffect(() => {
+    refreshConversations();
+  }, [refreshConversations]);
+
+  // A fresh new chat tracks the app default sampling profile; a loaded conversation owns the params
+  // it was run with, so defaults are only re-applied while there is no active conversation.
+  useEffect(() => {
+    if (activeConversationId === null) {
+      setParams(defaultParams);
+    }
+  }, [defaultParams, activeConversationId]);
+
+  /// Reset to a fresh, unsaved new chat: clears messages/draft/attachments, clears the active id,
+  /// and resets params to the app defaults. The saved history is untouched.
+  const startNewChat = useCallback(() => {
+    setActiveConversationId(null);
+    setMessages([]);
+    setDraft("");
+    setAttachments([]);
+    setVideoAttachments([]);
+    setParams(paramsFromSettings(appSettings.sampling));
+  }, [appSettings]);
+
+  /// Load a conversation: `get_conversation(id)` → messages into the transcript + params restored
+  /// into the Sampling panel, and set as active. Throws on failure so the caller (story C) can
+  /// surface the error.
+  const selectConversation = useCallback(async (id) => {
+    const conversation = await invoke("get_conversation", { id });
+    setActiveConversationId(conversation.id);
+    setMessages(Array.isArray(conversation.messages) ? conversation.messages : []);
+    setDraft("");
+    setAttachments([]);
+    setVideoAttachments([]);
+    setParams(paramsFromConversation(conversation.params));
+    return conversation;
+  }, []);
+
+  /// Persist the active conversation. On the first send of a new chat this lazily creates it with a
+  /// `crypto.randomUUID()` id, a title derived from the first user message, and the active params;
+  /// on subsequent turns / rewind it upserts the same id and the backend bumps `updatedAt`.
+  /// Callers (the send loop, story D's rewind) should pass `messages`/`params` explicitly so the
+  /// committed transcript is captured even when React state has not flushed yet; otherwise the
+  /// latest state (via refs) is used. Always refreshes the metadata cache on success.
+  const persistConversation = useCallback(async ({ id, messages: msgs, params: p, title } = {}) => {
+    const resolvedId = id ?? activeIdRef.current ?? crypto.randomUUID();
+    const finalMessages = msgs ?? messagesRef.current;
+    const finalParams = p ?? paramsRef.current;
+    const existing = conversationsRef.current.find((entry) => entry.id === resolvedId);
+    const finalTitle = title ?? existing?.title ?? deriveConversationTitle(finalMessages);
+    const record = {
+      id: resolvedId,
+      title: finalTitle,
+      createdAt: 0,
+      updatedAt: 0,
+      params: paramsToConversation(finalParams),
+      messages: finalMessages,
+    };
+    const saved = await invoke("save_conversation", { conversation: record });
+    setActiveConversationId(saved.id);
+    await refreshConversations();
+    return saved;
+  }, [refreshConversations]);
+
+  const renameConversation = useCallback(
+    async (id, title) => {
+      const meta = await invoke("rename_conversation", { id, title });
+      await refreshConversations();
+      return meta;
+    },
+    [refreshConversations],
+  );
+
+  const deleteConversation = useCallback(
+    async (id) => {
+      await invoke("delete_conversation", { id });
+      if (id === activeIdRef.current) {
+        startNewChat();
+      }
+      await refreshConversations();
+    },
+    [refreshConversations, startNewChat],
+  );
+
+  const conversationsValue = useMemo(
+    () => ({
+      activeConversationId,
+      conversations,
+      selectConversation,
+      startNewChat,
+      persistConversation,
+      renameConversation,
+      deleteConversation,
+      refreshConversations,
+    }),
+    [
+      activeConversationId,
+      conversations,
+      selectConversation,
+      startNewChat,
+      persistConversation,
+      renameConversation,
+      deleteConversation,
+      refreshConversations,
+    ],
+  );
+
+  const chatStateValue = useMemo(
+    () => ({
+      messages,
+      setMessages,
+      draft,
+      setDraft,
+      params,
+      setParams,
+      attachments,
+      setAttachments,
+      videoAttachments,
+      setVideoAttachments,
+    }),
+    [messages, draft, params, attachments, videoAttachments],
+  );
+
+  return (
+    <ConversationsContext.Provider value={conversationsValue}>
+      <ChatStateContext.Provider value={chatStateValue}>{children}</ChatStateContext.Provider>
+    </ConversationsContext.Provider>
+  );
+}
+
+function useConversations() {
+  const context = useContext(ConversationsContext);
+  if (!context) throw new Error("useConversations must be used inside ConversationsProvider");
+  return context;
+}
+
+function useChatState() {
+  const context = useContext(ChatStateContext);
+  if (!context) throw new Error("useChatState must be used inside ConversationsProvider");
+  return context;
 }
 
 function buildLocalApiBase(serverStatus) {
@@ -561,14 +817,22 @@ function ToolResult({ message }) {
 
 function ChatScreen() {
   const { engineStatus, refreshEngineStatus, appSettings, apiAuthToken } = useApp();
+  const { activeConversationId, persistConversation, startNewChat } = useConversations();
+  const {
+    messages,
+    setMessages,
+    draft,
+    setDraft,
+    params,
+    setParams,
+    attachments,
+    setAttachments,
+    videoAttachments,
+    setVideoAttachments,
+  } = useChatState();
   const [serverStatus, setServerStatus] = useState(null);
-  const [messages, setMessages] = useState([]);
-  const [draft, setDraft] = useState("");
-  const [params, setParams] = useState(() => paramsFromSettings(appSettings.sampling));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
-  const [attachments, setAttachments] = useState([]); // image data URLs for the next turn
-  const [videoAttachments, setVideoAttachments] = useState([]); // {name, frames, timestamps, fps}
   const [pendingAttachments, setPendingAttachments] = useState(0);
   const [toolSpecs, setToolSpecs] = useState([]); // OpenAI function-tool defs from the backend
   const [toolsEnabled, setToolsEnabled] = useState(true); // offer tools when the model supports them
@@ -631,10 +895,6 @@ function ChatScreen() {
     refreshServerStatus();
   }, [refreshServerStatus]);
 
-  useEffect(() => {
-    setParams(paramsFromSettings(appSettings.sampling));
-  }, [appSettings]);
-
   async function handleSubmit(eventArg) {
     eventArg.preventDefault();
     if (!canSend) return;
@@ -653,6 +913,29 @@ function ChatScreen() {
     setDraft("");
     setAttachments([]);
     setVideoAttachments([]);
+
+    // Lazy save / upsert: on the first send of a new chat this creates the conversation
+    // (`save_conversation` with a `crypto.randomUUID()` id, a title derived from the first user
+    // message, and the active per-session `params`); on subsequent commits it upserts the same id
+    // and the backend bumps `updatedAt`. Capturing the user message here means the conversation
+    // survives an interrupted stream. `conversationId` is tracked locally because the context's
+    // `activeConversationId` does not flush within this handler.
+    let conversationId = activeConversationId ?? crypto.randomUUID();
+    const persist = async (transcript) => {
+      try {
+        const saved = await persistConversation({
+          id: conversationId,
+          messages: transcript,
+          params,
+        });
+        conversationId = saved.id;
+      } catch (cause) {
+        // Persistence failures must not abort the in-flight chat; surface a soft error.
+        setError(`Could not save conversation: ${String(cause?.message ?? cause)}`);
+      }
+    };
+    await persist(conversation);
+
     try {
       const status = await refreshServerStatus();
       const nextEngineStatus = await refreshEngineStatus();
@@ -689,6 +972,7 @@ function ChatScreen() {
         if (result.toolCalls.length) finalAssistant.tool_calls = result.toolCalls;
         conversation = [...committed, finalAssistant];
         setMessages(conversation);
+        await persist(conversation);
 
         if (!result.toolCalls.length) {
           hitStepLimit = false;
@@ -726,6 +1010,7 @@ function ChatScreen() {
         }
         conversation = [...conversation, ...toolMessages];
         setMessages(conversation);
+        await persist(conversation);
         // Loop: re-send the transcript (now with the tool results) for the model's next turn.
       }
 
@@ -735,6 +1020,7 @@ function ChatScreen() {
     } catch (cause) {
       setError(String(cause?.message ?? cause));
       setMessages(conversation); // drop the in-flight assistant placeholder, keep committed turns
+      await persist(conversation);
     } finally {
       setBusy(false);
     }
@@ -1053,7 +1339,7 @@ function ChatScreen() {
             </span>
           </label>
         ) : null}
-        <button className="ghost-btn" disabled={busy || !messages.length} onClick={() => setMessages([])} type="button">
+        <button className="ghost-btn" disabled={busy || !messages.length} onClick={startNewChat} type="button">
           Clear conversation
         </button>
       </aside>
@@ -1800,7 +2086,9 @@ function Root() {
     <React.StrictMode>
       <ErrorBoundary>
         <AppProvider>
-          <AppShell />
+          <ConversationsProvider>
+            <AppShell />
+          </ConversationsProvider>
         </AppProvider>
       </ErrorBoundary>
     </React.StrictMode>
