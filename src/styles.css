@@ -315,6 +315,52 @@
   text-transform: uppercase;
 }
 
+/* Per-message Copy + Rewind actions (sc-8147): hover/focus-revealed icon row. */
+.message-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--gap-1);
+  opacity: 0;
+  transition: opacity var(--t-fast) var(--ease-out);
+}
+
+.message-bubble:hover .message-actions,
+.message-bubble:focus-within .message-actions {
+  opacity: 1;
+}
+
+.message-action-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background var(--t-fast) var(--ease-out), border-color var(--t-fast) var(--ease-out),
+    color var(--t-fast) var(--ease-out);
+}
+
+.message-action-btn:hover:not(:disabled) {
+  border-color: var(--border);
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+.message-action-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.message-action-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
 .markdown-body {
   display: grid;
   gap: var(--gap-2);
