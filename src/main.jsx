@@ -705,6 +705,22 @@ function toOpenAiMessage({ role, content, images, videos, tool_calls: toolCalls 
   return { role, content };
 }
 
+/// Extract the plain-text content of an in-app message for Copy/Rewind (sc-8147). `content` is
+/// normally a string, but a saved/loaded vision turn may carry an array of OpenAI content parts;
+/// only `text` parts count as text (image_url/video_url parts are visual). Returns "" for
+/// image/video-only turns so Copy/Rewind can be disabled on them (decision 7).
+function messageTextContent(message) {
+  const content = message?.content;
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => (part && part.type === "text" && typeof part.text === "string" ? part.text : ""))
+      .join("\n");
+  }
+  return "";
+}
+
 function chatRequestBody({ engineStatus, messages, params, thinkingCapable, tools }) {
   const requestMessages = [];
   if (params.systemPrompt.trim()) {
@@ -831,6 +847,116 @@ function ToolResult({ message }) {
   );
 }
 
+/// `Copy` and `Rewind` are not part of `@sceneworks/ui` (sc-8147). These inline SVGs mirror the
+/// package's icon base (24×24 viewBox, `currentColor` stroke, round joins, strokeWidth 1.7) so they
+/// render identically alongside `Icon.*` glyphs. A `Check` glyph backs the Copy "Copied" state.
+function CopyIcon({ size = 18, ...rest }) {
+  return (
+    <svg
+      aria-hidden="true"
+      fill="none"
+      height={size}
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth="1.7"
+      viewBox="0 0 24 24"
+      width={size}
+      {...rest}
+    >
+      <path d="M9 4h6v2H9z M8 6h8a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2" />
+    </svg>
+  );
+}
+
+function RewindIcon({ size = 18, ...rest }) {
+  return (
+    <svg
+      aria-hidden="true"
+      fill="none"
+      height={size}
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth="1.7"
+      viewBox="0 0 24 24"
+      width={size}
+      {...rest}
+    >
+      <path d="M9 6L4 12l5 6 M4 12h9a6 6 0 0 1 6 6" />
+    </svg>
+  );
+}
+
+function CheckIcon({ size = 18, ...rest }) {
+  return (
+    <svg
+      aria-hidden="true"
+      fill="none"
+      height={size}
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth="1.7"
+      viewBox="0 0 24 24"
+      width={size}
+      {...rest}
+    >
+      <path d="M5 12l5 5L19 7" />
+    </svg>
+  );
+}
+
+/// Per-message Copy + Rewind actions rendered at the foot of every bubble (sc-8147). Copy writes the
+/// message's text content to the clipboard (disabled on image/video-only turns); Rewind asks the
+/// parent to drop this message and everything after it and load its text into the composer (disabled
+/// mid-stream and on text-less turns). Extracted into its own component so the Copy button can hold
+/// a local "Copied" confirmation without per-bubble state in the parent's message map.
+function MessageActions({ message, index, onRewind, busy }) {
+  const [copied, setCopied] = useState(false);
+  const text = messageTextContent(message);
+  const hasText = text.trim().length > 0;
+  const canRewind = hasText && !busy;
+
+  async function handleCopy() {
+    if (!hasText) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  return (
+    <div className="message-actions">
+      <button
+        type="button"
+        className="message-action-btn"
+        onClick={handleCopy}
+        disabled={!hasText}
+        aria-label="Copy message text"
+        title={hasText ? "Copy message text" : "No text to copy"}
+      >
+        {copied ? <CheckIcon /> : <CopyIcon />}
+      </button>
+      <button
+        type="button"
+        className="message-action-btn"
+        onClick={() => onRewind(index)}
+        disabled={!canRewind}
+        aria-label="Rewind to this message"
+        title={
+          busy ? "Wait for the response to finish" : hasText ? "Rewind to this message" : "No text to load"
+        }
+      >
+        <RewindIcon />
+      </button>
+    </div>
+  );
+}
+
 function ChatScreen() {
   const { engineStatus, refreshEngineStatus, appSettings, apiAuthToken } = useApp();
   const { activeConversationId, persistConversation, startNewChat, busy, setBusy } = useConversations();
@@ -909,6 +1035,29 @@ function ChatScreen() {
   useEffect(() => {
     refreshServerStatus();
   }, [refreshServerStatus]);
+
+  /// Rewind (sc-8147, decision 3): drop message `index` and every message after it, load that
+  /// message's text into the composer, and persist the trimmed transcript so the trim survives a
+  /// relaunch. Blocked mid-stream and on text-less turns (the buttons are disabled then; this is a
+  /// defensive backstop). The in-memory trim always runs even when there is no saved conversation
+  /// yet (unsaved new chat), matching the existing lazy-save semantics.
+  const handleRewind = useCallback(
+    (index) => {
+      if (busy) return;
+      const target = messages[index];
+      const text = target ? messageTextContent(target).trim() : "";
+      if (!text) return;
+      const trimmed = messages.slice(0, index);
+      setMessages(trimmed);
+      setDraft(text);
+      if (activeConversationId !== null) {
+        persistConversation({ messages: trimmed }).catch((err) => {
+          setError(err instanceof Error ? err.message : String(err));
+        });
+      }
+    },
+    [busy, messages, setMessages, setDraft, activeConversationId, persistConversation],
+  );
 
   async function handleSubmit(eventArg) {
     eventArg.preventDefault();
@@ -1132,6 +1281,7 @@ function ChatScreen() {
                       {hasToolCalls ? <ToolCallList calls={message.tool_calls} /> : null}
                     </>
                   )}
+                  <MessageActions message={message} index={index} onRewind={handleRewind} busy={busy} />
                 </article>
               );
             })
