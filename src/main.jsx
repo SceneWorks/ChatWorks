@@ -180,6 +180,10 @@ function supportsVision(engineStatus) {
   return engineStatus?.loaded?.provider?.capabilities?.supports_vision === true;
 }
 
+function supportsVideo(engineStatus) {
+  return engineStatus?.loaded?.provider?.capabilities?.supports_video === true;
+}
+
 function supportsTools(engineStatus) {
   return engineStatus?.loaded?.provider?.capabilities?.supports_tools === true;
 }
@@ -189,6 +193,14 @@ const MAX_TOOL_STEPS = 8;
 const IMAGE_ATTACHMENT_MAX_DIMENSION = 1536;
 const IMAGE_ATTACHMENT_MAX_BYTES = 8 * 1024 * 1024;
 const IMAGE_ATTACHMENT_QUALITY_STEPS = [0.86, 0.76, 0.66, 0.56];
+
+// Video frame sampling (sc-8081): the frontend samples a small number of evenly-spaced frames from
+// an attached video client-side (no native decoder needed) and sends them as a `video_url` part with
+// per-frame timestamps. Frames are downscaled like images. Keeping the count small bounds prompt size
+// and keeps inference responsive.
+const VIDEO_ATTACHMENT_MAX_FRAMES = 8;
+const VIDEO_FRAME_MAX_DIMENSION = 768;
+const VIDEO_FRAME_QUALITY = 0.7;
 
 /// Parse an OpenAI tool call's `arguments` (a JSON-encoded string) into an object for `execute_tool`.
 function parseToolArguments(raw) {
@@ -296,6 +308,74 @@ async function normalizeImageAttachment(file) {
   throw new Error(`${file.name || "Image attachment"} is too large after compression.`);
 }
 
+/// Sample up to `VIDEO_ATTACHMENT_MAX_FRAMES` evenly-spaced frames from a video file, client-side,
+/// using a hidden `<video>` element + canvas (no native decoder). Returns `{ frames, timestamps, fps
+/// }` where `frames` are downscaled JPEG data URLs in temporal order and `timestamps` are the
+/// wall-clock seconds of each sampled frame — exactly the `video_url` shape the local server expects
+/// (sc-8081). `fps` is the *sampled* rate (frames per second over the captured span), forwarded so
+/// the server can derive timestamps if needed.
+async function sampleVideoAttachment(file) {
+  const url = URL.createObjectURL(file);
+  const video = document.createElement("video");
+  video.preload = "auto";
+  video.muted = true;
+  video.playsInline = true;
+  video.src = url;
+
+  const ready = new Promise((resolve, reject) => {
+    video.onloadedmetadata = () => resolve();
+    video.onerror = () => reject(new Error(`Could not decode ${file.name || "video attachment"}.`));
+  });
+
+  try {
+    await ready;
+    const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
+    const count = Math.max(1, Math.min(VIDEO_ATTACHMENT_MAX_FRAMES, duration > 0 ? VIDEO_ATTACHMENT_MAX_FRAMES : 1));
+    // Even sampling across the duration (midpoints of `count` equal segments) so frames span the clip.
+    const times = duration > 0
+      ? Array.from({ length: count }, (_, i) => ((i + 0.5) / count) * duration)
+      : [0];
+
+    const vw = video.videoWidth || 1;
+    const vh = video.videoHeight || 1;
+    const scale = Math.min(1, VIDEO_FRAME_MAX_DIMENSION / Math.max(vw, vh));
+    const width = Math.max(1, Math.round(vw * scale));
+    const height = Math.max(1, Math.round(vh * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Could not prepare video frame canvas.");
+
+    const seekTo = (t) =>
+      new Promise((resolve, reject) => {
+        const onSeeked = () => {
+          video.removeEventListener("seeked", onSeeked);
+          resolve();
+        };
+        video.addEventListener("seeked", onSeeked);
+        video.onerror = () => reject(new Error("Could not seek video for frame sampling."));
+        // Clamp to just inside the duration to avoid a seek past the end never firing `seeked`.
+        video.currentTime = Math.min(t, Math.max(0, (duration || t) - 0.01));
+      });
+
+    const frames = [];
+    const timestamps = [];
+    for (const t of times) {
+      await seekTo(t);
+      context.drawImage(video, 0, 0, width, height);
+      const blob = await canvasToBlob(canvas, "image/jpeg", VIDEO_FRAME_QUALITY);
+      frames.push(await readBlobAsDataUrl(blob));
+      timestamps.push(Number(video.currentTime.toFixed(3)));
+    }
+    const span = timestamps.length > 1 ? timestamps[timestamps.length - 1] - timestamps[0] : 0;
+    const fps = span > 0 ? (timestamps.length - 1) / span : 1;
+    return { frames, timestamps, fps };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 function readSseMessages(buffer, onData) {
   let remaining = buffer;
   let index = remaining.indexOf("\n\n");
@@ -314,8 +394,10 @@ function readSseMessages(buffer, onData) {
 }
 
 /// Map an in-app message to the OpenAI wire shape: a `tool` result turn, an assistant turn carrying
-/// `tool_calls` (content `null`), a vision turn with `image_url` parts, or a plain text turn.
-function toOpenAiMessage({ role, content, images, tool_calls: toolCalls }) {
+/// `tool_calls` (content `null`), a vision turn with `image_url` / `video_url` parts, or a plain text
+/// turn. Video parts (sc-8081) carry pre-sampled `frames` + per-frame `timestamps` (Text–Timestamp
+/// Alignment); visuals come before text, matching the Qwen3-VL convention.
+function toOpenAiMessage({ role, content, images, videos, tool_calls: toolCalls }) {
   if (role === "tool") {
     return { role: "tool", content: content ?? "" };
   }
@@ -336,8 +418,15 @@ function toOpenAiMessage({ role, content, images, tool_calls: toolCalls }) {
       })),
     };
   }
-  if (images && images.length) {
-    const parts = images.map((url) => ({ type: "image_url", image_url: { url } }));
+  if ((images && images.length) || (videos && videos.length)) {
+    const parts = [];
+    for (const url of images ?? []) parts.push({ type: "image_url", image_url: { url } });
+    for (const video of videos ?? []) {
+      parts.push({
+        type: "video_url",
+        video_url: { frames: video.frames, timestamps: video.timestamps, fps: video.fps },
+      });
+    }
     if (content) parts.push({ type: "text", text: content });
     return { role, content: parts };
   }
@@ -479,19 +568,21 @@ function ChatScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [attachments, setAttachments] = useState([]); // image data URLs for the next turn
+  const [videoAttachments, setVideoAttachments] = useState([]); // {name, frames, timestamps, fps}
   const [pendingAttachments, setPendingAttachments] = useState(0);
   const [toolSpecs, setToolSpecs] = useState([]); // OpenAI function-tool defs from the backend
   const [toolsEnabled, setToolsEnabled] = useState(true); // offer tools when the model supports them
   const [pendingApproval, setPendingApproval] = useState(null); // {calls, decisions, resolve}
   const thinkingCapable = supportsThinking(engineStatus);
   const visionCapable = supportsVision(engineStatus);
+  const videoCapable = supportsVideo(engineStatus);
   const toolsCapable = supportsTools(engineStatus);
   const apiBase = buildLocalApiBase(serverStatus);
   const canSend =
     Boolean(engineStatus?.loaded) &&
     !busy &&
     pendingAttachments === 0 &&
-    (Boolean(draft.trim()) || attachments.length > 0);
+    (Boolean(draft.trim()) || attachments.length > 0 || videoAttachments.length > 0);
 
   // Load the built-in tool definitions once; the chat loop offers them when tools are enabled.
   useEffect(() => {
@@ -549,13 +640,19 @@ function ChatScreen() {
     if (!canSend) return;
     setBusy(true);
     setError(null);
-    const userMessage = { role: "user", content: draft.trim(), images: attachments };
+    const userMessage = {
+      role: "user",
+      content: draft.trim(),
+      images: attachments,
+      videos: videoAttachments,
+    };
     // `conversation` is the committed transcript; the in-flight assistant turn is appended for
     // rendering and only committed once it finishes streaming.
     let conversation = [...messages, userMessage];
     setMessages(conversation);
     setDraft("");
     setAttachments([]);
+    setVideoAttachments([]);
     try {
       const status = await refreshServerStatus();
       const nextEngineStatus = await refreshEngineStatus();
@@ -660,6 +757,24 @@ function ChatScreen() {
     });
   }
 
+  function addVideoFiles(fileList) {
+    const files = Array.from(fileList || []).filter((file) => file && file.type.startsWith("video/"));
+    if (!files.length) return;
+    setError(null);
+    setPendingAttachments((current) => current + files.length);
+    files.forEach((file) => {
+      sampleVideoAttachment(file)
+        .then((sampled) =>
+          setVideoAttachments((current) => [
+            ...current,
+            { name: file.name || "video", ...sampled },
+          ]),
+        )
+        .catch((cause) => setError(String(cause?.message ?? cause)))
+        .finally(() => setPendingAttachments((current) => Math.max(0, current - 1)));
+    });
+  }
+
   return (
     <section className="chat-layout">
       <div className="panel chat-panel">
@@ -686,6 +801,19 @@ function ChatScreen() {
                     <div className="message-images">
                       {message.images.map((url, imageIndex) => (
                         <img key={imageIndex} className="message-image" src={url} alt={`attachment ${imageIndex + 1}`} />
+                      ))}
+                    </div>
+                  ) : null}
+                  {message.videos && message.videos.length ? (
+                    <div className="message-images">
+                      {message.videos.map((video, videoIndex) => (
+                        <img
+                          key={videoIndex}
+                          className="message-image"
+                          src={video.frames?.[0]}
+                          alt={`video ${videoIndex + 1} (${video.frames?.length ?? 0} frames)`}
+                          title={`${video.frames?.length ?? 0} sampled frames`}
+                        />
                       ))}
                     </div>
                   ) : null}
@@ -757,6 +885,26 @@ function ChatScreen() {
               ))}
             </div>
           ) : null}
+          {videoCapable && videoAttachments.length ? (
+            <div className="composer-attachments">
+              {videoAttachments.map((video, index) => (
+                <div className="composer-thumb composer-thumb-video" key={index}>
+                  {/* First sampled frame as the video thumbnail; badge shows the frame count. */}
+                  <img src={video.frames[0]} alt={`video ${index + 1}`} />
+                  <span className="composer-thumb-badge">{video.frames.length}f</span>
+                  <button
+                    type="button"
+                    aria-label="Remove video"
+                    onClick={() =>
+                      setVideoAttachments((current) => current.filter((_, i) => i !== index))
+                    }
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : null}
           <textarea
             disabled={!engineStatus?.loaded || busy}
             onChange={(event) => setDraft(event.target.value)}
@@ -798,6 +946,21 @@ function ChatScreen() {
                   }}
                 />
                 {pendingAttachments ? "Preparing..." : "Image"}
+              </label>
+            ) : null}
+            {videoCapable ? (
+              <label className="ghost-btn" title="Attach video (sampled into frames)">
+                <input
+                  type="file"
+                  accept="video/*"
+                  style={{ display: "none" }}
+                  disabled={!engineStatus?.loaded || busy}
+                  onChange={(event) => {
+                    addVideoFiles(event.target.files);
+                    event.target.value = "";
+                  }}
+                />
+                {pendingAttachments ? "Preparing..." : "Video"}
               </label>
             ) : null}
             <button className="primary-btn" disabled={!canSend} type="submit">
