@@ -575,11 +575,13 @@ fn validate_text_snapshot_config(path: &Path) -> Result<(), String> {
     let config =
         serde_json::from_str::<serde_json::Value>(&body).map_err(|error| error.to_string())?;
     // A `vision_config` wrapper is supported when a linked provider can serve it: LLaVA/JoyCaption,
-    // or Qwen3.6 (`qwen3_5`) which the `mlx-llama` provider now handles as a full VLM (sc-7633).
+    // Qwen3.6 (`qwen3_5`) which the `mlx-llama` provider now handles as a full VLM (sc-7633), or
+    // Qwen3-VL (`qwen3_vl`) which the `mlx-llama` provider also serves (sc-8078).
     // Anything else multimodal is still rejected with the clear error (sc-7618).
     if config.get("vision_config").is_some()
         && !is_joycaption_config(&config)
         && !is_qwen35_vision_config(&config)
+        && !is_qwen3vl_vision_config(&config)
     {
         let model_type = config
             .get("model_type")
@@ -619,9 +621,12 @@ fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, S
         local_path: path.to_string_lossy().to_string(),
         provider_id: provider.id,
         provider_family: provider.family,
-        // The static provider descriptor is weightless, so the `mlx-llama` Qwen3.6 VLM advertises
-        // vision only once loaded; detect it from the snapshot config so the UI offers image input.
-        supports_vision: provider.capabilities.supports_vision || is_qwen35_vision_snapshot(path)?,
+        // The static provider descriptor is weightless, so the `mlx-llama` Qwen3.6/Qwen3-VL VLM
+        // advertises vision only once loaded; detect it from the snapshot config so the UI offers
+        // image input before load.
+        supports_vision: provider.capabilities.supports_vision
+            || is_qwen35_vision_snapshot(path)?
+            || is_qwen3vl_vision_snapshot(path)?,
         file_count,
         size_bytes,
     }))
@@ -677,6 +682,27 @@ fn is_qwen35_vision_config(config: &serde_json::Value) -> bool {
         .unwrap_or_default()
         .to_lowercase();
     model_type.starts_with("qwen3_5") && config.get("vision_config").is_some()
+}
+
+/// Whether `path` is a Qwen3-VL (`qwen3_vl`) vision wrapper — a `vision_config` carried alongside
+/// the `qwen3_vl` text decoder, which `mlx-llama` serves as a full VLM (sc-8078).
+fn is_qwen3vl_vision_snapshot(path: &Path) -> Result<bool, String> {
+    let body = fs::read_to_string(path.join("config.json")).map_err(|error| error.to_string())?;
+    let config =
+        serde_json::from_str::<serde_json::Value>(&body).map_err(|error| error.to_string())?;
+    Ok(is_qwen3vl_vision_config(&config))
+}
+
+fn is_qwen3vl_vision_config(config: &serde_json::Value) -> bool {
+    // Gate on the top-level `model_type` (`qwen3_vl`), where `vision_config` sits. The nested
+    // `text_config.model_type` is `qwen3_vl_text` (also `starts_with "qwen3_vl"`), but the relevant
+    // gate is the top-level config that carries the `vision_config` wrapper.
+    let model_type = config
+        .get("model_type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    model_type.starts_with("qwen3_vl") && config.get("vision_config").is_some()
 }
 
 fn hf_cache_dirs() -> Vec<PathBuf> {
@@ -1007,6 +1033,47 @@ mod tests {
     }
 
     #[test]
+    fn accepts_qwen3vl_vision_snapshot_config() {
+        // Qwen3-VL (`qwen3_vl`) carries a `vision_config`; the `mlx-llama` provider serves it as a
+        // full VLM (sc-8078), so validation must accept it (no longer the sc-7618 reject). The
+        // fixture mirrors the real `Qwen/Qwen3-VL-8B-Instruct` config (rev 0c351dd0): top-level
+        // `model_type` `qwen3_vl`, `text_config.model_type` `qwen3_vl_text`, `vision_config` present.
+        let dir = snapshot_dir("qwen3vl-vision");
+        write_snapshot_file(
+            &dir,
+            "config.json",
+            r#"{"architectures":["Qwen3VLForConditionalGeneration"],"model_type":"qwen3_vl","text_config":{"model_type":"qwen3_vl_text"},"vision_config":{"model_type":"qwen3_vl"}}"#,
+        );
+        write_snapshot_file(&dir, "tokenizer.json", "{}");
+        write_snapshot_file(&dir, "model.safetensors", "weights");
+
+        assert!(validate_snapshot(&dir).is_ok());
+        assert!(is_qwen3vl_vision_snapshot(&dir).unwrap());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_unsupported_vlm_despite_qwen3vl_text_config() {
+        // A generic VLM whose top-level `model_type` is unknown is still rejected even if its
+        // `vision_config` is present — the gate keys off the top-level `model_type` (sc-8078),
+        // not the nested text config.
+        let dir = snapshot_dir("unknown-vlm");
+        write_snapshot_file(
+            &dir,
+            "config.json",
+            r#"{"architectures":["SomeVlmForConditionalGeneration"],"model_type":"some_vlm","text_config":{"model_type":"qwen3_vl_text"},"vision_config":{"model_type":"siglip"}}"#,
+        );
+        write_snapshot_file(&dir, "tokenizer.json", "{}");
+        write_snapshot_file(&dir, "model.safetensors", "weights");
+
+        let error = validate_snapshot(&dir).unwrap_err();
+        assert!(error.contains("unsupported model type some_vlm"));
+        assert!(error.contains("not supported by the linked inference providers"));
+        assert!(!is_qwen3vl_vision_snapshot(&dir).unwrap());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn accepts_joycaption_snapshot_config() {
         let dir = snapshot_dir("joycaption");
         write_snapshot_file(
@@ -1138,6 +1205,56 @@ mod tests {
         fs::write(
             snapshot.join("config.json"),
             r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text","hidden_size":8},"vision_config":{"model_type":"qwen3_5"}}"#,
+        )
+        .unwrap();
+        fs::write(snapshot.join("tokenizer.json"), "{}").unwrap();
+        fs::write(snapshot.join("model.safetensors"), "weights").unwrap();
+
+        assert!(cached_model_candidate(&snapshot).unwrap().is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    // Qwen3-VL is served only by the `mlx-llama` provider (macOS). On the Candle backend
+    // (Windows/Linux) there is no vision provider, so the same snapshot is skipped instead.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn builds_vision_candidate_for_qwen3vl_snapshot() {
+        // A cached Qwen3-VL snapshot is selectable and advertises vision (so the UI offers image
+        // input), routed to the `mlx-llama` provider (sc-8078).
+        let root = snapshot_dir("hf-qwen3vl-vlm");
+        let snapshot = root
+            .join("models--Qwen--Qwen3-VL-8B-Instruct")
+            .join("snapshots")
+            .join("rev1");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(
+            snapshot.join("config.json"),
+            r#"{"architectures":["Qwen3VLForConditionalGeneration"],"model_type":"qwen3_vl","text_config":{"model_type":"qwen3_vl_text","hidden_size":8},"vision_config":{"model_type":"qwen3_vl"}}"#,
+        )
+        .unwrap();
+        fs::write(snapshot.join("tokenizer.json"), "{}").unwrap();
+        fs::write(snapshot.join("model.safetensors"), "weights").unwrap();
+
+        let candidate = cached_model_candidate(&snapshot).unwrap().unwrap();
+        assert_eq!(candidate.repo, "Qwen/Qwen3-VL-8B-Instruct");
+        assert_eq!(candidate.provider_id, "mlx-llama");
+        assert!(candidate.supports_vision);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn skips_qwen3vl_vision_candidate_without_vision_provider() {
+        // The Candle backend has no vision provider, so a Qwen3-VL snapshot is not selectable.
+        let root = snapshot_dir("hf-qwen3vl-vlm");
+        let snapshot = root
+            .join("models--Qwen--Qwen3-VL-8B-Instruct")
+            .join("snapshots")
+            .join("rev1");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(
+            snapshot.join("config.json"),
+            r#"{"architectures":["Qwen3VLForConditionalGeneration"],"model_type":"qwen3_vl","text_config":{"model_type":"qwen3_vl_text","hidden_size":8},"vision_config":{"model_type":"qwen3_vl"}}"#,
         )
         .unwrap();
         fs::write(snapshot.join("tokenizer.json"), "{}").unwrap();
