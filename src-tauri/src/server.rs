@@ -19,8 +19,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::app_settings::SamplingDefaults;
 use crate::engine::{
     EngineHandle, GenerateMessage, GenerateRequest, GenerateResponse, GenerateTool,
-    GenerateToolCall, LoadedModelStatus, SamplingRequest, StreamChannel, StreamPayload,
-    ThinkingRequest, UsagePayload,
+    GenerateToolCall, GenerateVideo, LoadedModelStatus, SamplingRequest, StreamChannel,
+    StreamPayload, ThinkingRequest, UsagePayload,
 };
 
 pub const DEFAULT_OPENAI_HOST: &str = "127.0.0.1";
@@ -611,6 +611,7 @@ impl OpenAiChatRequest {
                 role: "system".to_string(),
                 content: defaults.system_prompt.clone(),
                 images: Vec::new(),
+                videos: Vec::new(),
                 tool_calls: Vec::new(),
             });
         }
@@ -701,14 +702,15 @@ struct OpenAiChatMessage {
 
 impl OpenAiChatMessage {
     fn into_generate(self) -> Result<GenerateMessage, ApiError> {
-        let (content, images) = match self.content {
+        let (content, images, videos) = match self.content {
             Some(content) => content.into_parts()?,
-            None => (String::new(), Vec::new()),
+            None => (String::new(), Vec::new(), Vec::new()),
         };
         Ok(GenerateMessage {
             role: self.role,
             content,
             images,
+            videos,
             tool_calls: self
                 .tool_calls
                 .into_iter()
@@ -763,14 +765,34 @@ enum OpenAiMessageContent {
 }
 
 impl OpenAiMessageContent {
-    /// Split OpenAI content into concatenated text and the ordered image-URL attachments. A plain
-    /// string is text with no images (the text path stays byte-identical).
-    fn into_parts(self) -> Result<(String, Vec<String>), ApiError> {
+    /// Split OpenAI content into concatenated text, the ordered image-URL attachments, and the
+    /// ordered video attachments. A plain string is text with no images/videos (the text path stays
+    /// byte-identical).
+    ///
+    /// **Video representation (sc-8081).** There is no standard OpenAI `image_url` analog for video.
+    /// We accept a **`video_url` content part carrying pre-sampled frames** plus optional per-frame
+    /// timestamps:
+    /// ```json
+    /// { "type": "video_url",
+    ///   "video_url": {
+    ///     "frames": ["data:image/jpeg;base64,…", "data:image/jpeg;base64,…"],
+    ///     "timestamps": [0.0, 0.5],   // optional; seconds, one per frame
+    ///     "fps": 2.0                  // optional; used to derive timestamps when absent
+    ///   } }
+    /// ```
+    /// The host (the ChatWorks frontend) samples frames client-side, so v1 needs **no heavy
+    /// server-side video-file decoder** (arbitrary `.mp4` decode is a tracked follow-up). Each frame
+    /// is an image data URL decoded exactly like an `image_url`. If `timestamps` is omitted it is
+    /// derived from `fps` (`i / fps`) or, lacking both, frame index seconds (`i`, i.e. 1 fps) — the
+    /// engine forwards these straight into `VideoRef`, which drives Text–Timestamp Alignment.
+    #[allow(clippy::type_complexity)]
+    fn into_parts(self) -> Result<(String, Vec<String>, Vec<GenerateVideo>), ApiError> {
         match self {
-            Self::Text(value) => Ok((value, Vec::new())),
+            Self::Text(value) => Ok((value, Vec::new(), Vec::new())),
             Self::Parts(parts) => {
                 let mut text = String::new();
                 let mut images = Vec::new();
+                let mut videos = Vec::new();
                 for part in parts {
                     match part.kind.as_str() {
                         "text" => text.push_str(&part.text.unwrap_or_default()),
@@ -780,6 +802,32 @@ impl OpenAiMessageContent {
                             })?;
                             images.push(url);
                         }
+                        "video_url" => {
+                            let video = part.video_url.ok_or_else(|| {
+                                ApiError::bad_request("video_url part is missing its video_url")
+                            })?;
+                            if video.frames.is_empty() {
+                                return Err(ApiError::bad_request(
+                                    "video_url part must carry at least one frame",
+                                ));
+                            }
+                            // Derive timestamps when absent: explicit > fps-derived > 1-fps index.
+                            let n = video.frames.len();
+                            let timestamps = match video.timestamps {
+                                Some(ts) if ts.len() == n => ts,
+                                Some(ts) => {
+                                    return Err(ApiError::bad_request(format!(
+                                        "video_url timestamps length {} != frame count {n}",
+                                        ts.len()
+                                    )))
+                                }
+                                None => {
+                                    let fps = video.fps.filter(|f| *f > 0.0).unwrap_or(1.0);
+                                    (0..n).map(|i| i as f32 / fps).collect()
+                                }
+                            };
+                            videos.push(GenerateVideo { frames: video.frames, timestamps });
+                        }
                         other => {
                             return Err(ApiError::bad_request(format!(
                                 "unsupported content part type '{other}'"
@@ -787,7 +835,7 @@ impl OpenAiMessageContent {
                         }
                     }
                 }
-                Ok((text, images))
+                Ok((text, images, videos))
             }
         }
     }
@@ -801,12 +849,29 @@ struct OpenAiContentPart {
     text: Option<String>,
     #[serde(default)]
     image_url: Option<OpenAiImageUrl>,
+    #[serde(default)]
+    video_url: Option<OpenAiVideoUrl>,
 }
 
 /// The OpenAI vision part: `{"type":"image_url","image_url":{"url":"data:image/png;base64,…"}}`.
 #[derive(Deserialize)]
 struct OpenAiImageUrl {
     url: String,
+}
+
+/// The ChatWorks video part (sc-8081): pre-sampled frames + optional per-frame timestamps. See
+/// [`OpenAiMessageContent::into_parts`] for the decision rationale and the wire shape.
+#[derive(Deserialize)]
+struct OpenAiVideoUrl {
+    /// Sampled frames, in temporal order, each a `data:image/…;base64,…` URL (or bare base64).
+    frames: Vec<String>,
+    /// Optional per-frame timestamps in seconds (one per frame). Derived from `fps` / frame index
+    /// when absent.
+    #[serde(default)]
+    timestamps: Option<Vec<f32>>,
+    /// Optional sampling rate; used to derive timestamps when `timestamps` is absent.
+    #[serde(default)]
+    fps: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -1349,6 +1414,76 @@ mod tests {
         assert_eq!(generate.seed, Some(42));
         assert_eq!(generate.stop, vec!["END"]);
         assert!(matches!(generate.thinking, ThinkingRequest::Auto));
+    }
+
+    /// A `video_url` content part with pre-sampled frames + explicit timestamps parses into a
+    /// `GenerateVideo` carrying the frames and timestamps verbatim, alongside the text (sc-8081).
+    #[test]
+    fn parses_video_url_content_part_with_timestamps() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "model": "fake",
+            "messages": [{"role": "user", "content": [
+                {"type": "video_url", "video_url": {
+                    "frames": ["data:image/jpeg;base64,AAA", "data:image/jpeg;base64,BBB"],
+                    "timestamps": [0.0, 0.5]
+                }},
+                {"type": "text", "text": "what happens"}
+            ]}],
+            "max_tokens": 8
+        }))
+        .unwrap();
+        let defaults = SamplingDefaults { system_prompt: String::new(), ..Default::default() };
+        let generate = request.into_generate(&defaults).unwrap();
+        let msg = &generate.messages[0];
+        assert_eq!(msg.content, "what happens");
+        assert!(msg.images.is_empty());
+        assert_eq!(msg.videos.len(), 1);
+        assert_eq!(msg.videos[0].frames.len(), 2);
+        assert_eq!(msg.videos[0].timestamps, vec![0.0, 0.5]);
+    }
+
+    /// When `timestamps` is omitted, they are derived from `fps` (`i / fps`).
+    #[test]
+    fn video_url_derives_timestamps_from_fps() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "model": "fake",
+            "messages": [{"role": "user", "content": [
+                {"type": "video_url", "video_url": {
+                    "frames": ["data:image/jpeg;base64,AAA", "data:image/jpeg;base64,BBB",
+                               "data:image/jpeg;base64,CCC", "data:image/jpeg;base64,DDD"],
+                    "fps": 2.0
+                }},
+                {"type": "text", "text": "describe"}
+            ]}],
+            "max_tokens": 8
+        }))
+        .unwrap();
+        let defaults = SamplingDefaults { system_prompt: String::new(), ..Default::default() };
+        let generate = request.into_generate(&defaults).unwrap();
+        assert_eq!(generate.messages[0].videos[0].timestamps, vec![0.0, 0.5, 1.0, 1.5]);
+    }
+
+    /// A `video_url` part with no frames is a 400, and a timestamp/frame-count mismatch is a 400.
+    #[test]
+    fn video_url_rejects_empty_and_mismatched() {
+        let empty: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "video_url", "video_url": {"frames": []}}
+            ]}]
+        }))
+        .unwrap();
+        assert!(empty.into_generate(&SamplingDefaults::default()).is_err());
+
+        let mismatched: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "video_url", "video_url": {
+                    "frames": ["data:image/jpeg;base64,AAA"],
+                    "timestamps": [0.0, 0.5]
+                }}
+            ]}]
+        }))
+        .unwrap();
+        assert!(mismatched.into_generate(&SamplingDefaults::default()).is_err());
     }
 
     #[test]

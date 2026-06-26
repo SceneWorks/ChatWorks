@@ -511,6 +511,24 @@
   cursor: pointer;
 }
 
+/* Video attachment thumbnail: the first sampled frame with a frame-count badge. */
+.composer-thumb-video img {
+  border-color: var(--accent, var(--border));
+}
+
+.composer-thumb-badge {
+  position: absolute;
+  bottom: 2px;
+  left: 2px;
+  padding: 0 4px;
+  font-size: 10px;
+  line-height: 1.4;
+  border-radius: var(--r-sm, 4px);
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  pointer-events: none;
+}
+
 .composer-actions {
   display: flex;
   flex-direction: column;

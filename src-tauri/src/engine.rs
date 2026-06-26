@@ -5,7 +5,7 @@ use std::thread;
 use core_llm::{
     load_for_model, CancelFlag, Channel, Content, FinishReason, ImageRef, LoadSpec, Message,
     Quantize, Role, Sampling, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor,
-    TextLlmRequest, ThinkingMode, ToolCall, ToolSpec, Usage,
+    TextLlmRequest, ThinkingMode, ToolCall, ToolSpec, Usage, VideoRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -379,6 +379,11 @@ pub struct GenerateMessage {
     /// Decoded to RGB8 and placed *before* the text block, matching the Qwen-VL convention.
     #[serde(default)]
     pub images: Vec<String>,
+    /// Video attachments for a video-capable model (sc-8081): pre-sampled frames + per-frame
+    /// timestamps. Decoded to RGB8 frames and placed *before* the text block (after images), so the
+    /// vision providers see visuals before text, matching the Qwen3-VL convention.
+    #[serde(default)]
+    pub videos: Vec<GenerateVideo>,
     /// An assistant turn's tool / function calls, re-rendered by the chat template to continue a
     /// multi-step tool exchange (paired with the following `tool`-role result turn). Empty for
     /// non-tool turns.
@@ -386,12 +391,37 @@ pub struct GenerateMessage {
     pub tool_calls: Vec<GenerateToolCall>,
 }
 
+/// A sampled video attachment: ordered frame image data URLs + per-frame timestamps (seconds). The
+/// host (frontend / API caller) samples the frames; this carries them straight to [`VideoRef`].
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct GenerateVideo {
+    /// Sampled frames in temporal order, each a `data:image/…;base64,…` URL (or bare base64).
+    pub frames: Vec<String>,
+    /// Per-frame timestamp in seconds (one per frame), driving Text–Timestamp Alignment.
+    pub timestamps: Vec<f32>,
+}
+
+impl GenerateVideo {
+    fn into_core(self) -> EngineResult<VideoRef> {
+        let frames = self
+            .frames
+            .iter()
+            .map(|f| decode_image(f))
+            .collect::<EngineResult<Vec<ImageRef>>>()?;
+        VideoRef::new(frames, self.timestamps)
+    }
+}
+
 impl GenerateMessage {
     fn into_core(self) -> EngineResult<Message> {
-        // Images first, then text — the order the chat templates / vision providers expect.
-        let mut content = Vec::with_capacity(self.images.len() + 1);
+        // Visuals first (images then videos), then text — the order the chat templates / vision
+        // providers expect (Qwen3-VL: visual placeholder before the question text).
+        let mut content = Vec::with_capacity(self.images.len() + self.videos.len() + 1);
         for image in &self.images {
             content.push(Content::Image(decode_image(image)?));
+        }
+        for video in self.videos {
+            content.push(Content::Video(video.into_core()?));
         }
         if !self.content.is_empty() || content.is_empty() {
             content.push(Content::Text(self.content));
@@ -509,6 +539,9 @@ pub struct CapabilitySummary {
     pub max_new_tokens: u32,
     pub supports_system_prompt: bool,
     pub supports_vision: bool,
+    /// Whether the loaded model accepts video input (sc-8081) — surfaced so the UI can enable the
+    /// video attach affordance.
+    pub supports_video: bool,
     pub supports_thinking: bool,
     pub supports_tools: bool,
     pub supported_constraints: Vec<String>,
@@ -521,6 +554,7 @@ impl From<TextLlmCapabilities> for CapabilitySummary {
             max_new_tokens: value.max_new_tokens,
             supports_system_prompt: value.supports_system_prompt,
             supports_vision: value.supports_vision,
+            supports_video: value.supports_video,
             supports_thinking: value.supports_thinking,
             supports_tools: value.supports_tools,
             supported_constraints: value
@@ -721,6 +755,7 @@ mod tests {
                         role: "user".to_string(),
                         content: "hello".to_string(),
                         images: Vec::new(),
+                        videos: Vec::new(),
                         tool_calls: Vec::new(),
                     }],
                     sampling: SamplingRequest::default(),
@@ -749,6 +784,7 @@ mod tests {
                     role: "user".to_string(),
                     content: "hello".to_string(),
                     images: Vec::new(),
+                    videos: Vec::new(),
                     tool_calls: Vec::new(),
                 }],
                 sampling: SamplingRequest::default(),
