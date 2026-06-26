@@ -8,6 +8,7 @@ use mlx_llm as _;
 use candle_llm as _;
 
 pub mod app_settings;
+pub mod conversations;
 pub mod engine;
 pub mod model_registry;
 pub mod server;
