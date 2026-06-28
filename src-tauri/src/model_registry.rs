@@ -1164,13 +1164,14 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
-    // Qwen3.6 vision is served only by the `mlx-llama` provider (macOS). On the Candle backend
-    // (Windows/Linux) there is no vision provider, so the same snapshot is skipped instead.
-    #[cfg(target_os = "macos")]
+    // Qwen3.6 (`qwen3_5`) vision is now served as a full VLM by BOTH backends: the `mlx-llama`
+    // provider on macOS (sc-7633) and the `candle-llama` provider on Windows/Linux (sc-7634). A
+    // cached Qwen3.6 VLM snapshot is therefore selectable and advertises vision on every platform —
+    // only the matched provider id differs.
     #[test]
     fn builds_vision_candidate_for_qwen35_snapshot() {
         // A cached Qwen3.6 VLM snapshot is selectable and advertises vision (so the UI offers image
-        // input), routed to the `mlx-llama` provider.
+        // input), routed to the platform's linked backend.
         let root = snapshot_dir("hf-qwen35-vlm");
         let snapshot = root
             .join("models--Qwen--Qwen3.6-27B")
@@ -1187,40 +1188,22 @@ mod tests {
 
         let candidate = cached_model_candidate(&snapshot).unwrap().unwrap();
         assert_eq!(candidate.repo, "Qwen/Qwen3.6-27B");
+        #[cfg(target_os = "macos")]
         assert_eq!(candidate.provider_id, "mlx-llama");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(candidate.provider_id, "candle-llama");
         assert!(candidate.supports_vision);
         let _ = fs::remove_dir_all(root);
     }
 
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn skips_qwen35_vision_candidate_without_vision_provider() {
-        // The Candle backend has no vision provider, so a Qwen3.6 VLM snapshot is not selectable.
-        let root = snapshot_dir("hf-qwen35-vlm");
-        let snapshot = root
-            .join("models--Qwen--Qwen3.6-27B")
-            .join("snapshots")
-            .join("rev1");
-        fs::create_dir_all(&snapshot).unwrap();
-        fs::write(
-            snapshot.join("config.json"),
-            r#"{"architectures":["Qwen3_5ForConditionalGeneration"],"model_type":"qwen3_5","text_config":{"model_type":"qwen3_5_text","hidden_size":8},"vision_config":{"model_type":"qwen3_5"}}"#,
-        )
-        .unwrap();
-        fs::write(snapshot.join("tokenizer.json"), "{}").unwrap();
-        fs::write(snapshot.join("model.safetensors"), "weights").unwrap();
-
-        assert!(cached_model_candidate(&snapshot).unwrap().is_none());
-        let _ = fs::remove_dir_all(root);
-    }
-
-    // Qwen3-VL is served only by the `mlx-llama` provider (macOS). On the Candle backend
-    // (Windows/Linux) there is no vision provider, so the same snapshot is skipped instead.
-    #[cfg(target_os = "macos")]
+    // Qwen3-VL (`qwen3_vl`) vision is now served as a full VLM by BOTH backends: the `mlx-llama`
+    // provider on macOS (sc-8078) and the `candle-llama` provider on Windows/Linux (sc-8080 image +
+    // sc-8472 video). A cached Qwen3-VL snapshot is therefore selectable and advertises vision on
+    // every platform — only the matched provider id differs.
     #[test]
     fn builds_vision_candidate_for_qwen3vl_snapshot() {
         // A cached Qwen3-VL snapshot is selectable and advertises vision (so the UI offers image
-        // input), routed to the `mlx-llama` provider (sc-8078).
+        // input), routed to the platform's linked backend.
         let root = snapshot_dir("hf-qwen3vl-vlm");
         let snapshot = root
             .join("models--Qwen--Qwen3-VL-8B-Instruct")
@@ -1237,30 +1220,11 @@ mod tests {
 
         let candidate = cached_model_candidate(&snapshot).unwrap().unwrap();
         assert_eq!(candidate.repo, "Qwen/Qwen3-VL-8B-Instruct");
+        #[cfg(target_os = "macos")]
         assert_eq!(candidate.provider_id, "mlx-llama");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(candidate.provider_id, "candle-llama");
         assert!(candidate.supports_vision);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn skips_qwen3vl_vision_candidate_without_vision_provider() {
-        // The Candle backend has no vision provider, so a Qwen3-VL snapshot is not selectable.
-        let root = snapshot_dir("hf-qwen3vl-vlm");
-        let snapshot = root
-            .join("models--Qwen--Qwen3-VL-8B-Instruct")
-            .join("snapshots")
-            .join("rev1");
-        fs::create_dir_all(&snapshot).unwrap();
-        fs::write(
-            snapshot.join("config.json"),
-            r#"{"architectures":["Qwen3VLForConditionalGeneration"],"model_type":"qwen3_vl","text_config":{"model_type":"qwen3_vl_text","hidden_size":8},"vision_config":{"model_type":"qwen3_vl"}}"#,
-        )
-        .unwrap();
-        fs::write(snapshot.join("tokenizer.json"), "{}").unwrap();
-        fs::write(snapshot.join("model.safetensors"), "weights").unwrap();
-
-        assert!(cached_model_candidate(&snapshot).unwrap().is_none());
         let _ = fs::remove_dir_all(root);
     }
 

@@ -378,11 +378,11 @@ dependencies = [
 [[package]]
 name = "candle-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/candle-llm?branch=main#c6a57601feeec992d426afb56e6e32958ca781ee"
+source = "git+https://github.com/SceneWorks/candle-llm?branch=main#df0720b8c9db70a7c156a0922aa4957976f5bc5a"
 dependencies = [
  "candle-core",
  "candle-nn",
- "core-llm",
+ "core-llm 0.0.0 (git+https://github.com/SceneWorks/core-llm?rev=3870ed1)",
  "inventory",
  "serde_json",
  "thiserror 2.0.18",
@@ -510,7 +510,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "candle-llm",
- "core-llm",
+ "core-llm 0.0.0 (git+https://github.com/SceneWorks/core-llm?rev=3870ed1)",
  "futures-util",
  "image",
  "keyring",
@@ -644,7 +644,20 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#94aa0d8024e50cc92b00964b461fbfd9b6f759ca"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#3870ed1c7495caa6bcb8cc0836b9dd4356969737"
+dependencies = [
+ "inventory",
+ "minijinja",
+ "minijinja-contrib",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokenizers 0.21.4",
+]
+
+[[package]]
+name = "core-llm"
+version = "0.0.0"
+source = "git+https://github.com/SceneWorks/core-llm?rev=3870ed1#3870ed1c7495caa6bcb8cc0836b9dd4356969737"
 dependencies = [
  "inventory",
  "minijinja",
@@ -984,7 +997,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2554,7 +2567,7 @@ name = "mlx-llm"
 version = "0.0.0"
 source = "git+https://github.com/SceneWorks/mlx-llm?branch=main#7041411f395e43c542770d1cfb3c3945c8c9a875"
 dependencies = [
- "core-llm",
+ "core-llm 0.0.0 (git+https://github.com/SceneWorks/core-llm?branch=main)",
  "half",
  "inventory",
  "pmetal-mlx-rs",
@@ -5404,7 +5417,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
