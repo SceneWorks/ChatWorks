@@ -17,7 +17,14 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 axum = "0.8"
 base64 = "0.22"
-core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
+# Pinned to the same rev as the candle-llm backend dep (its Cargo.toml hard-pins core-llm `3870ed1`,
+# sc-8021), so cargo unifies on ONE core-llm source — otherwise a `branch = "main"` spec here and the
+# `rev` spec there are distinct git sources, yielding two core-llm copies whose link-time provider
+# registries don't share (the backend's `candle-llama`/`mlx-llama` registration would be invisible to
+# this crate). `3870ed1` carries the Qwen3-VL contract (`Content::Video`, `supports_video`,
+# `weightless_vision`). NOTE: the macOS `mlx-llm` dep must pin the same rev for the macOS build to
+# unify (the remaining sc-8021 mlx-llm pin).
+core-llm = { git = "https://github.com/SceneWorks/core-llm", rev = "3870ed1" }
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
