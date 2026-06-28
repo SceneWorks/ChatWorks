@@ -382,7 +382,7 @@ source = "git+https://github.com/SceneWorks/candle-llm?branch=main#df0720b8c9db7
 dependencies = [
  "candle-core",
  "candle-nn",
- "core-llm 0.0.0 (git+https://github.com/SceneWorks/core-llm?rev=3870ed1)",
+ "core-llm",
  "inventory",
  "serde_json",
  "thiserror 2.0.18",
@@ -510,7 +510,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "candle-llm",
- "core-llm 0.0.0 (git+https://github.com/SceneWorks/core-llm?rev=3870ed1)",
+ "core-llm",
  "futures-util",
  "image",
  "keyring",
@@ -639,19 +639,6 @@ dependencies = [
  "bitflags 2.13.0",
  "core-foundation 0.10.1",
  "libc",
-]
-
-[[package]]
-name = "core-llm"
-version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=main#3870ed1c7495caa6bcb8cc0836b9dd4356969737"
-dependencies = [
- "inventory",
- "minijinja",
- "minijinja-contrib",
- "serde_json",
- "thiserror 2.0.18",
- "tokenizers 0.21.4",
 ]
 
 [[package]]
@@ -2565,9 +2552,9 @@ dependencies = [
 [[package]]
 name = "mlx-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/mlx-llm?branch=main#7041411f395e43c542770d1cfb3c3945c8c9a875"
+source = "git+https://github.com/SceneWorks/mlx-llm?branch=main#2885ee28cd6ba773f3b1d2d0af88e91b0a5925cc"
 dependencies = [
- "core-llm 0.0.0 (git+https://github.com/SceneWorks/core-llm?branch=main)",
+ "core-llm",
  "half",
  "inventory",
  "pmetal-mlx-rs",
@@ -2731,7 +2718,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 1.3.1",
+ "proc-macro-crate 2.0.2",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
