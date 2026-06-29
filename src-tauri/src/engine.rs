@@ -5,8 +5,8 @@ use std::thread;
 use core_llm::{
     load_for_model, CancelFlag, Channel, Content, FinishReason, ImageRef, KvCacheQuant,
     KvCacheQuantMethod, LoadSpec, Message, Quantize, Role, Sampling, StreamEvent, TextLlm,
-    TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest, ThinkingMode, ToolCall, ToolSpec, Usage,
-    VideoRef,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest, ThinkingMode, ToolCall, ToolSpec,
+    Usage, VideoRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -831,6 +831,59 @@ mod tests {
                 },
             },
         }))
+    }
+
+    /// A loader standing in for a backend/model that does NOT support KV-cache quantization: a
+    /// `kv_cache_quant` request is rejected at load with `Error::Unsupported` (exactly as the mlx-llm
+    /// provider does for the hybrid Qwen3.6 cache / an out-of-range bit-width). A `None` request loads
+    /// fine. Mirrors the contract's "advertise the capability, otherwise fail cleanly" rule.
+    fn kv_quant_rejecting_loader(spec: &LoadSpec) -> core_llm::Result<Box<dyn TextLlm>> {
+        if spec.kv_cache_quant.is_some() {
+            return Err(core_llm::Error::Unsupported(
+                "KV-cache quantization is not supported for this model".to_string(),
+            ));
+        }
+        fake_loader(spec)
+    }
+
+    /// Unsupported path (sc-8533): loading with a `kv_cache_quant` against a backend/model that does
+    /// not support it surfaces a clean error string (no panic, no silent dense fallback) — the engine
+    /// stays unloaded so the UI can show a "not supported" state. Loading the same model dense
+    /// (`None`) then succeeds, proving the toggle is recoverable.
+    #[test]
+    fn load_with_unsupported_kv_cache_quant_errors_cleanly() {
+        let engine = EngineHandle::spawn_with_loader(kv_quant_rejecting_loader);
+
+        let err = engine
+            .load_model(LoadModelRequest {
+                source: "/tmp/fake-model".to_string(),
+                display_name: None,
+                quantize: None,
+                kv_cache_quant: Some(KvCacheQuantRequest {
+                    method: KvCacheQuantMethodRequest::Rvq,
+                    bits: 4,
+                }),
+            })
+            .unwrap_err();
+        assert!(
+            err.contains("not supported"),
+            "unsupported KV-quant load should surface a clean 'not supported' error, got: {err:?}"
+        );
+
+        // Nothing got loaded — toggling KV-quant off (dense) loads cleanly.
+        let status = engine
+            .load_model(LoadModelRequest {
+                source: "/tmp/fake-model".to_string(),
+                display_name: None,
+                quantize: None,
+                kv_cache_quant: None,
+            })
+            .unwrap();
+        let loaded = status.loaded.expect("dense load succeeds");
+        assert!(
+            loaded.kv_cache_quant.is_none(),
+            "dense load has no KV-quant"
+        );
     }
 
     #[test]
