@@ -382,7 +382,7 @@ source = "git+https://github.com/SceneWorks/candle-llm?branch=main#df0720b8c9db7
 dependencies = [
  "candle-core",
  "candle-nn",
- "core-llm",
+ "core-llm 0.0.0 (git+https://github.com/SceneWorks/core-llm?rev=3870ed1)",
  "inventory",
  "serde_json",
  "thiserror 2.0.18",
@@ -510,7 +510,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "candle-llm",
- "core-llm",
+ "core-llm 0.0.0 (git+https://github.com/SceneWorks/core-llm?rev=6e07ae4)",
  "futures-util",
  "image",
  "keyring",
@@ -645,6 +645,19 @@ dependencies = [
 name = "core-llm"
 version = "0.0.0"
 source = "git+https://github.com/SceneWorks/core-llm?rev=3870ed1#3870ed1c7495caa6bcb8cc0836b9dd4356969737"
+dependencies = [
+ "inventory",
+ "minijinja",
+ "minijinja-contrib",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokenizers 0.21.4",
+]
+
+[[package]]
+name = "core-llm"
+version = "0.0.0"
+source = "git+https://github.com/SceneWorks/core-llm?rev=6e07ae4#6e07ae447a5e006921da8083d37209f14d65b128"
 dependencies = [
  "inventory",
  "minijinja",
@@ -2552,9 +2565,9 @@ dependencies = [
 [[package]]
 name = "mlx-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/mlx-llm?branch=main#2885ee28cd6ba773f3b1d2d0af88e91b0a5925cc"
+source = "git+https://github.com/SceneWorks/mlx-llm?branch=michaeltrefry1818/sc-8533/e-chatworks-kv-cache-qua#8ec5e4de7ffb4f987cf75ee50ad5ef9565362e70"
 dependencies = [
- "core-llm",
+ "core-llm 0.0.0 (git+https://github.com/SceneWorks/core-llm?rev=6e07ae4)",
  "half",
  "inventory",
  "pmetal-mlx-rs",

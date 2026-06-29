@@ -1258,6 +1258,7 @@ mod tests {
                 source: "/tmp/fake-model".to_string(),
                 display_name: Some("fake-model".to_string()),
                 quantize: None,
+                kv_cache_quant: None,
             })
             .unwrap();
         engine
@@ -1332,6 +1333,7 @@ mod tests {
                 source: "/tmp/fake-tools".to_string(),
                 display_name: Some("fake-tools".to_string()),
                 quantize: None,
+                kv_cache_quant: None,
             })
             .unwrap();
         engine
