@@ -45,6 +45,7 @@ fn qwen3vl_vision_over_openai_server() {
             source: model,
             display_name: None,
             quantize: None,
+            kv_cache_quant: None,
         })
         .expect("load Qwen3-VL");
     // The provider must advertise vision once loaded (the VLM checkpoint carries the `vision_config`).

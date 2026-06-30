@@ -3,9 +3,10 @@ use std::sync::mpsc;
 use std::thread;
 
 use core_llm::{
-    load_for_model, CancelFlag, Channel, Content, FinishReason, ImageRef, LoadSpec, Message,
-    Quantize, Role, Sampling, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor,
-    TextLlmRequest, ThinkingMode, ToolCall, ToolSpec, Usage, VideoRef,
+    load_for_model, CancelFlag, Channel, Content, FinishReason, ImageRef, KvCacheQuant,
+    KvCacheQuantMethod, LoadSpec, Message, Quantize, Role, Sampling, StreamEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest, ThinkingMode, ToolCall, ToolSpec,
+    Usage, VideoRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -146,6 +147,10 @@ impl EngineActor {
         let spec = LoadSpec {
             source: request.source.clone(),
             quantize: request.quantize.map(Into::into),
+            // KV-cache quantization (sc-8533) — DISTINCT from the weight quant above. `None` (the
+            // default) ⇒ a dense cache; a provider/model that doesn't support it surfaces a clean
+            // error from `load` (no crash, no silent fallback).
+            kv_cache_quant: request.kv_cache_quant.map(Into::into),
         };
         let provider = (self.loader)(&spec).map_err(|error| error.to_string())?;
         let descriptor = provider.descriptor().clone();
@@ -153,6 +158,7 @@ impl EngineActor {
             source: request.source,
             display_name: request.display_name,
             quantize: request.quantize,
+            kv_cache_quant: request.kv_cache_quant,
             provider,
             descriptor,
         });
@@ -206,6 +212,7 @@ struct LoadedModel {
     source: String,
     display_name: Option<String>,
     quantize: Option<QuantizeRequest>,
+    kv_cache_quant: Option<KvCacheQuantRequest>,
     provider: Box<dyn TextLlm>,
     descriptor: TextLlmDescriptor,
 }
@@ -219,6 +226,7 @@ impl LoadedModel {
                 .clone()
                 .unwrap_or_else(|| model_name(&self.source)),
             quantize: self.quantize,
+            kv_cache_quant: self.kv_cache_quant,
             provider: ProviderSummary::from(self.descriptor.clone()),
         }
     }
@@ -229,8 +237,14 @@ pub struct LoadModelRequest {
     pub source: String,
     #[serde(default)]
     pub display_name: Option<String>,
+    /// Load-time **weight** quantization (Q4/Q8). DISTINCT from [`kv_cache_quant`](Self::kv_cache_quant).
     #[serde(default)]
     pub quantize: Option<QuantizeRequest>,
+    /// **KV-cache** quantization (sc-8533) — runtime compression of the per-step key/value cache,
+    /// entirely separate from the weight [`quantize`](Self::quantize) above. `None`/absent (the
+    /// default) ⇒ a dense cache; an unsupported backend/model surfaces a clean load error.
+    #[serde(default)]
+    pub kv_cache_quant: Option<KvCacheQuantRequest>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -245,6 +259,38 @@ impl From<QuantizeRequest> for Quantize {
         match value {
             QuantizeRequest::Q4 => Quantize::Q4,
             QuantizeRequest::Q8 => Quantize::Q8,
+        }
+    }
+}
+
+/// KV-cache quantization config (sc-8533): a compression method + bit-width, mirroring
+/// [`core_llm::KvCacheQuant`]. Kept separate from [`QuantizeRequest`] (weight quant) end to end.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct KvCacheQuantRequest {
+    pub method: KvCacheQuantMethodRequest,
+    pub bits: u8,
+}
+
+/// The KV-cache compression method (sc-8533), mirroring [`core_llm::KvCacheQuantMethod`].
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum KvCacheQuantMethodRequest {
+    Rvq,
+}
+
+impl From<KvCacheQuantMethodRequest> for KvCacheQuantMethod {
+    fn from(value: KvCacheQuantMethodRequest) -> Self {
+        match value {
+            KvCacheQuantMethodRequest::Rvq => KvCacheQuantMethod::Rvq,
+        }
+    }
+}
+
+impl From<KvCacheQuantRequest> for KvCacheQuant {
+    fn from(value: KvCacheQuantRequest) -> Self {
+        KvCacheQuant {
+            method: value.method.into(),
+            bits: value.bits,
         }
     }
 }
@@ -511,6 +557,9 @@ pub struct LoadedModelStatus {
     pub source: String,
     pub name: String,
     pub quantize: Option<QuantizeRequest>,
+    /// The KV-cache quantization the loaded model is running with (sc-8533), or `None` for a dense
+    /// cache. Surfaced so the UI can reflect the active state (and restore "dense" when toggled off).
+    pub kv_cache_quant: Option<KvCacheQuantRequest>,
     pub provider: ProviderSummary,
 }
 
@@ -544,6 +593,9 @@ pub struct CapabilitySummary {
     pub supports_video: bool,
     pub supports_thinking: bool,
     pub supports_tools: bool,
+    /// Whether the loaded model can run a quantized KV cache (sc-8533) — surfaced so the UI only
+    /// offers the KV-cache-quant toggle where the active backend/model honors it.
+    pub supports_kv_cache_quant: bool,
     pub supported_constraints: Vec<String>,
 }
 
@@ -557,6 +609,7 @@ impl From<TextLlmCapabilities> for CapabilitySummary {
             supports_video: value.supports_video,
             supports_thinking: value.supports_thinking,
             supports_tools: value.supports_tools,
+            supports_kv_cache_quant: value.supports_kv_cache_quant,
             supported_constraints: value
                 .supported_constraints
                 .into_iter()
@@ -672,6 +725,51 @@ mod tests {
     use super::*;
     use core_llm::{TextLlmOutput, Usage};
 
+    /// A `LoadModelRequest` with no `kv_cache_quant` field in the JSON deserializes with `None`
+    /// (backward compatible with callers/persisted requests written before sc-8533), and weight
+    /// quant stays independent.
+    #[test]
+    fn load_request_kv_cache_quant_absent_is_none() {
+        let req: LoadModelRequest =
+            serde_json::from_str(r#"{"source":"/snap","quantize":"q4"}"#).unwrap();
+        assert!(req.kv_cache_quant.is_none());
+        assert!(matches!(req.quantize, Some(QuantizeRequest::Q4)));
+    }
+
+    /// An explicit RVQ `kv_cache_quant` round-trips through serde and converts to the core-llm
+    /// contract type with the method + bit-width preserved, distinct from the weight quant.
+    #[test]
+    fn load_request_kv_cache_quant_round_trip_and_into_core() {
+        let json = r#"{"source":"/snap","kv_cache_quant":{"method":"rvq","bits":4}}"#;
+        let req: LoadModelRequest = serde_json::from_str(json).unwrap();
+        let kv = req.kv_cache_quant.expect("kv_cache_quant present");
+        assert_eq!(kv.method, KvCacheQuantMethodRequest::Rvq);
+        assert_eq!(kv.bits, 4);
+        assert!(req.quantize.is_none()); // weight quant independent / absent
+
+        // Re-serialize → deserialize is stable.
+        let again: KvCacheQuantRequest =
+            serde_json::from_str(&serde_json::to_string(&kv).unwrap()).unwrap();
+        assert_eq!(again, kv);
+
+        // Converts to the core-llm contract type faithfully.
+        let core: KvCacheQuant = kv.into();
+        assert_eq!(core.method, KvCacheQuantMethod::Rvq);
+        assert_eq!(core.bits, 4);
+    }
+
+    /// The capability summary surfaces `supports_kv_cache_quant` so the UI can gate the toggle.
+    #[test]
+    fn capability_summary_carries_kv_cache_quant_support() {
+        let caps = TextLlmCapabilities {
+            supports_kv_cache_quant: true,
+            ..Default::default()
+        };
+        let summary = CapabilitySummary::from(caps);
+        assert!(summary.supports_kv_cache_quant);
+        assert!(!CapabilitySummary::from(TextLlmCapabilities::default()).supports_kv_cache_quant);
+    }
+
     struct FakeProvider {
         descriptor: TextLlmDescriptor,
     }
@@ -735,6 +833,59 @@ mod tests {
         }))
     }
 
+    /// A loader standing in for a backend/model that does NOT support KV-cache quantization: a
+    /// `kv_cache_quant` request is rejected at load with `Error::Unsupported` (exactly as the mlx-llm
+    /// provider does for the hybrid Qwen3.6 cache / an out-of-range bit-width). A `None` request loads
+    /// fine. Mirrors the contract's "advertise the capability, otherwise fail cleanly" rule.
+    fn kv_quant_rejecting_loader(spec: &LoadSpec) -> core_llm::Result<Box<dyn TextLlm>> {
+        if spec.kv_cache_quant.is_some() {
+            return Err(core_llm::Error::Unsupported(
+                "KV-cache quantization is not supported for this model".to_string(),
+            ));
+        }
+        fake_loader(spec)
+    }
+
+    /// Unsupported path (sc-8533): loading with a `kv_cache_quant` against a backend/model that does
+    /// not support it surfaces a clean error string (no panic, no silent dense fallback) — the engine
+    /// stays unloaded so the UI can show a "not supported" state. Loading the same model dense
+    /// (`None`) then succeeds, proving the toggle is recoverable.
+    #[test]
+    fn load_with_unsupported_kv_cache_quant_errors_cleanly() {
+        let engine = EngineHandle::spawn_with_loader(kv_quant_rejecting_loader);
+
+        let err = engine
+            .load_model(LoadModelRequest {
+                source: "/tmp/fake-model".to_string(),
+                display_name: None,
+                quantize: None,
+                kv_cache_quant: Some(KvCacheQuantRequest {
+                    method: KvCacheQuantMethodRequest::Rvq,
+                    bits: 4,
+                }),
+            })
+            .unwrap_err();
+        assert!(
+            err.contains("not supported"),
+            "unsupported KV-quant load should surface a clean 'not supported' error, got: {err:?}"
+        );
+
+        // Nothing got loaded — toggling KV-quant off (dense) loads cleanly.
+        let status = engine
+            .load_model(LoadModelRequest {
+                source: "/tmp/fake-model".to_string(),
+                display_name: None,
+                quantize: None,
+                kv_cache_quant: None,
+            })
+            .unwrap();
+        let loaded = status.loaded.expect("dense load succeeds");
+        assert!(
+            loaded.kv_cache_quant.is_none(),
+            "dense load has no KV-quant"
+        );
+    }
+
     #[test]
     fn load_generate_and_unload_round_trip() {
         let engine = EngineHandle::spawn_with_loader(fake_loader);
@@ -743,6 +894,7 @@ mod tests {
                 source: "/tmp/fake-model".to_string(),
                 display_name: None,
                 quantize: None,
+                kv_cache_quant: None,
             })
             .unwrap();
         assert_eq!(status.loaded.unwrap().name, "fake-model");

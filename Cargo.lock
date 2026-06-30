@@ -378,7 +378,7 @@ dependencies = [
 [[package]]
 name = "candle-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/candle-llm?branch=main#df0720b8c9db70a7c156a0922aa4957976f5bc5a"
+source = "git+https://github.com/SceneWorks/candle-llm?branch=main#3d7963197dbf22200fd163072f90f3fa0176dafe"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -644,7 +644,7 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?rev=3870ed1#3870ed1c7495caa6bcb8cc0836b9dd4356969737"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#084d3e9919d4c30f8dea74f0e66fb0f6257af65d"
 dependencies = [
  "inventory",
  "minijinja",
@@ -2552,7 +2552,7 @@ dependencies = [
 [[package]]
 name = "mlx-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/mlx-llm?branch=main#2885ee28cd6ba773f3b1d2d0af88e91b0a5925cc"
+source = "git+https://github.com/SceneWorks/mlx-llm?branch=main#1b72e2ac5c394ac82c24c6cde07cf268f24d3767"
 dependencies = [
  "core-llm",
  "half",
@@ -5404,7 +5404,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

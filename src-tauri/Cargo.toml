@@ -17,14 +17,15 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 axum = "0.8"
 base64 = "0.22"
-# Pinned to the same rev as the candle-llm backend dep (its Cargo.toml hard-pins core-llm `3870ed1`,
-# sc-8021), so cargo unifies on ONE core-llm source — otherwise a `branch = "main"` spec here and the
+# Pinned to `branch = "main"` to match the backend deps (mlx-llm + candle-llm both pin core-llm
+# `branch = "main"`), so cargo unifies on ONE core-llm source — otherwise a `branch` spec here and a
 # `rev` spec there are distinct git sources, yielding two core-llm copies whose link-time provider
 # registries don't share (the backend's `candle-llama`/`mlx-llama` registration would be invisible to
-# this crate). `3870ed1` carries the Qwen3-VL contract (`Content::Video`, `supports_video`,
-# `weightless_vision`). NOTE: the macOS `mlx-llm` dep must pin the same rev for the macOS build to
-# unify (the remaining sc-8021 mlx-llm pin).
-core-llm = { git = "https://github.com/SceneWorks/core-llm", rev = "3870ed1" }
+# this crate). The committed Cargo.lock pins the resolved commit so a stray `cargo update` can't float
+# core-llm to a new HEAD (sc-8116/sc-8533). core-llm main carries the sc-8533 additions: the OPTIONAL
+# `LoadSpec.kv_cache_quant` + `supports_kv_cache_quant` capability the KV-cache-quant UI threads
+# through (epic sc-8528); candle-llm (Windows/Linux) reports the capability as unsupported.
+core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
@@ -39,7 +40,8 @@ tokio-stream = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 # Inference backend — exactly one is compiled per platform.
-# macOS (Apple Silicon): the MLX backend.
+# macOS (Apple Silicon): the MLX backend. Pinned to `main`, which carries the sc-8533 RVQ KV-cache
+# provider (#62) and itself pins core-llm `branch = "main"`, so the macOS build unifies on ONE core-llm.
 [target.'cfg(target_os = "macos")'.dependencies]
 mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", branch = "main" }
 
