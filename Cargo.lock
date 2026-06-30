@@ -378,7 +378,7 @@ dependencies = [
 [[package]]
 name = "candle-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/candle-llm?branch=michaeltrefry1818/sc-8528-backout/candle-remove-kv-quant-compat#abcc16498724f16036cf4470dd2adedf158b46e5"
+source = "git+https://github.com/SceneWorks/candle-llm?branch=main#8673651a3b78684a6c5cb59971f9797d5b756721"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -644,7 +644,7 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/core-llm?branch=michaeltrefry1818/sc-8528-backout/core-llm-remove-kv-quant#b6df5151ac2746d40fb7f68488c3d22eb2e9995a"
+source = "git+https://github.com/SceneWorks/core-llm?branch=main#54cbac806304e823470ce3ded08f78589acdbb62"
 dependencies = [
  "inventory",
  "minijinja",
@@ -2552,7 +2552,7 @@ dependencies = [
 [[package]]
 name = "mlx-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/mlx-llm?branch=michaeltrefry1818/sc-8528-backout/mlx-llm-remove-kv-quant#cb34af6048dd6df1ed6f236ac4227a7df0cdd8ee"
+source = "git+https://github.com/SceneWorks/mlx-llm?branch=main#4b1f090e6524bbf743d780afc73679fff83ed28e"
 dependencies = [
  "core-llm",
  "half",
@@ -2718,7 +2718,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 1.3.1",
+ "proc-macro-crate 2.0.2",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -5404,7 +5404,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

@@ -26,7 +26,7 @@ base64 = "0.22"
 # DEV-PIN (sc-8528): COORDINATOR flip back to branch="main" after the core-llm + mlx-llm backout PRs merge.
 # Temporarily pinned to the field-removed core-llm backout branch (the KV-quant `LoadSpec.kv_cache_quant`
 # + `supports_kv_cache_quant` surface is being removed and isn't on main yet).
-core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "michaeltrefry1818/sc-8528-backout/core-llm-remove-kv-quant" }
+core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
@@ -46,7 +46,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # DEV-PIN (sc-8528): COORDINATOR flip back to branch="main" after the core-llm + mlx-llm backout PRs merge.
 # Temporarily pinned to the KV-quant-removed mlx-llm backout branch (not merged to main yet).
 [target.'cfg(target_os = "macos")'.dependencies]
-mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", branch = "michaeltrefry1818/sc-8528-backout/mlx-llm-remove-kv-quant" }
+mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", branch = "main" }
 
 # Windows / Linux: the cross-platform Candle backend (CPU by default; CUDA via its `cuda` feature).
 # DEV-PIN (sc-8528): COORDINATOR flip back to branch="main" after the core-llm + mlx-llm backout PRs merge.
@@ -55,7 +55,7 @@ mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", branch = "michaeltref
 # into TWO core-llm sources. All three backends must pin the SAME core-llm for the provider registry
 # to unify.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-candle-llm = { git = "https://github.com/SceneWorks/candle-llm", branch = "michaeltrefry1818/sc-8528-backout/candle-remove-kv-quant-compat" }
+candle-llm = { git = "https://github.com/SceneWorks/candle-llm", branch = "main" }
 
 [lints.rust]
 unsafe_code = "allow"
