@@ -9,9 +9,7 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::engine::{
-    EngineHandle, EngineStatus, KvCacheQuantRequest, LoadModelRequest, QuantizeRequest,
-};
+use crate::engine::{EngineHandle, EngineStatus, LoadModelRequest, QuantizeRequest};
 
 const HF_HOST: &str = "huggingface.co";
 const HF_KEYCHAIN_SERVICE: &str = "net.trefry.chatworks.huggingface";
@@ -58,16 +56,8 @@ pub struct ModelEntry {
     pub revision: String,
     pub source_url: String,
     pub local_path: String,
-    /// Load-time **weight** quantization baked at import (Q4/Q8). DISTINCT from
-    /// [`kv_cache_quant`](Self::kv_cache_quant).
     #[serde(default)]
     pub quantize: Option<QuantizeRequest>,
-    /// **KV-cache** quantization (sc-8533): a per-model runtime setting applied at load, separate
-    /// from the weight [`quantize`](Self::quantize) above. `None`/absent (the default — backward
-    /// compatible with registries written before sc-8533) ⇒ a dense KV cache. Set via
-    /// `set_model_kv_cache_quant`; honored only by a backend/model that advertises support.
-    #[serde(default)]
-    pub kv_cache_quant: Option<KvCacheQuantRequest>,
     pub imported_at: u64,
     pub file_count: usize,
     #[serde(default)]
@@ -173,7 +163,6 @@ pub fn adopt_cached_hf_model(
         source_url: model_ref.source_url(),
         local_path: candidate.local_path,
         quantize: request.quantize,
-        kv_cache_quant: None,
         imported_at: now_secs(),
         file_count: candidate.file_count,
         size_bytes: candidate.size_bytes,
@@ -227,45 +216,10 @@ pub fn load_registered_model(
         source: entry.local_path.clone(),
         display_name: Some(entry.name.clone()),
         quantize: entry.quantize,
-        // Per-model KV-cache quant (sc-8533): `None` ⇒ dense. An unsupported backend/model makes
-        // `load_model` return an error, surfaced to the UI as a clear "not supported" state.
-        kv_cache_quant: entry.kv_cache_quant,
     })?;
     registry.selected_id = Some(entry.id);
     write_registry(&manifest, &registry)?;
     Ok(status)
-}
-
-/// Set (or clear, with `None`) a model's KV-cache quantization (sc-8533) in the registry. This is the
-/// per-model advanced setting the UI toggles, kept DISTINCT from the import-time weight quant. The
-/// new value takes effect the next time the model is loaded (`load_registered_model`); if the model
-/// is the currently-selected one, it is reloaded immediately so the change is live, and a load error
-/// from an unsupported backend/model is surfaced to the caller (the UI shows a "not supported"
-/// state).
-pub fn set_model_kv_cache_quant(
-    app: &AppHandle,
-    engine: &EngineHandle,
-    model_id: String,
-    kv_cache_quant: Option<KvCacheQuantRequest>,
-) -> Result<ModelRegistry, String> {
-    let manifest = registry_path(app)?;
-    let mut registry = read_registry(&manifest)?;
-    let entry = registry
-        .models
-        .iter_mut()
-        .find(|model| model.id == model_id)
-        .ok_or_else(|| format!("model {model_id:?} is not in the registry"))?;
-    entry.kv_cache_quant = kv_cache_quant;
-    let is_selected = registry.selected_id.as_deref() == Some(model_id.as_str());
-    write_registry(&manifest, &registry)?;
-
-    // If this model is currently loaded, reload it so the new cache setting takes effect now. An
-    // unsupported request surfaces the load error to the caller (the UI reflects the "not supported"
-    // state); toggling back to dense (`None`) always reloads cleanly.
-    if is_selected {
-        load_registered_model(app, engine, model_id)?;
-    }
-    Ok(registry)
 }
 
 pub fn hf_token_status() -> HfTokenStatus {
@@ -384,7 +338,6 @@ async fn import_hf_model_inner(
         source_url: model_ref.source_url(),
         local_path: snapshot_dir.to_string_lossy().to_string(),
         quantize: request.quantize,
-        kv_cache_quant: None,
         imported_at: now_secs(),
         file_count: files.len(),
         size_bytes: total_bytes,
@@ -684,7 +637,6 @@ fn matching_provider(path: &Path) -> Result<Option<core_llm::TextLlmDescriptor>,
     let spec = LoadSpec {
         source,
         quantize: None,
-        kv_cache_quant: None,
     };
     Ok(core_llm::textllms()
         .find(|registration| (registration.can_load)(&spec))
@@ -1291,7 +1243,6 @@ mod tests {
                 source_url: model_ref.source_url(),
                 local_path: "/tmp/old".to_string(),
                 quantize: None,
-                kv_cache_quant: None,
                 imported_at: 1,
                 file_count: 3,
                 size_bytes: Some(10),
@@ -1307,7 +1258,6 @@ mod tests {
                 source_url: model_ref.source_url(),
                 local_path: "/tmp/new".to_string(),
                 quantize: None,
-                kv_cache_quant: None,
                 imported_at: 2,
                 file_count: 4,
                 size_bytes: Some(20),
