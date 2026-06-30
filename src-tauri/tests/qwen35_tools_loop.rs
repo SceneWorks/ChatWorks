@@ -23,7 +23,6 @@ fn qwen35_tool_loop_over_openai_server() {
             source: model,
             display_name: None,
             quantize: None,
-            kv_cache_quant: None,
         })
         .expect("load 27B");
 

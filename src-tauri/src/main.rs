@@ -11,7 +11,6 @@ use chatworks::conversations::{
     rename_conversation as rename_conversation_inner, save_conversation as save_conversation_inner,
     Conversation, ConversationMetadata,
 };
-use chatworks::engine::KvCacheQuantRequest;
 use chatworks::engine::{
     EngineHandle, EngineStatus, GenerateRequest, GenerateResponse, LoadModelRequest,
 };
@@ -21,8 +20,8 @@ use chatworks::model_registry::{
     list_cached_hf_models as list_cached_hf_models_inner,
     list_registered_models as list_registered_models_inner,
     load_registered_model as load_registered_model_inner, set_hf_token as set_hf_token_inner,
-    set_model_kv_cache_quant as set_model_kv_cache_quant_inner, AdoptCachedModelRequest,
-    CachedModelCandidate, HfTokenStatus, ImportHfModelRequest, ModelRegistry, SetHfTokenRequest,
+    AdoptCachedModelRequest, CachedModelCandidate, HfTokenStatus, ImportHfModelRequest,
+    ModelRegistry, SetHfTokenRequest,
 };
 use chatworks::server::{OpenAiServerConfig, OpenAiServerHandle, OpenAiServerStatus};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -159,19 +158,6 @@ fn load_registered_model(
     load_registered_model_inner(&app, &engine, model_id)
 }
 
-/// Set (or clear) a model's KV-cache quantization (sc-8533). `kv_cache_quant: null` ⇒ dense. If the
-/// model is currently loaded it reloads with the new setting; an unsupported backend/model returns
-/// an error string the UI surfaces as a "not supported" state.
-#[tauri::command]
-fn set_model_kv_cache_quant(
-    app: AppHandle,
-    engine: State<'_, EngineHandle>,
-    model_id: String,
-    kv_cache_quant: Option<KvCacheQuantRequest>,
-) -> Result<ModelRegistry, String> {
-    set_model_kv_cache_quant_inner(&app, &engine, model_id, kv_cache_quant)
-}
-
 #[tauri::command]
 fn list_builtin_tools() -> Vec<serde_json::Value> {
     chatworks::tools::builtin_tool_specs()
@@ -282,7 +268,6 @@ fn main() {
             list_cached_hf_models,
             adopt_cached_hf_model,
             load_registered_model,
-            set_model_kv_cache_quant,
             list_builtin_tools,
             execute_tool,
             hf_token_status,

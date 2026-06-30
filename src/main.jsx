@@ -460,14 +460,6 @@ function supportsTools(engineStatus) {
   return engineStatus?.loaded?.provider?.capabilities?.supports_tools === true;
 }
 
-/// Whether the loaded model can run a quantized KV cache (sc-8533). DISTINCT from weight quantization
-/// (Q4/Q8): this compresses the per-step key/value cache at runtime, not the model weights at load.
-/// The MLX llama backend advertises true for the generic causal decoder; candle and the hybrid
-/// Qwen3.6 decoder advertise false, so the KV-cache-quant control stays hidden there.
-function supportsKvCacheQuant(engineStatus) {
-  return engineStatus?.loaded?.provider?.capabilities?.supports_kv_cache_quant === true;
-}
-
 /// The maximum number of model→tool→model round-trips in a single send, to bound runaway loops.
 const MAX_TOOL_STEPS = 8;
 const IMAGE_ATTACHMENT_MAX_DIMENSION = 1536;
@@ -1526,11 +1518,6 @@ const QUANTIZE_OPTIONS = [
   { id: "q8", label: "Quantize Q8", value: "q8" },
 ];
 
-/// KV-cache quantization (sc-8533), runtime KV-cache compression — kept SEPARATE from the weight
-/// quantization (Q4/Q8) above. Currently RVQ is the only method; bit-width is one of {1, 2, 4}.
-const KV_CACHE_QUANT_METHODS = [{ id: "rvq", label: "RVQ", value: "rvq" }];
-const KV_CACHE_QUANT_BITS = [1, 2, 4];
-
 function formatBytes(bytes) {
   if (!bytes && bytes !== 0) return "";
   const units = ["B", "KB", "MB", "GB", "TB"];
@@ -1552,125 +1539,6 @@ function modelSubtitle(model) {
   return parts.join(" · ");
 }
 
-/// Runtime KV-cache-quantization control (sc-8533) for the served model. Rendered ONLY when the
-/// loaded model advertises `supports_kv_cache_quant` — hidden entirely for backends/models that do
-/// not honor it (candle, the hybrid Qwen3.6 decoder). DISTINCT from the weight-quant (Q4/Q8) import
-/// control above: this compresses the per-step KV cache at runtime via `set_model_kv_cache_quant`.
-/// Default OFF (dense). Toggling off sends `null`, restoring the dense cache.
-function KvCacheQuantPanel({ engineStatus, servedModelId, onApplied }) {
-  const active = engineStatus?.loaded?.kv_cache_quant ?? null;
-  const enabled = active !== null;
-  // Form state seeds from the active setting (method/bits) and falls back to RVQ @ 4 bits.
-  const [method, setMethod] = useState(active?.method ?? KV_CACHE_QUANT_METHODS[0].value);
-  const [bits, setBits] = useState(active?.bits ?? 4);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState(null);
-
-  // Re-seed the form whenever the served model / its active KV-quant changes so the controls reflect
-  // the real loaded state (e.g. after a model swap).
-  useEffect(() => {
-    setMethod(active?.method ?? KV_CACHE_QUANT_METHODS[0].value);
-    setBits(active?.bits ?? 4);
-    setError(null);
-  }, [active?.method, active?.bits, servedModelId]);
-
-  // Don't render unless a model is served AND it advertises KV-cache-quant support.
-  if (!servedModelId || !supportsKvCacheQuant(engineStatus)) return null;
-
-  async function apply(kvCacheQuant) {
-    if (busy) return;
-    setBusy(true);
-    setError(null);
-    try {
-      await invoke("set_model_kv_cache_quant", { modelId: servedModelId, kvCacheQuant });
-      await onApplied?.();
-    } catch (cause) {
-      setError(String(cause));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function handleToggle(event) {
-    // Toggling ON applies the current method/bits; toggling OFF sends null (restores dense).
-    apply(event.target.checked ? { method, bits } : null);
-  }
-
-  function handleMethod(value) {
-    setMethod(value);
-    if (enabled) apply({ method: value, bits });
-  }
-
-  function handleBits(value) {
-    const nextBits = Number(value);
-    setBits(nextBits);
-    if (enabled) apply({ method, bits: nextBits });
-  }
-
-  return (
-    <div className="panel">
-      <div className="panel-head">
-        <p className="eyebrow">Runtime</p>
-        <h2>KV-cache quantization</h2>
-        <p className="view-copy">
-          Compress the per-step key/value cache during generation to fit longer contexts in memory.
-          Separate from the model&apos;s weight quantization (Q4/Q8) — this is applied at runtime to the
-          served model and reloads it with the new setting. Default off (dense cache).
-        </p>
-      </div>
-      <label className="toggle-row">
-        <input
-          type="checkbox"
-          checked={enabled}
-          disabled={busy}
-          onChange={handleToggle}
-          aria-label="Enable KV-cache quantization"
-        />
-        <span>
-          Quantize KV cache
-          <small>{enabled ? "Enabled — running a quantized KV cache." : "Disabled — dense KV cache."}</small>
-        </span>
-      </label>
-      {enabled ? (
-        <>
-          <div className="field">
-            <label htmlFor="kv-quant-method">Method</label>
-            <select
-              id="kv-quant-method"
-              value={method}
-              disabled={busy}
-              onChange={(event) => handleMethod(event.target.value)}
-            >
-              {KV_CACHE_QUANT_METHODS.map((option) => (
-                <option key={option.id} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div className="field">
-            <label htmlFor="kv-quant-bits">Bit-width</label>
-            <select
-              id="kv-quant-bits"
-              value={String(bits)}
-              disabled={busy}
-              onChange={(event) => handleBits(event.target.value)}
-            >
-              {KV_CACHE_QUANT_BITS.map((option) => (
-                <option key={option} value={String(option)}>
-                  {option}-bit
-                </option>
-              ))}
-            </select>
-          </div>
-        </>
-      ) : null}
-      {busy ? <p className="view-copy" aria-live="polite">Applying…</p> : null}
-      {error ? <p className="form-error" role="alert">{error}</p> : null}
-    </div>
-  );
-}
-
 function ModelsScreen() {
   const { engineStatus, refreshEngineStatus } = useApp();
   const [registry, setRegistry] = useState({ models: [], selectedId: null });
@@ -1689,15 +1557,6 @@ function ModelsScreen() {
 
   const loadedSource = engineStatus?.loaded?.source ?? null;
   const selectedModel = registry.models.find((model) => model.id === registry.selectedId) ?? null;
-  // The registry id of the currently served model (matched by source + weight-quant), used to key the
-  // runtime KV-cache-quant command. `null` when nothing is served.
-  const servedModelId =
-    registry.models.find(
-      (model) =>
-        loadedSource &&
-        model.localPath === loadedSource &&
-        (model.quantize ?? null) === (engineStatus?.loaded?.quantize ?? null),
-    )?.id ?? null;
 
   const refreshRegistry = useCallback(() => {
     return invoke("list_registered_models")
@@ -1710,13 +1569,6 @@ function ModelsScreen() {
         return null;
       });
   }, []);
-
-  // Re-pull the registry and engine status after a runtime KV-cache-quant change so the panel
-  // reflects the reloaded model's active setting.
-  const refreshServedModel = useCallback(async () => {
-    await refreshRegistry();
-    await refreshEngineStatus();
-  }, [refreshRegistry, refreshEngineStatus]);
 
   useEffect(() => {
     refreshRegistry();
@@ -1993,12 +1845,6 @@ function ModelsScreen() {
           </p>
         ) : null}
       </div>
-
-      <KvCacheQuantPanel
-        engineStatus={engineStatus}
-        servedModelId={servedModelId}
-        onApplied={refreshServedModel}
-      />
 
       <div className="panel">
         <div className="panel-head">
