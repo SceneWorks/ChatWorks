@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use core_llm::{
@@ -14,9 +14,26 @@ pub type EngineResult<T> = Result<T, String>;
 
 type Loader = fn(&LoadSpec) -> core_llm::Result<Box<dyn TextLlm>>;
 
+/// The in-flight generation's cancel flag, shared between the engine thread and the handle so a
+/// `cancel()` call can trip it without going through the actor's serial command loop (which is
+/// blocked while a generation runs). `None` when no generation is in flight (code-review F-004).
+///
+/// The single (unkeyed) slot is safe because the [`EngineActor`] runs one command at a time on a
+/// single thread: at most ONE generation is ever in flight, so `cancel()` can only ever target it.
+/// This holds even though the handle is shared between the Tauri UI and the HTTP server — the actor
+/// serializes their `Generate` commands. Two caveats a future change must respect:
+/// (1) If the actor ever runs generations concurrently (e.g. a worker pool), the slot must be keyed
+///     by request id so cancel targets the right generation (PR #30 review, R7).
+/// (2) A `cancel()` issued in the window after a `Generate` command is sent but before the actor
+///     installs the flag returns `false` (the flag isn't installed yet); the caller may retry. This
+///     window is bounded by the actor's dequeue time and is not a correctness bug — the generation
+///     simply isn't cancellable until it starts.
+type CancelSlot = Arc<Mutex<Option<CancelFlag>>>;
+
 #[derive(Clone)]
 pub struct EngineHandle {
     tx: mpsc::Sender<EngineCommand>,
+    cancel: CancelSlot,
 }
 
 impl EngineHandle {
@@ -26,11 +43,13 @@ impl EngineHandle {
 
     pub(crate) fn spawn_with_loader(loader: Loader) -> Self {
         let (tx, rx) = mpsc::channel();
+        let cancel: CancelSlot = Arc::new(Mutex::new(None));
+        let actor_cancel = Arc::clone(&cancel);
         thread::Builder::new()
             .name("chatworks-engine".to_string())
-            .spawn(move || EngineActor::new(loader, rx).run())
+            .spawn(move || EngineActor::new(loader, rx, actor_cancel).run())
             .expect("failed to start ChatWorks engine thread");
-        Self { tx }
+        Self { tx, cancel }
     }
 
     pub fn load_model(&self, request: LoadModelRequest) -> EngineResult<EngineStatus> {
@@ -69,6 +88,20 @@ impl EngineHandle {
         recv_reply(reply_rx)
     }
 
+    /// Request cancellation of the in-flight generation, if any. The provider is handed the
+    /// [`CancelFlag`] at generation start; tripping it asks the provider to stop promptly (the
+    /// provider returns a partial output marked `FinishReason::Cancelled`). Returns `true` if a
+    /// generation was in flight and its flag was tripped (code-review F-004).
+    pub fn cancel(&self) -> bool {
+        if let Ok(slot) = self.cancel.lock() {
+            if let Some(flag) = slot.as_ref() {
+                flag.cancel();
+                return true;
+            }
+        }
+        false
+    }
+
     fn send(&self, command: EngineCommand) -> EngineResult<()> {
         self.tx
             .send(command)
@@ -103,14 +136,16 @@ struct EngineActor {
     loader: Loader,
     rx: mpsc::Receiver<EngineCommand>,
     loaded: Option<LoadedModel>,
+    cancel: CancelSlot,
 }
 
 impl EngineActor {
-    fn new(loader: Loader, rx: mpsc::Receiver<EngineCommand>) -> Self {
+    fn new(loader: Loader, rx: mpsc::Receiver<EngineCommand>, cancel: CancelSlot) -> Self {
         Self {
             loader,
             rx,
             loaded: None,
+            cancel,
         }
     }
 
@@ -169,12 +204,24 @@ impl EngineActor {
             .as_ref()
             .ok_or_else(|| "no model loaded".to_string())?;
         let core_request = request.into_core()?;
-        let output = loaded
+        // Publish the request's cancel flag into the shared slot so an out-of-band `cancel()` can
+        // trip it mid-generation (the actor loop is blocked here, so cancel can't be a command).
+        // Cleared in the guard below so a stale flag never cancels a later generation (F-004).
+        if let Ok(mut slot) = self.cancel.lock() {
+            *slot = Some(core_request.cancel.clone());
+        }
+        let result = loaded
             .provider
             .generate(&core_request, &mut |event| {
                 let _ = event_tx.send(StreamPayload::from(event));
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string());
+        // Always clear the in-flight flag, whether the generation finished, errored, or was
+        // cancelled — the next generation installs a fresh flag.
+        if let Ok(mut slot) = self.cancel.lock() {
+            *slot = None;
+        }
+        let output = result?;
         Ok(GenerateResponse {
             text: output.text,
             thinking: output.thinking,
@@ -282,6 +329,10 @@ impl GenerateRequest {
                 .map(GenerateMessage::into_core)
                 .collect::<EngineResult<Vec<_>>>()?,
             sampling: self.sampling.into_core(),
+            // `max_new_tokens` is intentionally not clamped against the loaded provider's
+            // `max_new_tokens` here: the provider's `validate` rejects an over-limit value (the
+            // FakeProvider test exercises exactly that), so the clamp is deliberately downstream of
+            // the engine boundary (code-review F-014).
             max_new_tokens: self.max_new_tokens,
             seed: self.seed,
             constraint: None,
@@ -403,6 +454,16 @@ pub struct GenerateVideo {
 
 impl GenerateVideo {
     fn into_core(self) -> EngineResult<VideoRef> {
+        // Per-video frame cap (F-002). This is deliberately NOT cumulative across the request: the
+        // frontend re-sends full history each turn, so a cumulative cap would brick a conversation
+        // once enough video turns accumulate (PR #30 review). Per-video bounds a single oversized
+        // clip without making history toxic.
+        if self.frames.len() > MAX_FRAMES_PER_VIDEO {
+            return Err(format!(
+                "video attachment has {} frames, exceeding the {MAX_FRAMES_PER_VIDEO} per-video limit",
+                self.frames.len()
+            ));
+        }
         let frames = self
             .frames
             .iter()
@@ -439,18 +500,62 @@ impl GenerateMessage {
     }
 }
 
-/// Decode an image attachment (`data:<mime>;base64,<data>` URL or bare base64) to an RGB8 [`ImageRef`].
+/// Maximum decoded pixel budget per image attachment (width × height). A 64 MiB JSON body can
+/// carry a base64 payload that decodes to a multi-gigabyte RGB buffer (a decompression bomb); this
+/// cap rejects oversized images at the decode boundary so both the IPC and HTTP paths share the
+/// guard (code-review F-002). 3_318_240 px ≈ 1830×1830, comfortably above the frontend's 1536 px
+/// self-limit (`src/media/image.js`) while bounding a single image to ~10 MB of RGB8.
+const MAX_IMAGE_PIXELS: u64 = 3_318_240;
+
+/// Per-axis decompression-bomb ceiling. The `image` crate's strict limits are per-axis (not a
+/// pixel product), so this is set generously — high enough that no legitimate image near the
+/// [`MAX_IMAGE_PIXELS`] budget is rejected (e.g. a 2560×800 panorama, 2.05 Mpx, is well under budget
+/// but exceeds a naive `floor(sqrt(budget))` per-axis cap of 1821 px — PR #30 review). The real
+/// budget is enforced post-decode on the width×height product below.
+const MAX_IMAGE_AXIS: u32 = 4096;
+
+/// Maximum frames per single video attachment, bounding the worst case where every frame is itself a
+/// dimension-capped image (code-review F-002). The frontend samples up to ~8 frames per clip
+/// (`VIDEO_ATTACHMENT_MAX_FRAMES` in `src/media/video.js`); this is a per-video safety ceiling, NOT
+/// cumulative across the re-sent transcript — a cumulative cap would brick conversations once enough
+/// video turns accumulate, since the frontend re-sends full history each turn (PR #30 review).
+const MAX_FRAMES_PER_VIDEO: usize = 64;
+
+/// Decode an image attachment (`data:<mime>;base64,<data>` URL or bare base64) to an RGB8
+/// [`ImageRef`], rejecting images whose decoded dimensions exceed [`MAX_IMAGE_PIXELS`]
+/// (code-review F-002). The per-axis strict limit is only a bomb guard (see [`MAX_IMAGE_AXIS`]); the
+/// real pixel budget is enforced post-decode on the width×height product, so legitimate
+/// non-square images under budget are accepted.
 fn decode_image(data: &str) -> EngineResult<ImageRef> {
     use base64::Engine as _;
+    use image::GenericImageView;
     // Strip the optional `data:<mime>;base64,` prefix.
     let b64 = data.rsplit_once(',').map(|(_, rest)| rest).unwrap_or(data).trim();
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|error| format!("invalid base64 image attachment: {error}"))?;
-    let rgb = image::load_from_memory(&bytes)
-        .map_err(|error| format!("could not decode image attachment: {error}"))?
-        .to_rgb8();
-    let (width, height) = rgb.dimensions();
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes));
+    reader.set_format(image::guess_format(&bytes).map_err(|error| {
+        format!("could not determine image attachment format: {error}")
+    })?);
+    // Bomb guard: reject absurd per-axis dimensions before decoding the full buffer. Set generously
+    // (MAX_IMAGE_AXIS); the real budget is the product check after decode.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_AXIS);
+    limits.max_image_height = Some(MAX_IMAGE_AXIS);
+    reader.limits(limits);
+    let img = reader
+        .decode()
+        .map_err(|error| format!("could not decode image attachment: {error}"))?;
+    let (width, height) = img.dimensions();
+    let pixels = width as u64 * height as u64;
+    if pixels > MAX_IMAGE_PIXELS {
+        return Err(format!(
+            "image attachment is too large: {width}x{height} ({pixels} px) exceeds the {MAX_IMAGE_PIXELS} px limit"
+        ));
+    }
+    // `into_rgb8()` moves the decoded buffer instead of cloning it (`.to_rgb8()` copies).
+    let rgb = img.into_rgb8();
     ImageRef::new(width, height, rgb.into_raw())
 }
 
@@ -670,70 +775,9 @@ fn model_name(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_llm::{TextLlmOutput, Usage};
-
-    struct FakeProvider {
-        descriptor: TextLlmDescriptor,
-    }
-
-    impl TextLlm for FakeProvider {
-        fn descriptor(&self) -> &TextLlmDescriptor {
-            &self.descriptor
-        }
-
-        fn validate(&self, req: &TextLlmRequest) -> core_llm::Result<()> {
-            self.descriptor
-                .capabilities
-                .validate_request(&self.descriptor.id, req)
-        }
-
-        fn generate(
-            &self,
-            req: &TextLlmRequest,
-            on_event: &mut dyn FnMut(StreamEvent),
-        ) -> core_llm::Result<TextLlmOutput> {
-            self.validate(req)?;
-            on_event(StreamEvent::Token {
-                id: 1,
-                text: "ok".to_string(),
-                index: 0,
-                channel: Channel::Content,
-            });
-            let usage = Usage {
-                prompt_tokens: 2,
-                generated_tokens: 1,
-            };
-            on_event(StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-                usage,
-            });
-            Ok(TextLlmOutput {
-                text: "ok".to_string(),
-                thinking: None,
-                tool_calls: Vec::new(),
-                usage,
-                finish_reason: Some(FinishReason::Stop),
-            })
-        }
-    }
-
-    fn fake_loader(spec: &LoadSpec) -> core_llm::Result<Box<dyn TextLlm>> {
-        if spec.source == "bad" {
-            return Err(core_llm::Error::Load("bad model".to_string()));
-        }
-        Ok(Box::new(FakeProvider {
-            descriptor: TextLlmDescriptor {
-                id: "fake".to_string(),
-                family: "test".to_string(),
-                backend: "unit".to_string(),
-                capabilities: TextLlmCapabilities {
-                    supports_system_prompt: true,
-                    max_new_tokens: 8,
-                    ..Default::default()
-                },
-            },
-        }))
-    }
+    // The shared weightless fakes live in `test_support` so the engine and server tests can't drift
+    // apart (code-review F-012).
+    use crate::test_support::fake_loader;
 
     #[test]
     fn load_generate_and_unload_round_trip() {
@@ -769,7 +813,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(output.text, "ok");
-        assert_eq!(events.len(), 2);
+        // The shared FakeProvider emits a reasoning token + a content token + Done (3 events) when
+        // thinking is not disabled (code-review F-012 unifies this with the server fake).
+        assert_eq!(events.len(), 3);
+        assert_eq!(output.thinking.as_deref(), Some("reason"));
 
         let status = engine.unload_model().unwrap();
         assert!(status.loaded.is_none());
@@ -797,5 +844,85 @@ mod tests {
             |_| {},
         );
         assert_eq!(result.unwrap_err(), "no model loaded");
+    }
+
+    /// A single video with `MAX_FRAMES_PER_VIDEO + 1` frames is rejected (F-002). The cap is
+    /// per-video, NOT cumulative across the re-sent transcript — a cumulative cap would brick a
+    /// conversation once enough video turns accumulate (PR #30 review). Frames are bare base64;
+    /// decode never runs because the cap fires first.
+    #[test]
+    fn rejects_video_exceeding_per_video_frame_cap() {
+        let frames: Vec<String> = (0..=MAX_FRAMES_PER_VIDEO)
+            .map(|i| format!("data:image/png;base64,FRAME{i}"))
+            .collect();
+        let timestamps: Vec<f32> = (0..frames.len()).map(|i| i as f32).collect();
+        let request = GenerateRequest {
+            messages: vec![GenerateMessage {
+                role: "user".to_string(),
+                content: "describe".to_string(),
+                images: Vec::new(),
+                videos: vec![GenerateVideo { frames, timestamps }],
+                tool_calls: Vec::new(),
+            }],
+            sampling: SamplingRequest::default(),
+            max_new_tokens: 8,
+            seed: None,
+            stop: Vec::new(),
+            thinking: ThinkingRequest::Auto,
+            tools: Vec::new(),
+        };
+        let engine = EngineHandle::spawn_with_loader(fake_loader);
+        engine
+            .load_model(LoadModelRequest {
+                source: "/tmp/fake-model".to_string(),
+                display_name: None,
+                quantize: None,
+            })
+            .unwrap();
+        let err = engine.generate(request, |_| {}).unwrap_err();
+        assert!(
+            err.contains("frames") && err.contains("per-video limit"),
+            "expected a per-video frame-cap error, got: {err}"
+        );
+    }
+
+    /// cancel() returns false when nothing is in flight and true once a generation's flag is
+    /// installed. Because FakeProvider.generate runs synchronously to completion, we can't observe
+    /// a mid-stream cancel end-to-end here, but we can confirm the handle exposes the cancel path
+    /// and the flag is cleared after generation finishes (F-004).
+    #[test]
+    fn cancel_returns_false_when_idle() {
+        let engine = EngineHandle::spawn_with_loader(fake_loader);
+        // No generation in flight: cancel is a no-op.
+        assert!(!engine.cancel());
+        engine
+            .load_model(LoadModelRequest {
+                source: "/tmp/fake-model".to_string(),
+                display_name: None,
+                quantize: None,
+            })
+            .unwrap();
+        engine
+            .generate(
+                GenerateRequest {
+                    messages: vec![GenerateMessage {
+                        role: "user".to_string(),
+                        content: "hello".to_string(),
+                        images: Vec::new(),
+                        videos: Vec::new(),
+                        tool_calls: Vec::new(),
+                    }],
+                    sampling: SamplingRequest::default(),
+                    max_new_tokens: 8,
+                    seed: None,
+                    stop: Vec::new(),
+                    thinking: ThinkingRequest::Auto,
+                    tools: Vec::new(),
+                },
+                |_| {},
+            )
+            .unwrap();
+        // Generation finished: the flag is cleared, so cancel is again a no-op.
+        assert!(!engine.cancel());
     }
 }

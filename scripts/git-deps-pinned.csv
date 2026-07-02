@@ -1,0 +1,19 @@
+# Expected resolved commits for the core inference git dependencies (code-review F-001, epic 9318).
+#
+# Each line is `<crate>,<40-hex-sha>` — the commit `scripts/check-git-deps.sh` requires each core
+# inference dep to be lock-pinned to in Cargo.lock. The lockfile is the second layer (pins the
+# current resolution); this file is the FIRST layer (records the *expected* resolution, so a
+# `cargo update -p core-llm` that floats to a new upstream HEAD fails this check until a maintainer
+# intentionally bumps the SHA here and reviews the new commit).
+#
+# To update (intentional bump): run `cargo update -p <crate>`, verify the new commit, then update
+# the SHA in this file in the same PR.
+#
+# Why branch="main" and not rev="? Cargo keys git sources by (url, ref-spec); the upstream backends
+# (mlx-llm, candle-llm) still pin core-llm with `branch = "main"`, so a unilateral `rev` here splits
+# the graph into two core-llm sources and breaks the provider registry (verified). Moving everyone
+# to `rev` is a cross-repo coordination; until then the branch form is structurally required for
+# source unification, and this pin file + the lock enforce the trust model.
+core-llm,54cbac806304e823470ce3ded08f78589acdbb62
+mlx-llm,4b1f090e6524bbf743d780afc73679fff83ed28e
+candle-llm,8673651a3b78684a6c5cb59971f9797d5b756721

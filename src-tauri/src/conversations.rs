@@ -1,14 +1,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Manager};
 
+use crate::fsutil::{now_secs, write_json_atomic};
+
 const PREVIEW_MAX_CHARS: usize = 80;
-/// Suffix appended to an in-progress atomic write before rename.
-const TMP_SUFFIX: &str = ".tmp";
 /// Filename suffix for the small per-conversation metadata sidecar.
 ///
 /// The sidecar holds the derived `ConversationMetadata` so `list_conversations` can render the
@@ -109,10 +108,14 @@ fn conversation_meta_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}{META_SUFFIX}"))
 }
 
-/// Validates the conversation id is non-empty and path-safe. The id is canonicalized to its
-/// trimmed form once at the top so whitespace-padded dangerous values (e.g. `" .. "`) cannot
-/// slip past the `.`/`..`/segment checks.
-fn validate_id(id: &str) -> Result<(), String> {
+/// Validates the conversation id is non-empty and path-safe, returning the canonical **trimmed**
+/// id so callers build the storage key from the same value that was checked. Canonicalizing once at
+/// the boundary fixes the contract mismatch where `validate_id` trimmed for its checks but callers
+/// then used the raw id on disk — so an id like `"  abc  "` validated, then wrote `"  abc  .json"`,
+/// which a later `get_conversation("abc")` could not find (code-review F-009). Whitespace-padded
+/// dangerous values (e.g. `" .. "`) are rejected rather than slipping past the `.`/`..`/segment
+/// checks.
+fn validate_id(id: &str) -> Result<String, String> {
     let trimmed = id.trim();
     if trimmed.is_empty() {
         return Err("conversation id is required".to_string());
@@ -126,7 +129,7 @@ fn validate_id(id: &str) -> Result<(), String> {
     {
         return Err(format!("invalid conversation id {trimmed:?}"));
     }
-    Ok(())
+    Ok(trimmed.to_string())
 }
 
 /// Lists conversations reading ONLY the small `.meta` sidecar files — full transcript bodies are
@@ -185,8 +188,8 @@ fn list_conversations_in_dir(dir: &Path) -> Result<Vec<ConversationMetadata>, St
 }
 
 fn get_conversation_in_dir(dir: &Path, id: &str) -> Result<Conversation, String> {
-    validate_id(id)?;
-    let path = conversation_file_path(dir, id);
+    let id = validate_id(id)?;
+    let path = conversation_file_path(dir, &id);
     if !path.exists() {
         return Err(format!("conversation {id:?} was not found"));
     }
@@ -194,7 +197,9 @@ fn get_conversation_in_dir(dir: &Path, id: &str) -> Result<Conversation, String>
 }
 
 fn save_conversation_in_dir(dir: &Path, mut conversation: Conversation) -> Result<Conversation, String> {
-    validate_id(&conversation.id)?;
+    // Canonicalize the id once at the storage boundary so the safety check and the storage key agree
+    // on the id (F-009): the key is built from the validated, trimmed id, not the raw input.
+    conversation.id = validate_id(&conversation.id)?;
     let path = conversation_file_path(dir, &conversation.id);
     let now = now_secs();
     if conversation.created_at == 0 {
@@ -216,41 +221,27 @@ fn save_conversation_in_dir(dir: &Path, mut conversation: Conversation) -> Resul
 }
 
 fn rename_conversation_in_dir(dir: &Path, id: &str, title: &str) -> Result<ConversationMetadata, String> {
-    let mut conversation = get_conversation_in_dir(dir, id)?;
+    let id = validate_id(id)?;
+    let mut conversation = get_conversation_in_dir(dir, &id)?;
     conversation.title = title.to_string();
     conversation.updated_at = now_secs();
-    let path = conversation_file_path(dir, id);
+    let path = conversation_file_path(dir, &id);
     write_json_atomic(&path, &conversation)?;
     let meta = metadata_from(&conversation);
-    write_json_atomic(&conversation_meta_path(dir, id), &meta)?;
+    write_json_atomic(&conversation_meta_path(dir, &id), &meta)?;
     Ok(meta)
 }
 
 fn delete_conversation_in_dir(dir: &Path, id: &str) -> Result<(), String> {
-    validate_id(id)?;
-    let path = conversation_file_path(dir, id);
+    let id = validate_id(id)?;
+    let path = conversation_file_path(dir, &id);
     // Best-effort: drop the sidecar first, then the body. Idempotent for missing ids.
-    let _ = fs::remove_file(conversation_meta_path(dir, id));
+    let _ = fs::remove_file(conversation_meta_path(dir, &id));
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
     }
-}
-
-/// Atomic write via temp file + rename (the `write_settings` / `write_registry` pattern). The
-/// parent directory is created on demand so callers do not need a separate `create_dir_all`.
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    let tmp = with_appended_suffix(path, TMP_SUFFIX);
-    fs::write(
-        &tmp,
-        serde_json::to_string_pretty(value).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    fs::rename(tmp, path).map_err(|error| error.to_string())
 }
 
 fn read_conversation_file(path: &Path) -> Result<Conversation, String> {
@@ -325,29 +316,19 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
     format!("{truncated}\u{2026}")
 }
 
-/// Builds a sibling path with an extra `.{suffix}` appended (e.g. `foo.json` + `tmp` -> `foo.json.tmp`).
-fn with_appended_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.as_os_str().to_owned();
-    name.push(".");
-    name.push(suffix);
-    PathBuf::from(name)
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fsutil::{TempDir, TEMP_FILE_SUFFIX};
     use serde_json::json;
+
+    /// Alias for the on-disk temp-suffix `fsutil` appends, so the "ignore temp files" test tracks
+    /// the real value instead of re-declaring a string that could drift (PR #30 review).
+    const TMP_SUFFIX: &str = TEMP_FILE_SUFFIX;
 
     #[test]
     fn save_then_get_round_trips_messages_and_params() {
-        let dir = test_dir("round-trip");
+        let dir = TempDir::new("conversations-round-trip");
         let messages = json!([
             {"role": "user", "content": "Hi there"},
             {"role": "assistant", "content": "Hello!", "thinking": "reasoning"}
@@ -367,11 +348,11 @@ mod tests {
             params: params.clone(),
             messages: messages.clone(),
         };
-        let saved = save_conversation_in_dir(&dir, conversation).unwrap();
+        let saved = save_conversation_in_dir(dir.path(), conversation).unwrap();
         assert!(saved.created_at > 0);
         assert!(saved.updated_at >= saved.created_at);
 
-        let got = get_conversation_in_dir(&dir, "abc").unwrap();
+        let got = get_conversation_in_dir(dir.path(), "abc").unwrap();
         assert_eq!(got.id, "abc");
         assert_eq!(got.title, "Hello");
         assert_eq!(got.messages, messages);
@@ -379,7 +360,6 @@ mod tests {
         assert_eq!(got.params.max_tokens, params.max_tokens);
         assert_eq!(got.created_at, saved.created_at);
         assert_eq!(got.updated_at, saved.updated_at);
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -389,9 +369,8 @@ mod tests {
             id: "   ".to_string(),
             ..empty_conversation("x")
         };
-        let error = save_conversation_in_dir(&dir, conversation).unwrap_err();
+        let error = save_conversation_in_dir(dir.path(), conversation).unwrap_err();
         assert!(error.contains("id"), "unexpected error: {error}");
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -404,11 +383,10 @@ mod tests {
                 ..empty_conversation(id)
             };
             assert!(
-                save_conversation_in_dir(&dir, conversation).is_err(),
+                save_conversation_in_dir(dir.path(), conversation).is_err(),
                 "id {id:?} should be rejected"
             );
         }
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -421,9 +399,38 @@ mod tests {
                 "id {id:?} should be rejected after trimming"
             );
         }
-        // A normal id with surrounding whitespace validates (callers trim on use); confirm the
-        // trimmed form itself is accepted.
-        assert!(validate_id("  abc  ").is_ok());
+        // validate_id returns the canonical trimmed form (F-009), so the safety check and the
+        // storage key agree on what the id is.
+        assert_eq!(validate_id("  abc  ").unwrap(), "abc");
+    }
+
+    #[test]
+    fn save_canonicalizes_padded_id_so_get_finds_it() {
+        // F-009: a padded id is stored under its trimmed key, so a later get with the trimmed id
+        // (or the padded id) resolves to the same conversation rather than writing "  abc  .json".
+        let dir = test_dir("canonical-id");
+        let saved = save_conversation_in_dir(
+            dir.path(),
+            Conversation {
+                id: "  abc  ".to_string(),
+                title: "T".to_string(),
+                created_at: 0,
+                updated_at: 0,
+                params: ConversationParams::default(),
+                messages: json!([{"role": "user", "content": "hi"}]),
+            },
+        )
+        .unwrap();
+        assert_eq!(saved.id, "abc");
+        // The body + sidecar are written under the trimmed id.
+        assert!(conversation_file_path(dir.path(), "abc").exists());
+        assert!(conversation_meta_path(dir.path(), "abc").exists());
+        assert!(!conversation_file_path(dir.path(), "  abc  ").exists());
+        // Both the trimmed and the padded id resolve to the same stored conversation.
+        let got_trimmed = get_conversation_in_dir(dir.path(), "abc").unwrap();
+        let got_padded = get_conversation_in_dir(dir.path(), "  abc  ").unwrap();
+        assert_eq!(got_trimmed.id, "abc");
+        assert_eq!(got_padded.id, "abc");
     }
 
     #[test]
@@ -437,7 +444,7 @@ mod tests {
             params: ConversationParams::default(),
             messages: json!([{"role": "user", "content": "first"}]),
         };
-        let saved = save_conversation_in_dir(&dir, conversation).unwrap();
+        let saved = save_conversation_in_dir(dir.path(), conversation).unwrap();
         let created_at = saved.created_at;
         assert!(created_at > 0);
 
@@ -453,10 +460,9 @@ mod tests {
                 {"role": "assistant", "content": "second"}
             ]),
         };
-        let updated = save_conversation_in_dir(&dir, update).unwrap();
+        let updated = save_conversation_in_dir(dir.path(), update).unwrap();
         assert_eq!(updated.created_at, created_at);
         assert!(updated.updated_at >= saved.updated_at);
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -487,12 +493,11 @@ mod tests {
         )
         .unwrap();
 
-        let list = list_conversations_in_dir(&dir).unwrap();
+        let list = list_conversations_in_dir(dir.path()).unwrap();
         assert_eq!(list.len(), 1);
-        let got = get_conversation_in_dir(&dir, "u").unwrap();
+        let got = get_conversation_in_dir(dir.path(), "u").unwrap();
         assert_eq!(got.title, "New");
         assert_eq!(got.messages, json!([{"role": "user", "content": "b"}]));
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -510,17 +515,16 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(conversation_file_path(&dir, "sc").exists(), "body file must exist");
+        assert!(conversation_file_path(dir.path(), "sc").exists(), "body file must exist");
         assert!(
-            conversation_meta_path(&dir, "sc").exists(),
+            conversation_meta_path(dir.path(), "sc").exists(),
             "sidecar file must exist after save"
         );
-        let meta = read_meta_file(&conversation_meta_path(&dir, "sc")).unwrap();
+        let meta = read_meta_file(&conversation_meta_path(dir.path(), "sc")).unwrap();
         assert_eq!(meta.id, "sc");
         assert_eq!(meta.title, "Sidecar");
         assert_eq!(meta.preview, "hello");
         assert_eq!(meta.message_count, 1);
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -563,7 +567,7 @@ mod tests {
             },
         );
 
-        let list = list_conversations_in_dir(&dir).unwrap();
+        let list = list_conversations_in_dir(dir.path()).unwrap();
         assert_eq!(list.len(), 3);
         assert_eq!(list[0].id, "b");
         assert_eq!(list[1].id, "a");
@@ -586,7 +590,6 @@ mod tests {
         assert!(!serialized.contains("body-secret"));
         assert!(!serialized.contains("assistant"));
         assert!(!serialized.contains("messages"));
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -604,12 +607,11 @@ mod tests {
                 messages: json!([{"role": "user", "content": long_text}]),
             },
         );
-        let list = list_conversations_in_dir(&dir).unwrap();
+        let list = list_conversations_in_dir(dir.path()).unwrap();
         assert_eq!(list.len(), 1);
         // 80 chars + the ellipsis
         assert_eq!(list[0].preview.chars().count(), PREVIEW_MAX_CHARS + 1);
         assert!(list[0].preview.ends_with('\u{2026}'));
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -631,10 +633,9 @@ mod tests {
                 ]),
             },
         );
-        let list = list_conversations_in_dir(&dir).unwrap();
+        let list = list_conversations_in_dir(dir.path()).unwrap();
         assert_eq!(list[0].preview, "describe this");
         assert_eq!(list[0].title, "describe this");
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -655,10 +656,9 @@ mod tests {
         fs::write(dir.join(format!("keep{JSON_SUFFIX}{TMP_SUFFIX}")), "garbage").unwrap();
         fs::write(dir.join(format!("keep{META_SUFFIX}{TMP_SUFFIX}")), "garbage").unwrap();
         fs::write(dir.join("notes.md"), "nope").unwrap();
-        let list = list_conversations_in_dir(&dir).unwrap();
+        let list = list_conversations_in_dir(dir.path()).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "keep");
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -681,12 +681,12 @@ mod tests {
 
         // Corrupt the body AFTER the sidecar is written. If list reads bodies, this breaks it.
         fs::write(
-            conversation_file_path(&dir, "nb"),
+            conversation_file_path(dir.path(), "nb"),
             "THIS IS NOT VALID JSON {{{ { { { garbage",
         )
         .unwrap();
 
-        let list = list_conversations_in_dir(&dir).unwrap();
+        let list = list_conversations_in_dir(dir.path()).unwrap();
         assert_eq!(list.len(), 1, "list must find the conversation via the sidecar");
         assert_eq!(list[0].id, "nb");
         assert_eq!(list[0].title, "NoBody");
@@ -696,10 +696,9 @@ mod tests {
         // get_conversation reads the body and must now fail — proving the corruption is real and
         // the list path genuinely avoided opening the body file.
         assert!(
-            get_conversation_in_dir(&dir, "nb").is_err(),
+            get_conversation_in_dir(dir.path(), "nb").is_err(),
             "get should fail on the corrupted body, confirming list did not use it"
         );
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -724,18 +723,17 @@ mod tests {
             },
         )
         .unwrap();
-        let body_size = fs::metadata(conversation_file_path(&dir, "big")).unwrap().len();
-        let meta_size = fs::metadata(conversation_meta_path(&dir, "big")).unwrap().len();
+        let body_size = fs::metadata(conversation_file_path(dir.path(), "big")).unwrap().len();
+        let meta_size = fs::metadata(conversation_meta_path(dir.path(), "big")).unwrap().len();
         assert!(
             meta_size < body_size / 1000,
             "sidecar ({meta_size}B) should be far smaller than body ({body_size}B)"
         );
 
-        let list = list_conversations_in_dir(&dir).unwrap();
+        let list = list_conversations_in_dir(dir.path()).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].message_count, 2);
         assert_eq!(list[0].preview, "tiny preview");
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -754,25 +752,24 @@ mod tests {
                 messages: json!([{"role": "user", "content": "legacy preview"}]),
             },
         );
-        assert!(!conversation_meta_path(&dir, "legacy").exists());
+        assert!(!conversation_meta_path(dir.path(), "legacy").exists());
 
-        let list = list_conversations_in_dir(&dir).unwrap();
+        let list = list_conversations_in_dir(dir.path()).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "legacy");
         assert_eq!(list[0].preview, "legacy preview");
         assert_eq!(list[0].updated_at, 7);
         assert!(
-            conversation_meta_path(&dir, "legacy").exists(),
+            conversation_meta_path(dir.path(), "legacy").exists(),
             "sidecar must be written after the legacy fallback list"
         );
 
         // Now corrupt the body: the second list must still succeed via the freshly-written sidecar.
-        fs::write(conversation_file_path(&dir, "legacy"), "GARBAGE").unwrap();
-        let list2 = list_conversations_in_dir(&dir).unwrap();
+        fs::write(conversation_file_path(dir.path(), "legacy"), "GARBAGE").unwrap();
+        let list2 = list_conversations_in_dir(dir.path()).unwrap();
         assert_eq!(list2.len(), 1);
         assert_eq!(list2[0].id, "legacy");
         assert_eq!(list2[0].preview, "legacy preview");
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -789,25 +786,23 @@ mod tests {
                 messages: json!([{"role": "user", "content": "hi"}]),
             },
         );
-        let meta = rename_conversation_in_dir(&dir, "r1", "New Title").unwrap();
+        let meta = rename_conversation_in_dir(dir.path(), "r1", "New Title").unwrap();
         assert_eq!(meta.title, "New Title");
         assert_eq!(meta.created_at, 1000);
         assert!(meta.updated_at > 1000);
 
-        let stored = get_conversation_in_dir(&dir, "r1").unwrap();
+        let stored = get_conversation_in_dir(dir.path(), "r1").unwrap();
         assert_eq!(stored.title, "New Title");
         assert_eq!(stored.updated_at, meta.updated_at);
         // rename also refreshes the sidecar so list reflects the new title without reading the body.
-        let list = list_conversations_in_dir(&dir).unwrap();
+        let list = list_conversations_in_dir(dir.path()).unwrap();
         assert_eq!(list[0].title, "New Title");
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
     fn rename_missing_id_errors() {
         let dir = test_dir("rename-missing");
-        assert!(rename_conversation_in_dir(&dir, "nope", "X").is_err());
-        let _ = fs::remove_dir_all(dir);
+        assert!(rename_conversation_in_dir(dir.path(), "nope", "X").is_err());
     }
 
     #[test]
@@ -825,30 +820,27 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(conversation_file_path(&dir, "d1").exists());
-        assert!(conversation_meta_path(&dir, "d1").exists());
+        assert!(conversation_file_path(dir.path(), "d1").exists());
+        assert!(conversation_meta_path(dir.path(), "d1").exists());
 
-        delete_conversation_in_dir(&dir, "d1").unwrap();
-        assert!(!conversation_file_path(&dir, "d1").exists(), "body must be removed");
-        assert!(!conversation_meta_path(&dir, "d1").exists(), "sidecar must be removed");
-        assert!(get_conversation_in_dir(&dir, "d1").is_err());
-        assert!(list_conversations_in_dir(&dir).unwrap().is_empty());
-        let _ = fs::remove_dir_all(dir);
+        delete_conversation_in_dir(dir.path(), "d1").unwrap();
+        assert!(!conversation_file_path(dir.path(), "d1").exists(), "body must be removed");
+        assert!(!conversation_meta_path(dir.path(), "d1").exists(), "sidecar must be removed");
+        assert!(get_conversation_in_dir(dir.path(), "d1").is_err());
+        assert!(list_conversations_in_dir(dir.path()).unwrap().is_empty());
     }
 
     #[test]
     fn delete_is_idempotent_for_missing_id() {
         let dir = test_dir("delete-idempotent");
-        assert!(delete_conversation_in_dir(&dir, "ghost").is_ok());
-        let _ = fs::remove_dir_all(dir);
+        assert!(delete_conversation_in_dir(dir.path(), "ghost").is_ok());
     }
 
     #[test]
     fn get_missing_id_errors() {
         let dir = test_dir("get-missing");
-        let error = get_conversation_in_dir(&dir, "missing").unwrap_err();
+        let error = get_conversation_in_dir(dir.path(), "missing").unwrap_err();
         assert!(error.contains("was not found"), "unexpected error: {error}");
-        let _ = fs::remove_dir_all(dir);
     }
 
     fn empty_conversation(id: &str) -> Conversation {
@@ -869,11 +861,7 @@ mod tests {
         write_json_atomic(&path, &conversation).unwrap();
     }
 
-    fn test_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("chatworks-conversations-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn test_dir(label: &str) -> TempDir {
+        TempDir::new(&format!("conversations-{label}"))
     }
 }

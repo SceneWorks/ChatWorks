@@ -10,6 +10,10 @@ use candle_llm as _;
 pub mod app_settings;
 pub mod conversations;
 pub mod engine;
+pub mod fsutil;
 pub mod model_registry;
 pub mod server;
 pub mod tools;
+
+#[cfg(test)]
+pub mod test_support;

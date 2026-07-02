@@ -55,6 +55,14 @@ fn stream_completion(
     })
 }
 
+/// Request cancellation of the in-flight generation (code-review F-004). Returns `true` when a
+/// generation was in flight and its cancel flag was tripped; the provider stops promptly and the
+/// in-progress `stream_completion` resolves with a `cancelled` finish reason.
+#[tauri::command]
+fn stop_generation(engine: State<'_, EngineHandle>) -> bool {
+    engine.cancel()
+}
+
 #[tauri::command]
 fn start_openai_server(
     engine: State<'_, EngineHandle>,
@@ -255,6 +263,7 @@ fn main() {
             unload_model,
             engine_status,
             stream_completion,
+            stop_generation,
             start_openai_server,
             stop_openai_server,
             openai_server_status,
