@@ -1,9 +1,10 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
+use crate::fsutil::write_json_atomic;
 use crate::server::{DEFAULT_OPENAI_HOST, DEFAULT_OPENAI_PORT};
 
 const API_AUTH_KEYCHAIN_SERVICE: &str = "net.trefry.chatworks.openai";
@@ -148,17 +149,11 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| error.to_string())
 }
 
-fn write_settings(path: &Path, settings: &AppSettings) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    fs::write(
-        &tmp,
-        serde_json::to_string_pretty(settings).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    fs::rename(tmp, path).map_err(|error| error.to_string())
+fn write_settings(path: &std::path::Path, settings: &AppSettings) -> Result<(), String> {
+    // Delegates to the shared atomic-write helper (code-review F-010). For `settings.json` the
+    // previous local temp name (`with_extension("json.tmp")` → `settings.json.tmp`) matches the
+    // shared helper's appended `.tmp` (`settings.json.tmp`), so the on-disk temp name is unchanged.
+    write_json_atomic(path, settings)
 }
 
 fn default_host() -> String {

@@ -21,11 +21,11 @@ base64 = "0.22"
 # `branch = "main"`), so cargo unifies on ONE core-llm source — otherwise a `branch` spec here and a
 # `rev` spec there are distinct git sources, yielding two core-llm copies whose link-time provider
 # registries don't share (the backend's `candle-llama`/`mlx-llama` registration would be invisible to
-# this crate). The committed Cargo.lock pins the resolved commit so a stray `cargo update` can't float
-# core-llm to a new HEAD (sc-8116).
-# DEV-PIN (sc-8528): COORDINATOR flip back to branch="main" after the core-llm + mlx-llm backout PRs merge.
-# Temporarily pinned to the field-removed core-llm backout branch (the KV-quant `LoadSpec.kv_cache_quant`
-# + `supports_kv_cache_quant` surface is being removed and isn't on main yet).
+# this crate). A unilateral switch to `rev` here was verified to break the build with an ambiguous
+# `core-llm` source (F-001, code-review 2026-07-02); moving everyone to `rev` is a cross-repo
+# coordination tracked in that finding. The committed Cargo.lock pins the resolved commit so a stray
+# `cargo update` can't float core-llm to a new HEAD (sc-8116), and `scripts/check-git-deps.sh` gates
+# CI on every core dep staying lock-pinned to a concrete commit.
 core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
@@ -43,20 +43,20 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # Inference backend — exactly one is compiled per platform.
 # macOS (Apple Silicon): the MLX backend. Pinned to `main`, which itself pins core-llm
 # `branch = "main"`, so the macOS build unifies on ONE core-llm.
-# DEV-PIN (sc-8528): COORDINATOR flip back to branch="main" after the core-llm + mlx-llm backout PRs merge.
-# Temporarily pinned to the KV-quant-removed mlx-llm backout branch (not merged to main yet).
 [target.'cfg(target_os = "macos")'.dependencies]
 mlx-llm = { git = "https://github.com/SceneWorks/mlx-llm", branch = "main" }
 
 # Windows / Linux: the cross-platform Candle backend (CPU by default; CUDA via its `cuda` feature).
-# DEV-PIN (sc-8528): COORDINATOR flip back to branch="main" after the core-llm + mlx-llm backout PRs merge.
-# Temporarily pinned to the candle-llm backout branch (#45) so it pins the field-removed core-llm
-# backout branch too — otherwise candle's `branch="main"` HEAD pins core-llm main, splitting the graph
-# into TWO core-llm sources. All three backends must pin the SAME core-llm for the provider registry
-# to unify.
+# Same core-llm unification concern as above: candle-llm pins core-llm `branch = "main"`, so a matching
+# spec here is what keeps the graph on ONE core-llm and the provider registry unified.
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 candle-llm = { git = "https://github.com/SceneWorks/candle-llm", branch = "main" }
 
+# The workspace forbids `unsafe` (workspace `unsafe_code = "forbid"`), but this crate must relax it to
+# `allow`: the Tauri framework's generated code (and some of its macro-expanded FFI) emits `unsafe`
+# blocks that would otherwise trip the forbid lint at compile time. No hand-written `unsafe` lives in
+# `src/`; this override exists solely so the framework's macro output links. Scope it crate-wide rather
+# than per-module because the offending code is generated outside our sources (code-review F-006).
 [lints.rust]
 unsafe_code = "allow"
 

@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use core_llm::LoadSpec;
 use futures_util::StreamExt;
@@ -10,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::engine::{EngineHandle, EngineStatus, LoadModelRequest, QuantizeRequest};
+use crate::fsutil::{now_secs, write_json_atomic};
 
 const HF_HOST: &str = "huggingface.co";
 const HF_KEYCHAIN_SERVICE: &str = "net.trefry.chatworks.huggingface";
@@ -815,16 +815,11 @@ fn read_registry(path: &Path) -> Result<ModelRegistry, String> {
 }
 
 fn write_registry(path: &Path, registry: &ModelRegistry) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    fs::write(
-        &tmp,
-        serde_json::to_string_pretty(registry).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    fs::rename(tmp, path).map_err(|error| error.to_string())
+    // Delegates to the shared atomic-write helper (code-review F-010). The previous local copy used
+    // `with_extension("json.tmp")` (which replaces an extension) rather than appending `.tmp`; the
+    // shared helper appends `.tmp` preserving the extension, and for `manifest.json` both land on
+    // `manifest.json.tmp`, so the on-disk temp name is unchanged here.
+    write_json_atomic(path, registry)
 }
 
 fn upsert_model(registry: &mut ModelRegistry, entry: ModelEntry) {
@@ -936,16 +931,10 @@ fn make_job_id() -> String {
     format!("import-{}", now_secs())
 }
 
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fsutil::TempDir;
 
     #[test]
     fn parses_huggingface_urls() {
@@ -991,8 +980,7 @@ mod tests {
         write_snapshot_file(&dir, "tokenizer.json", "{}");
         write_snapshot_file(&dir, "model.safetensors", "weights");
 
-        assert!(validate_snapshot(&dir).is_ok());
-        let _ = fs::remove_dir_all(dir);
+        assert!(validate_snapshot(dir.path()).is_ok());
     }
 
     #[test]
@@ -1008,10 +996,9 @@ mod tests {
         write_snapshot_file(&dir, "tokenizer.json", "{}");
         write_snapshot_file(&dir, "model.safetensors", "weights");
 
-        let error = validate_snapshot(&dir).unwrap_err();
+        let error = validate_snapshot(dir.path()).unwrap_err();
         assert!(error.contains("unsupported model type gemma3"));
         assert!(error.contains("not supported by the linked inference providers"));
-        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1027,9 +1014,8 @@ mod tests {
         write_snapshot_file(&dir, "tokenizer.json", "{}");
         write_snapshot_file(&dir, "model.safetensors", "weights");
 
-        assert!(validate_snapshot(&dir).is_ok());
-        assert!(is_qwen35_vision_snapshot(&dir).unwrap());
-        let _ = fs::remove_dir_all(dir);
+        assert!(validate_snapshot(dir.path()).is_ok());
+        assert!(is_qwen35_vision_snapshot(dir.path()).unwrap());
     }
 
     #[test]
@@ -1047,9 +1033,8 @@ mod tests {
         write_snapshot_file(&dir, "tokenizer.json", "{}");
         write_snapshot_file(&dir, "model.safetensors", "weights");
 
-        assert!(validate_snapshot(&dir).is_ok());
-        assert!(is_qwen3vl_vision_snapshot(&dir).unwrap());
-        let _ = fs::remove_dir_all(dir);
+        assert!(validate_snapshot(dir.path()).is_ok());
+        assert!(is_qwen3vl_vision_snapshot(dir.path()).unwrap());
     }
 
     #[test]
@@ -1066,11 +1051,10 @@ mod tests {
         write_snapshot_file(&dir, "tokenizer.json", "{}");
         write_snapshot_file(&dir, "model.safetensors", "weights");
 
-        let error = validate_snapshot(&dir).unwrap_err();
+        let error = validate_snapshot(dir.path()).unwrap_err();
         assert!(error.contains("unsupported model type some_vlm"));
         assert!(error.contains("not supported by the linked inference providers"));
-        assert!(!is_qwen3vl_vision_snapshot(&dir).unwrap());
-        let _ = fs::remove_dir_all(dir);
+        assert!(!is_qwen3vl_vision_snapshot(dir.path()).unwrap());
     }
 
     #[test]
@@ -1084,8 +1068,7 @@ mod tests {
         write_snapshot_file(&dir, "tokenizer.json", "{}");
         write_snapshot_file(&dir, "model.safetensors", "weights");
 
-        assert!(validate_snapshot(&dir).is_ok());
-        let _ = fs::remove_dir_all(dir);
+        assert!(validate_snapshot(dir.path()).is_ok());
     }
 
     #[test]
@@ -1109,9 +1092,8 @@ mod tests {
         fs::create_dir_all(&snapshot).unwrap();
         fs::create_dir_all(root.join("not-a-model").join("snapshots").join("ignored")).unwrap();
 
-        let found = cached_snapshot_dirs(&root).unwrap();
+        let found = cached_snapshot_dirs(root.path()).unwrap();
         assert_eq!(found, vec![snapshot]);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1139,7 +1121,6 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         assert_eq!(candidate.provider_id, "candle-llama");
         assert!(!candidate.supports_vision);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1161,7 +1142,6 @@ mod tests {
         fs::write(snapshot.join("model.safetensors"), "weights").unwrap();
 
         assert!(cached_model_candidate(&snapshot).unwrap().is_none());
-        let _ = fs::remove_dir_all(root);
     }
 
     // Qwen3.6 (`qwen3_5`) vision is now served as a full VLM by BOTH backends: the `mlx-llama`
@@ -1193,7 +1173,6 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         assert_eq!(candidate.provider_id, "candle-llama");
         assert!(candidate.supports_vision);
-        let _ = fs::remove_dir_all(root);
     }
 
     // Qwen3-VL (`qwen3_vl`) vision is now served as a full VLM by BOTH backends: the `mlx-llama`
@@ -1225,7 +1204,6 @@ mod tests {
         #[cfg(not(target_os = "macos"))]
         assert_eq!(candidate.provider_id, "candle-llama");
         assert!(candidate.supports_vision);
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1268,11 +1246,8 @@ mod tests {
         assert_eq!(registry.models[0].file_count, 4);
     }
 
-    fn snapshot_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("chatworks-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn snapshot_dir(name: &str) -> TempDir {
+        TempDir::new(&format!("registry-{name}"))
     }
 
     fn write_snapshot_file(dir: &Path, name: &str, body: &str) {

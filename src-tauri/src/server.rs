@@ -2,7 +2,6 @@ use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{mpsc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -22,6 +21,7 @@ use crate::engine::{
     GenerateToolCall, GenerateVideo, LoadedModelStatus, SamplingRequest, StreamChannel,
     StreamPayload, ThinkingRequest, UsagePayload,
 };
+use crate::fsutil::{now_nanos, now_secs};
 
 pub const DEFAULT_OPENAI_HOST: &str = "127.0.0.1";
 pub const DEFAULT_OPENAI_PORT: u16 = 8000;
@@ -245,7 +245,12 @@ async fn run_server(
     let _ = ready_tx.send(Ok(bound_addr));
     axum::serve(
         listener,
-        openai_router(engine, config.auth_token, config.sampling_defaults),
+        openai_router(
+            engine,
+            config.auth_token,
+            config.sampling_defaults,
+            config.allow_lan,
+        ),
     )
     .with_graceful_shutdown(async {
         let _ = shutdown_rx.await;
@@ -258,6 +263,7 @@ fn openai_router(
     engine: EngineHandle,
     auth_token: Option<String>,
     sampling_defaults: SamplingDefaults,
+    allow_lan: bool,
 ) -> Router {
     Router::new()
         .route("/v1/models", get(models).options(cors_preflight))
@@ -271,31 +277,52 @@ fn openai_router(
             sampling_defaults,
         })
         .layer(DefaultBodyLimit::max(OPENAI_JSON_BODY_LIMIT_BYTES))
-        .layer(axum::middleware::from_fn(apply_cors_headers))
+        .layer(axum::middleware::from_fn_with_state(
+            allow_lan,
+            apply_cors_headers,
+        ))
 }
 
 async fn cors_preflight() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+/// CORS policy for the OpenAI surface (code-review F-003).
+///
+/// Loopback (the default) doesn't need CORS at all — same-origin pages issue requests directly —
+/// so when `allow_lan` is off we omit the `Access-Control-Allow-Origin` header entirely, tightening
+/// the static `*` that previously let any browser page reach a loopback server. When the user opts
+/// into LAN serving we still need cross-origin browser callers (the documented OpenAI-compatible
+/// surface), so we reflect the request `Origin` instead of emitting `*`: reflection is correct for
+/// credentialed requests and ties the grant to a concrete origin rather than "any page". The
+/// methods/headers preflight answers are unchanged.
 async fn apply_cors_headers(
+    State(allow_lan): State<bool>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    // Capture the request Origin before the inner service consumes the request.
+    let origin = request
+        .headers()
+        .get(axum::http::header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| HeaderValue::from_str(value).ok());
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    headers.insert(
-        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        HeaderValue::from_static("*"),
-    );
-    headers.insert(
-        axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, POST, OPTIONS"),
-    );
-    headers.insert(
-        axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("authorization, content-type"),
-    );
+    if allow_lan {
+        if let Some(origin) = origin {
+            headers.insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+            headers.insert(
+                axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
+                HeaderValue::from_static("GET, POST, OPTIONS"),
+            );
+            headers.insert(
+                axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+                HeaderValue::from_static("authorization, content-type"),
+            );
+        }
+    }
+    // When allow_lan is false, no CORS headers are added: loopback callers don't need them.
     response
 }
 
@@ -416,13 +443,37 @@ fn authorize(headers: &HeaderMap, token: Option<&str>) -> Result<(), ApiError> {
         return Ok(());
     };
     let expected = format!("Bearer {token}");
-    match headers
+    let actual = headers
         .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-    {
-        Some(actual) if actual == expected => Ok(()),
-        _ => Err(ApiError::auth("missing or invalid bearer token")),
+        .and_then(|value| value.to_str().ok());
+    // Constant-time comparison so a LAN-exposed server doesn't leak the token length or a prefix
+    // via a timing oracle (code-review F-008). `==` on strings short-circuits on the first mismatched
+    // byte; this walks every byte of the *expected* value regardless of where (or whether) they
+    // differ, then checks the length. The unconditional error path also keeps missing/malformed
+    // headers indistinguishable from a wrong token.
+    let ok = match actual {
+        Some(actual) => constant_time_eq(expected.as_bytes(), actual.as_bytes()),
+        None => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::auth("missing or invalid bearer token"))
     }
+}
+
+/// Constant-time byte-slice equality: returns `true` only when `a == b`, but never short-circuits
+/// on the first mismatched byte. Accumulates XOR differences across the whole of the *shorter* slice
+/// and folds in the length difference, so the work done is independent of where (or whether) the
+/// values differ. This removes the timing oracle that `==` would otherwise expose on the bearer
+/// token (code-review F-008).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let len = a.len().min(b.len());
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for i in 0..len {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
 }
 
 fn validate_config(config: &OpenAiServerConfig) -> ServerResult<SocketAddr> {
@@ -1099,7 +1150,7 @@ impl OpenAiFunctionCallOut {
 /// Synthesize the OpenAI call id (the provider does not assign one); the index keeps it unique within
 /// a single response even at nanosecond granularity.
 fn tool_call_id(index: usize) -> String {
-    format!("call_{}_{index}", timestamp_nanos())
+    format!("call_{}_{index}", now_nanos())
 }
 
 /// The model's tool calls as non-streaming `message.tool_calls`.
@@ -1147,109 +1198,21 @@ impl From<UsagePayload> for OpenAiUsage {
 }
 
 fn completion_id() -> String {
-    format!("chatcmpl-{}", timestamp_nanos())
+    format!("chatcmpl-{}", now_nanos())
 }
 
+/// Unix epoch seconds for OpenAI `created` timestamps (shared `now_secs`, F-011).
 fn created_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
-}
-
-fn timestamp_nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or_default()
+    now_secs()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core_llm::{
-        Channel, Content, FinishReason, LoadSpec, Role, TextLlm, TextLlmCapabilities,
-        TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingMode, Usage,
-    };
+    // The weightless fakes are shared with the engine tests via `test_support` so the two can't
+    // drift apart (code-review F-012).
+    use crate::test_support::{fake_loader, fake_tool_loader};
     use serde_json::{json, Value};
-
-    struct FakeProvider {
-        descriptor: TextLlmDescriptor,
-    }
-
-    impl TextLlm for FakeProvider {
-        fn descriptor(&self) -> &TextLlmDescriptor {
-            &self.descriptor
-        }
-
-        fn validate(&self, req: &TextLlmRequest) -> core_llm::Result<()> {
-            self.descriptor
-                .capabilities
-                .validate_request(&self.descriptor.id, req)
-        }
-
-        fn generate(
-            &self,
-            req: &TextLlmRequest,
-            on_event: &mut dyn FnMut(core_llm::StreamEvent),
-        ) -> core_llm::Result<TextLlmOutput> {
-            self.validate(req)?;
-            assert_eq!(req.messages.len(), 1);
-            assert_eq!(req.messages[0].role, Role::User);
-            assert_eq!(
-                req.messages[0].content,
-                vec![Content::Text("hello".to_string())]
-            );
-            let thinking = if req.thinking == ThinkingMode::Disabled {
-                None
-            } else {
-                on_event(core_llm::StreamEvent::Token {
-                    id: 9,
-                    text: "reason".to_string(),
-                    index: 0,
-                    channel: Channel::Thinking,
-                });
-                Some("reason".to_string())
-            };
-            on_event(core_llm::StreamEvent::Token {
-                id: 1,
-                text: "ok".to_string(),
-                index: 1,
-                channel: Channel::Content,
-            });
-            let usage = Usage {
-                prompt_tokens: 2,
-                generated_tokens: 1,
-            };
-            on_event(core_llm::StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-                usage,
-            });
-            Ok(TextLlmOutput {
-                text: "ok".to_string(),
-                thinking,
-                tool_calls: Vec::new(),
-                usage,
-                finish_reason: Some(FinishReason::Stop),
-            })
-        }
-    }
-
-    fn fake_loader(_: &LoadSpec) -> core_llm::Result<Box<dyn TextLlm>> {
-        Ok(Box::new(FakeProvider {
-            descriptor: TextLlmDescriptor {
-                id: "fake".to_string(),
-                family: "test".to_string(),
-                backend: "unit".to_string(),
-                capabilities: TextLlmCapabilities {
-                    supports_system_prompt: true,
-                    supports_thinking: true,
-                    max_new_tokens: 8,
-                    ..Default::default()
-                },
-            },
-        }))
-    }
 
     fn loaded_fake_engine() -> EngineHandle {
         let engine = EngineHandle::spawn_with_loader(fake_loader);
@@ -1261,68 +1224,6 @@ mod tests {
             })
             .unwrap();
         engine
-    }
-
-    /// A tool-capable provider that echoes the offered tools back as a single `get_weather(Paris)`
-    /// call, so the OpenAI tool_calls + finish_reason path can be exercised without real weights.
-    struct FakeToolProvider {
-        descriptor: TextLlmDescriptor,
-    }
-
-    impl TextLlm for FakeToolProvider {
-        fn descriptor(&self) -> &TextLlmDescriptor {
-            &self.descriptor
-        }
-
-        fn validate(&self, req: &TextLlmRequest) -> core_llm::Result<()> {
-            self.descriptor
-                .capabilities
-                .validate_request(&self.descriptor.id, req)
-        }
-
-        fn generate(
-            &self,
-            req: &TextLlmRequest,
-            on_event: &mut dyn FnMut(core_llm::StreamEvent),
-        ) -> core_llm::Result<TextLlmOutput> {
-            self.validate(req)?;
-            // The tools must have been threaded through to the core request.
-            assert_eq!(req.tools.len(), 1);
-            assert_eq!(req.tools[0].name, "get_weather");
-            let usage = Usage {
-                prompt_tokens: 3,
-                generated_tokens: 4,
-            };
-            on_event(core_llm::StreamEvent::Done {
-                finish_reason: FinishReason::Stop,
-                usage,
-            });
-            let mut arguments = serde_json::Map::new();
-            arguments.insert("location".to_string(), json!("Paris"));
-            Ok(TextLlmOutput {
-                text: String::new(),
-                thinking: None,
-                tool_calls: vec![core_llm::ToolCall::new("get_weather", arguments)],
-                usage,
-                finish_reason: Some(FinishReason::Stop),
-            })
-        }
-    }
-
-    fn fake_tool_loader(_: &LoadSpec) -> core_llm::Result<Box<dyn TextLlm>> {
-        Ok(Box::new(FakeToolProvider {
-            descriptor: TextLlmDescriptor {
-                id: "fake-tools".to_string(),
-                family: "test".to_string(),
-                backend: "unit".to_string(),
-                capabilities: TextLlmCapabilities {
-                    supports_system_prompt: true,
-                    supports_tools: true,
-                    max_new_tokens: 64,
-                    ..Default::default()
-                },
-            },
-        }))
     }
 
     fn loaded_tool_engine() -> EngineHandle {
@@ -1531,6 +1432,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn constant_time_eq_compares_without_short_circuit() {
+        // F-008: equal slices match, and any difference (prefix, suffix, length) rejects without
+        // short-circuiting. The function returns false for mismatched lengths and true only on a
+        // full byte match.
+        assert!(constant_time_eq(b"Bearer secret", b"Bearer secret"));
+        assert!(!constant_time_eq(b"Bearer secret", b"Bearer secr3t"));
+        assert!(!constant_time_eq(b"Bearer secret", b"Bearer secre"));
+        assert!(!constant_time_eq(b"Bearer secret", b"Bearer secrett"));
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
     fn http_request(addr: &str, request: String) -> String {
         use std::io::{Read, Write};
         use std::net::TcpStream;
@@ -1685,7 +1599,8 @@ mod tests {
             }),
             None,
         );
-        assert!(response.contains("access-control-allow-origin: *"));
+        // Loopback (allow_lan=false) omits the CORS allow-origin header (code-review F-003).
+        assert!(!response.to_ascii_lowercase().contains("access-control-allow-origin"));
         assert!(response.contains("data: {\"id\":\"chatcmpl-"));
         assert!(response.contains("\"reasoning_content\":\"reason\""));
         assert!(response.contains("\"content\":\"ok\""));
@@ -1723,7 +1638,9 @@ mod tests {
     }
 
     #[test]
-    fn accepts_cors_preflight() {
+    fn loopback_omits_cors_headers() {
+        // On loopback (allow_lan=false, the default) no CORS headers are needed and none are emitted,
+        // tightening the previous static `*` (code-review F-003).
         let server = OpenAiServerHandle::new();
         let status = server
             .start(
@@ -1738,7 +1655,35 @@ mod tests {
         let addr = status.bound_addr.unwrap();
         let response = http_options(&addr, "/v1/chat/completions");
         assert!(response.starts_with("HTTP/1.1 204 No Content"));
-        assert!(response.contains("access-control-allow-origin: *"));
+        assert!(
+            !response.to_ascii_lowercase().contains("access-control-allow-origin"),
+            "loopback must not emit a CORS allow-origin header: {response}"
+        );
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn lan_reflects_request_origin_for_cors() {
+        // When a user opts into LAN serving, the documented OpenAI-compatible surface still needs
+        // cross-origin browser callers; we reflect the request Origin instead of a static `*` so a
+        // credentialed request carries a concrete, non-wildcard grant (code-review F-003).
+        let server = OpenAiServerHandle::new();
+        let status = server
+            .start(
+                OpenAiServerConfig {
+                    port: 0,
+                    allow_lan: true,
+                    host: "127.0.0.1".to_string(),
+                    sampling_defaults: test_sampling_defaults(),
+                    ..Default::default()
+                },
+                loaded_fake_engine(),
+            )
+            .unwrap();
+        let addr = status.bound_addr.unwrap();
+        let response = http_options(&addr, "/v1/chat/completions");
+        assert!(response.starts_with("HTTP/1.1 204 No Content"));
+        assert!(response.contains("access-control-allow-origin: http://127.0.0.1:5173"));
         assert!(response.contains("access-control-allow-methods: GET, POST, OPTIONS"));
         server.stop().unwrap();
     }
