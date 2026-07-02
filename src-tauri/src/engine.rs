@@ -17,6 +17,17 @@ type Loader = fn(&LoadSpec) -> core_llm::Result<Box<dyn TextLlm>>;
 /// The in-flight generation's cancel flag, shared between the engine thread and the handle so a
 /// `cancel()` call can trip it without going through the actor's serial command loop (which is
 /// blocked while a generation runs). `None` when no generation is in flight (code-review F-004).
+///
+/// The single (unkeyed) slot is safe because the [`EngineActor`] runs one command at a time on a
+/// single thread: at most ONE generation is ever in flight, so `cancel()` can only ever target it.
+/// This holds even though the handle is shared between the Tauri UI and the HTTP server — the actor
+/// serializes their `Generate` commands. Two caveats a future change must respect:
+/// (1) If the actor ever runs generations concurrently (e.g. a worker pool), the slot must be keyed
+///     by request id so cancel targets the right generation (PR #30 review, R7).
+/// (2) A `cancel()` issued in the window after a `Generate` command is sent but before the actor
+///     installs the flag returns `false` (the flag isn't installed yet); the caller may retry. This
+///     window is bounded by the actor's dequeue time and is not a correctness bug — the generation
+///     simply isn't cancellable until it starts.
 type CancelSlot = Arc<Mutex<Option<CancelFlag>>>;
 
 #[derive(Clone)]
@@ -311,19 +322,6 @@ impl GenerateRequest {
         if self.messages.is_empty() {
             return Err("messages must not be empty".to_string());
         }
-        // Bound the total number of decoded video frames across the whole request so a single
-        // oversized `video_url` can't multiply the OOM surface of F-002 (each frame is itself a
-        // dimension-capped image, but N frames is N allocations).
-        let total_video_frames: usize = self
-            .messages
-            .iter()
-            .map(|message| message.videos.iter().map(|video| video.frames.len()).sum::<usize>())
-            .sum();
-        if total_video_frames > MAX_VIDEO_FRAMES_PER_REQUEST {
-            return Err(format!(
-                "request carries {total_video_frames} video frames, exceeding the {MAX_VIDEO_FRAMES_PER_REQUEST} per-request limit"
-            ));
-        }
         Ok(TextLlmRequest {
             messages: self
                 .messages
@@ -456,6 +454,16 @@ pub struct GenerateVideo {
 
 impl GenerateVideo {
     fn into_core(self) -> EngineResult<VideoRef> {
+        // Per-video frame cap (F-002). This is deliberately NOT cumulative across the request: the
+        // frontend re-sends full history each turn, so a cumulative cap would brick a conversation
+        // once enough video turns accumulate (PR #30 review). Per-video bounds a single oversized
+        // clip without making history toxic.
+        if self.frames.len() > MAX_FRAMES_PER_VIDEO {
+            return Err(format!(
+                "video attachment has {} frames, exceeding the {MAX_FRAMES_PER_VIDEO} per-video limit",
+                self.frames.len()
+            ));
+        }
         let frames = self
             .frames
             .iter()
@@ -495,22 +503,32 @@ impl GenerateMessage {
 /// Maximum decoded pixel budget per image attachment (width × height). A 64 MiB JSON body can
 /// carry a base64 payload that decodes to a multi-gigabyte RGB buffer (a decompression bomb); this
 /// cap rejects oversized images at the decode boundary so both the IPC and HTTP paths share the
-/// guard (code-review F-002). 3_318_240 px is ~1830×1830 — comfortably above the frontend's 1536 px
-/// self-limit (`src/main.jsx`) while bounding a single image to ~10 MB of RGB8.
+/// guard (code-review F-002). 3_318_240 px ≈ 1830×1830, comfortably above the frontend's 1536 px
+/// self-limit (`src/media/image.js`) while bounding a single image to ~10 MB of RGB8.
 const MAX_IMAGE_PIXELS: u64 = 3_318_240;
 
-/// Maximum total frames across all video attachments in a single request, bounding the worst case
-/// where every frame is an unbounded image (code-review F-002). The frontend samples a handful of
-/// frames per clip; this is a safety ceiling, not the working set.
-const MAX_VIDEO_FRAMES_PER_REQUEST: usize = 64;
+/// Per-axis decompression-bomb ceiling. The `image` crate's strict limits are per-axis (not a
+/// pixel product), so this is set generously — high enough that no legitimate image near the
+/// [`MAX_IMAGE_PIXELS`] budget is rejected (e.g. a 2560×800 panorama, 2.05 Mpx, is well under budget
+/// but exceeds a naive `floor(sqrt(budget))` per-axis cap of 1821 px — PR #30 review). The real
+/// budget is enforced post-decode on the width×height product below.
+const MAX_IMAGE_AXIS: u32 = 4096;
 
-/// Decode an image attachment (`data:<mime>;base64,<data>` URL or bare base64) to an RGB8 [`ImageRef`],
-/// rejecting images whose decoded dimensions exceed [`MAX_IMAGE_PIXELS`] (code-review F-002). The
-/// per-axis strict limits let the decoder reject a decompression bomb before materializing the full
-/// RGB8 buffer; the post-decode pixel-product check is a belt-and-suspenders guard for the case
-/// where each axis is under its cap but the product is not.
+/// Maximum frames per single video attachment, bounding the worst case where every frame is itself a
+/// dimension-capped image (code-review F-002). The frontend samples up to ~8 frames per clip
+/// (`VIDEO_ATTACHMENT_MAX_FRAMES` in `src/media/video.js`); this is a per-video safety ceiling, NOT
+/// cumulative across the re-sent transcript — a cumulative cap would brick conversations once enough
+/// video turns accumulate, since the frontend re-sends full history each turn (PR #30 review).
+const MAX_FRAMES_PER_VIDEO: usize = 64;
+
+/// Decode an image attachment (`data:<mime>;base64,<data>` URL or bare base64) to an RGB8
+/// [`ImageRef`], rejecting images whose decoded dimensions exceed [`MAX_IMAGE_PIXELS`]
+/// (code-review F-002). The per-axis strict limit is only a bomb guard (see [`MAX_IMAGE_AXIS`]); the
+/// real pixel budget is enforced post-decode on the width×height product, so legitimate
+/// non-square images under budget are accepted.
 fn decode_image(data: &str) -> EngineResult<ImageRef> {
     use base64::Engine as _;
+    use image::GenericImageView;
     // Strip the optional `data:<mime>;base64,` prefix.
     let b64 = data.rsplit_once(',').map(|(_, rest)| rest).unwrap_or(data).trim();
     let bytes = base64::engine::general_purpose::STANDARD
@@ -520,22 +538,24 @@ fn decode_image(data: &str) -> EngineResult<ImageRef> {
     reader.set_format(image::guess_format(&bytes).map_err(|error| {
         format!("could not determine image attachment format: {error}")
     })?);
+    // Bomb guard: reject absurd per-axis dimensions before decoding the full buffer. Set generously
+    // (MAX_IMAGE_AXIS); the real budget is the product check after decode.
     let mut limits = image::Limits::default();
-    let max_axis = (MAX_IMAGE_PIXELS as f64).sqrt().floor() as u32;
-    limits.max_image_width = Some(max_axis);
-    limits.max_image_height = Some(max_axis);
+    limits.max_image_width = Some(MAX_IMAGE_AXIS);
+    limits.max_image_height = Some(MAX_IMAGE_AXIS);
     reader.limits(limits);
-    let rgb = reader
+    let img = reader
         .decode()
-        .map_err(|error| format!("could not decode image attachment: {error}"))?
-        .to_rgb8();
-    let (width, height) = rgb.dimensions();
+        .map_err(|error| format!("could not decode image attachment: {error}"))?;
+    let (width, height) = img.dimensions();
     let pixels = width as u64 * height as u64;
     if pixels > MAX_IMAGE_PIXELS {
         return Err(format!(
             "image attachment is too large: {width}x{height} ({pixels} px) exceeds the {MAX_IMAGE_PIXELS} px limit"
         ));
     }
+    // `into_rgb8()` moves the decoded buffer instead of cloning it (`.to_rgb8()` copies).
+    let rgb = img.into_rgb8();
     ImageRef::new(width, height, rgb.into_raw())
 }
 
@@ -826,11 +846,13 @@ mod tests {
         assert_eq!(result.unwrap_err(), "no model loaded");
     }
 
-    /// Build a `MAX_VIDEO_FRAMES_PER_REQUEST + 1` frame request to exercise the per-request frame
-    /// cap (F-002). Frames are bare base64; decode never runs because the cap fires first.
+    /// A single video with `MAX_FRAMES_PER_VIDEO + 1` frames is rejected (F-002). The cap is
+    /// per-video, NOT cumulative across the re-sent transcript — a cumulative cap would brick a
+    /// conversation once enough video turns accumulate (PR #30 review). Frames are bare base64;
+    /// decode never runs because the cap fires first.
     #[test]
-    fn rejects_request_exceeding_video_frame_cap() {
-        let frames: Vec<String> = (0..=MAX_VIDEO_FRAMES_PER_REQUEST)
+    fn rejects_video_exceeding_per_video_frame_cap() {
+        let frames: Vec<String> = (0..=MAX_FRAMES_PER_VIDEO)
             .map(|i| format!("data:image/png;base64,FRAME{i}"))
             .collect();
         let timestamps: Vec<f32> = (0..frames.len()).map(|i| i as f32).collect();
@@ -859,8 +881,8 @@ mod tests {
             .unwrap();
         let err = engine.generate(request, |_| {}).unwrap_err();
         assert!(
-            err.contains("video frames") && err.contains("exceeding"),
-            "expected a frame-cap error, got: {err}"
+            err.contains("frames") && err.contains("per-video limit"),
+            "expected a per-video frame-cap error, got: {err}"
         );
     }
 

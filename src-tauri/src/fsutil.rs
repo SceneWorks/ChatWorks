@@ -11,6 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+/// The full on-disk temp suffix the atomic-write helper appends (`<path>.tmp`). Exposed
+/// `pub(crate)` under `#[cfg(test)]` so tests that assert temp files are ignored reference the same
+/// constant instead of re-declaring a string that could drift (PR #30 review).
+#[cfg(test)]
+pub(crate) const TEMP_FILE_SUFFIX: &str = ".tmp";
+
 /// Suffix appended to an in-progress atomic write before rename.
 const TMP_SUFFIX: &str = "tmp";
 

@@ -23,9 +23,9 @@ base64 = "0.22"
 # registries don't share (the backend's `candle-llama`/`mlx-llama` registration would be invisible to
 # this crate). A unilateral switch to `rev` here was verified to break the build with an ambiguous
 # `core-llm` source (F-001, code-review 2026-07-02); moving everyone to `rev` is a cross-repo
-# coordination tracked in that finding. The committed Cargo.lock pins the resolved commit so a stray
-# `cargo update` can't float core-llm to a new HEAD (sc-8116), and `scripts/check-git-deps.sh` gates
-# CI on every core dep staying lock-pinned to a concrete commit.
+# coordination tracked in that finding. The committed Cargo.lock pins the resolved commit (sc-8116),
+# and `scripts/check-git-deps.sh` compares it against `scripts/git-deps-pinned.csv` so a lockfile
+# refresh can't silently float a core dep — the gate runs in `.github/workflows/supply-chain.yml`.
 core-llm = { git = "https://github.com/SceneWorks/core-llm", branch = "main" }
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }

@@ -244,7 +244,6 @@ fn delete_conversation_in_dir(dir: &Path, id: &str) -> Result<(), String> {
     }
 }
 
-/// Atomic write via the shared [`crate::fsutil::write_json_atomic`] helper (F-010).
 fn read_conversation_file(path: &Path) -> Result<Conversation, String> {
     let body = fs::read_to_string(path).map_err(|error| error.to_string())?;
     serde_json::from_str::<Conversation>(&body).map_err(|error| error.to_string())
@@ -320,11 +319,12 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fsutil::TempDir;
+    use crate::fsutil::{TempDir, TEMP_FILE_SUFFIX};
     use serde_json::json;
 
-    /// The `.tmp` extension the shared atomic-write helper appends (matches `fsutil::TMP_SUFFIX`).
-    const TMP_SUFFIX: &str = ".tmp";
+    /// Alias for the on-disk temp-suffix `fsutil` appends, so the "ignore temp files" test tracks
+    /// the real value instead of re-declaring a string that could drift (PR #30 review).
+    const TMP_SUFFIX: &str = TEMP_FILE_SUFFIX;
 
     #[test]
     fn save_then_get_round_trips_messages_and_params() {
@@ -854,8 +854,6 @@ mod tests {
         }
     }
 
-    /// Writes a conversation body directly, bypassing `save_conversation_in_dir` (so no sidecar
-    /// is created). Used to exercise the legacy-fallback list path and to seed pre-sidecar state.
     /// Writes a conversation body directly, bypassing `save_conversation_in_dir` (so no sidecar
     /// is created). Used to exercise the legacy-fallback list path and to seed pre-sidecar state.
     fn write_raw_conversation(dir: &Path, conversation: Conversation) {

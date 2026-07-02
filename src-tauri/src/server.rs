@@ -287,15 +287,27 @@ async fn cors_preflight() -> StatusCode {
     StatusCode::NO_CONTENT
 }
 
+/// The origins that are ALWAYS allowed to call the OpenAI API, independent of `allow_lan`: the
+/// ChatWorks webview itself. The app's chat screen uses a browser `fetch` from the webview to the
+/// local server, so without CORS these origins' preflight would fail and every in-app send would
+/// die with "Failed to fetch" (this is exactly the regression the first F-003 attempt introduced).
+/// `tauri://localhost` is the packaged webview origin; `http://127.0.0.1:5173` is the Vite dev
+/// server origin (see `tauri.conf.json` `devUrl`).
+const APP_WEBVIEW_ORIGINS: &[&str] = &["tauri://localhost", "http://127.0.0.1:5173"];
+
 /// CORS policy for the OpenAI surface (code-review F-003).
 ///
-/// Loopback (the default) doesn't need CORS at all — same-origin pages issue requests directly —
-/// so when `allow_lan` is off we omit the `Access-Control-Allow-Origin` header entirely, tightening
-/// the static `*` that previously let any browser page reach a loopback server. When the user opts
-/// into LAN serving we still need cross-origin browser callers (the documented OpenAI-compatible
-/// surface), so we reflect the request `Origin` instead of emitting `*`: reflection is correct for
-/// credentialed requests and ties the grant to a concrete origin rather than "any page". The
-/// methods/headers preflight answers are unchanged.
+/// Two cases:
+/// - The ChatWorks webview's own origins (`APP_WEBVIEW_ORIGINS`) are always granted, regardless of
+///   `allow_lan` — the in-app chat is a cross-origin browser `fetch`, so without an explicit grant
+///   the preflight fails. This is the documented, trusted caller and is not gated behind `allow_lan`.
+/// - When the user opts into LAN serving (`allow_lan`), the documented OpenAI-compatible surface is
+///   opened to any origin (third-party LAN clients), matching the previous permissive behavior. We
+///   reflect the request `Origin` and add `Vary: Origin` so a shared cache can't serve one origin's
+///   grant to another. (No `Access-Control-Allow-Credentials` is emitted, so cookies/credentialed
+///   requests are not enabled; auth uses a bearer header, not cookies.)
+/// - When `allow_lan` is off and the origin is not a webview origin, no CORS headers are emitted:
+///   a random browser page on the host can no longer drive the loopback model.
 async fn apply_cors_headers(
     State(allow_lan): State<bool>,
     request: axum::extract::Request,
@@ -306,24 +318,59 @@ async fn apply_cors_headers(
         .headers()
         .get(axum::http::header::ORIGIN)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| HeaderValue::from_str(value).ok());
+        .map(str::to_string);
+    let allow = match origin.as_deref() {
+        // The app's own webview is always allowed, even on loopback.
+        Some(origin) if APP_WEBVIEW_ORIGINS.contains(&origin) => AllowOrigin::Webview,
+        // LAN mode opens the documented OpenAI surface to any origin (third-party clients).
+        Some(_) if allow_lan => AllowOrigin::Any,
+        // Loopback, non-webview origin: no grant (tightens the old static `*`).
+        _ => AllowOrigin::Deny,
+    };
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
-    if allow_lan {
-        if let Some(origin) = origin {
-            headers.insert(axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    match allow {
+        AllowOrigin::Webview => {
+            let origin = origin.as_deref().expect("webview grant implies an origin");
             headers.insert(
-                axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
-                HeaderValue::from_static("GET, POST, OPTIONS"),
+                axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                HeaderValue::from_str(origin).expect("webview origin is valid header"),
             );
-            headers.insert(
-                axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
-                HeaderValue::from_static("authorization, content-type"),
-            );
+            cors_methods_and_headers(headers);
         }
+        AllowOrigin::Any => {
+            headers.insert(
+                axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                HeaderValue::from_static("*"),
+            );
+            cors_methods_and_headers(headers);
+            // The grant depends on the request Origin once LAN is on, so vary caches by it.
+            headers.insert(axum::http::header::VARY, HeaderValue::from_static("Origin"));
+        }
+        AllowOrigin::Deny => {}
     }
-    // When allow_lan is false, no CORS headers are added: loopback callers don't need them.
     response
+}
+
+/// The methods + headers every granted preflight answer carries.
+fn cors_methods_and_headers(headers: &mut HeaderMap) {
+    headers.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    headers.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("authorization, content-type"),
+    );
+}
+
+enum AllowOrigin {
+    /// The request is from the app's own webview (always granted).
+    Webview,
+    /// LAN mode: grant any origin (the documented OpenAI surface).
+    Any,
+    /// Loopback, non-webview origin: no CORS grant.
+    Deny,
 }
 
 #[derive(Clone)]
@@ -392,7 +439,13 @@ fn stream_chat_completion(
                         OpenAiChatChunk::reasoning(id.clone(), created, model.clone(), text)
                     }
                 };
-                let _ = tx.blocking_send(Ok(sse_json(&chunk)));
+                // If the client disconnected (the SSE receiver was dropped), `blocking_send` fails.
+                // Treat that as a cancel request: trip the engine's in-flight CancelFlag so the
+                // provider stops promptly instead of generating into a dead stream (F-004, PR #30
+                // review — the original fix's backend cancel was unreachable end-to-end).
+                if tx.blocking_send(Ok(sse_json(&chunk))).is_err() {
+                    engine.cancel();
+                }
             }
         });
 
@@ -442,17 +495,20 @@ fn authorize(headers: &HeaderMap, token: Option<&str>) -> Result<(), ApiError> {
     let Some(token) = token else {
         return Ok(());
     };
-    let expected = format!("Bearer {token}");
+    // Compare the RAW token bytes (not the `Bearer `-prefixed string), as F-008 asks for "at
+    // minimum". The header value is `Bearer <token>`; strip the fixed scheme prefix first. A missing
+    // or non-Bearer header is rejected before any secret-dependent work.
     let actual = headers
         .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok());
-    // Constant-time comparison so a LAN-exposed server doesn't leak the token length or a prefix
-    // via a timing oracle (code-review F-008). `==` on strings short-circuits on the first mismatched
-    // byte; this walks every byte of the *expected* value regardless of where (or whether) they
-    // differ, then checks the length. The unconditional error path also keeps missing/malformed
-    // headers indistinguishable from a wrong token.
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::as_bytes);
     let ok = match actual {
-        Some(actual) => constant_time_eq(expected.as_bytes(), actual.as_bytes()),
+        // Constant-time compare: no short-circuit on the first mismatched byte. A residual
+        // length signal remains (the loop bound is the secret's length), which is acceptable for a
+        // LAN server with sub-µs deltas; the prefix-stripped comparison is the meaningful fix over
+        // `==` on the formatted string (code-review F-008).
+        Some(actual) => constant_time_eq(token.as_bytes(), actual),
         None => false,
     };
     if ok {
@@ -462,16 +518,19 @@ fn authorize(headers: &HeaderMap, token: Option<&str>) -> Result<(), ApiError> {
     }
 }
 
-/// Constant-time byte-slice equality: returns `true` only when `a == b`, but never short-circuits
-/// on the first mismatched byte. Accumulates XOR differences across the whole of the *shorter* slice
-/// and folds in the length difference, so the work done is independent of where (or whether) the
-/// values differ. This removes the timing oracle that `==` would otherwise expose on the bearer
-/// token (code-review F-008).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let len = a.len().min(b.len());
-    let mut diff = (a.len() ^ b.len()) as u8;
-    for i in 0..len {
-        diff |= a[i] ^ b[i];
+/// Constant-time byte-slice equality: returns `true` only when `a == b`, but never short-circuits on
+/// the first mismatched byte. Iterates over `secret.len()` bytes (folding in a length mismatch up
+/// front) so the work is independent of WHERE the values differ. NOTE: the iteration count is
+/// `secret.len()` — callers comparing a secret should pass it as `secret` and understand the secret
+/// length influences the loop bound (a residual length signal; acceptable for this LAN-auth use
+/// case, code-review F-008).
+fn constant_time_eq(secret: &[u8], candidate: &[u8]) -> bool {
+    let mut diff = (secret.len() ^ candidate.len()) as u8;
+    for (i, &sb) in secret.iter().enumerate() {
+        // Index `candidate` defensively; an out-of-bounds (candidate shorter than secret) is already
+        // captured by the length diff above, so just XOR a poison byte to keep the loop secret-bound.
+        let cb = candidate.get(i).copied().unwrap_or(0xFF);
+        diff |= sb ^ cb;
     }
     diff == 0
 }
@@ -1480,11 +1539,13 @@ mod tests {
         )
     }
 
-    fn http_options(addr: &str, path: &str) -> String {
+    /// A CORS preflight from a specific `Origin` (so the policy's origin-based branches can be
+    /// exercised: the webview origin, the packaged `tauri://localhost`, and a non-granted origin).
+    fn http_options_with_origin(addr: &str, path: &str, origin: &str) -> String {
         http_request(
             addr,
             format!(
-                "OPTIONS {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://127.0.0.1:5173\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: content-type\r\nConnection: close\r\n\r\n"
+                "OPTIONS {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\nAccess-Control-Request-Method: POST\r\nAccess-Control-Request-Headers: content-type\r\nConnection: close\r\n\r\n"
             ),
         )
     }
@@ -1638,9 +1699,10 @@ mod tests {
     }
 
     #[test]
-    fn loopback_omits_cors_headers() {
-        // On loopback (allow_lan=false, the default) no CORS headers are needed and none are emitted,
-        // tightening the previous static `*` (code-review F-003).
+    fn loopback_denies_non_webview_origin() {
+        // On loopback (allow_lan=false, the default) a random browser origin gets NO CORS grant,
+        // tightening the old static `*` that let any page drive the loopback model (F-003). Uses a
+        // non-webview origin so it is not confused with the always-allowed webview origin.
         let server = OpenAiServerHandle::new();
         let status = server
             .start(
@@ -1653,20 +1715,48 @@ mod tests {
             )
             .unwrap();
         let addr = status.bound_addr.unwrap();
-        let response = http_options(&addr, "/v1/chat/completions");
+        let response = http_options_with_origin(&addr, "/v1/chat/completions", "http://evil.example");
         assert!(response.starts_with("HTTP/1.1 204 No Content"));
         assert!(
             !response.to_ascii_lowercase().contains("access-control-allow-origin"),
-            "loopback must not emit a CORS allow-origin header: {response}"
+            "loopback must not grant a non-webview origin: {response}"
         );
         server.stop().unwrap();
     }
 
     #[test]
-    fn lan_reflects_request_origin_for_cors() {
-        // When a user opts into LAN serving, the documented OpenAI-compatible surface still needs
-        // cross-origin browser callers; we reflect the request Origin instead of a static `*` so a
-        // credentialed request carries a concrete, non-wildcard grant (code-review F-003).
+    fn loopback_grants_app_webview_origin() {
+        // The app's own webview always gets a CORS grant even on loopback (allow_lan=false): the
+        // in-app chat is a cross-origin browser fetch, so without this the preflight fails and every
+        // send dies. This is the regression the first F-003 attempt introduced (PR #30 review).
+        let server = OpenAiServerHandle::new();
+        let status = server
+            .start(
+                OpenAiServerConfig {
+                    port: 0,
+                    sampling_defaults: test_sampling_defaults(),
+                    ..Default::default()
+                },
+                loaded_fake_engine(),
+            )
+            .unwrap();
+        let addr = status.bound_addr.unwrap();
+        // The Vite dev webview origin.
+        let response = http_options_with_origin(&addr, "/v1/chat/completions", "http://127.0.0.1:5173");
+        assert!(response.starts_with("HTTP/1.1 204 No Content"));
+        assert!(response.contains("access-control-allow-origin: http://127.0.0.1:5173"));
+        assert!(response.contains("access-control-allow-methods: GET, POST, OPTIONS"));
+        // The packaged webview origin.
+        let response = http_options_with_origin(&addr, "/v1/chat/completions", "tauri://localhost");
+        assert!(response.contains("access-control-allow-origin: tauri://localhost"));
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn lan_grants_any_origin_with_vary() {
+        // When a user opts into LAN serving, the documented OpenAI-compatible surface is opened to
+        // any origin (third-party LAN clients), matching the old permissive behavior. We emit `*`
+        // and a `Vary: Origin` so a shared cache can't serve one origin's grant to another (F-003).
         let server = OpenAiServerHandle::new();
         let status = server
             .start(
@@ -1681,9 +1771,10 @@ mod tests {
             )
             .unwrap();
         let addr = status.bound_addr.unwrap();
-        let response = http_options(&addr, "/v1/chat/completions");
+        let response = http_options_with_origin(&addr, "/v1/chat/completions", "http://evil.example");
         assert!(response.starts_with("HTTP/1.1 204 No Content"));
-        assert!(response.contains("access-control-allow-origin: http://127.0.0.1:5173"));
+        assert!(response.contains("access-control-allow-origin: *"));
+        assert!(response.to_ascii_lowercase().contains("vary: origin"));
         assert!(response.contains("access-control-allow-methods: GET, POST, OPTIONS"));
         server.stop().unwrap();
     }

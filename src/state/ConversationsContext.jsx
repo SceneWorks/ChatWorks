@@ -99,6 +99,17 @@ export function ConversationsProvider({ children }) {
     refreshConversations();
   }, [refreshConversations]);
 
+  // Clear any pending debounced refresh when the provider unmounts, so a timer doesn't fire its
+  // setState after the component is gone (PR #30 review).
+  useEffect(() => {
+    return () => {
+      if (refreshDebounceRef.current) {
+        clearTimeout(refreshDebounceRef.current);
+        refreshDebounceRef.current = null;
+      }
+    };
+  }, []);
+
   // A fresh new chat tracks the app default sampling profile; a loaded conversation owns the params
   // it was run with, so defaults are only re-applied while there is no active conversation.
   useEffect(() => {

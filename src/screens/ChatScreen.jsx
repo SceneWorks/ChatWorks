@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { StatusDot } from "@sceneworks/ui";
 import { useApp } from "../state/AppContext";
@@ -44,6 +44,9 @@ export function ChatScreen() {
   const [toolSpecs, setToolSpecs] = useState([]); // OpenAI function-tool defs from the backend
   const [toolsEnabled, setToolsEnabled] = useState(true); // offer tools when the model supports them
   const [pendingApproval, setPendingApproval] = useState(null); // {calls, decisions, resolve}
+  // AbortController for the in-flight stream, so a Stop click (or unmount) cancels the fetch + the
+  // backend generation (F-004). `null` when no stream is in flight.
+  const abortRef = useRef(null);
   const thinkingCapable = supportsThinking(engineStatus);
   const visionCapable = supportsVision(engineStatus);
   const videoCapable = supportsVideo(engineStatus);
@@ -166,6 +169,12 @@ export function ChatScreen() {
     };
     await persist(conversation);
 
+    // The AbortController for this send: a Stop click (or unmount) aborts the in-flight fetch, the
+    // local server observes the dropped SSE receiver and cancels its generation, and the loop below
+    // commits the partial turn (F-004). Cleared in `finally`.
+    const abort = new AbortController();
+    abortRef.current = abort;
+
     try {
       const status = await refreshServerStatus();
       const nextEngineStatus = await refreshEngineStatus();
@@ -195,7 +204,21 @@ export function ChatScreen() {
           }),
           onUpdate: ({ content, thinking }) =>
             setMessages([...committed, { ...assistantMessage, content, thinking }]),
+          signal: abort.signal,
         });
+
+        // A user-initiated Stop aborts the stream; the server cancels and we get the partial turn
+        // back with finishReason "stopped". Commit it and end the send (do not loop into tools).
+        if (result.finishReason === "stopped") {
+          const partial = { role: "assistant", content: result.content, thinking: result.thinking };
+          if (result.content || result.thinking) {
+            conversation = [...committed, partial];
+          }
+          setMessages(conversation);
+          await persist(conversation);
+          hitStepLimit = false;
+          break;
+        }
 
         // Commit the assistant turn (with any tool calls it requested).
         const finalAssistant = { role: "assistant", content: result.content, thinking: result.thinking };
@@ -252,9 +275,22 @@ export function ChatScreen() {
       setMessages(conversation); // drop the in-flight assistant placeholder, keep committed turns
       await persist(conversation);
     } finally {
+      abortRef.current = null;
       setBusy(false);
     }
   }
+
+  /// Stop the in-flight generation (F-004): abort the SSE fetch (the server then cancels its
+  /// generation on the dropped receiver) and also call the engine's stop_generation command as a
+  /// belt-and-suspenders for the IPC path. The send loop commits the partial turn and ends.
+  const handleStop = useCallback(() => {
+    if (abortRef.current) {
+      abortRef.current.abort();
+    }
+    invoke("stop_generation").catch(() => {
+      /* best-effort; the fetch abort is the primary cancel path */
+    });
+  }, []);
 
   function updateParam(key, value) {
     setParams((current) => ({ ...current, [key]: value }));
@@ -483,6 +519,11 @@ export function ChatScreen() {
             <button className="primary-btn" disabled={!canSend} type="submit">
               {busy ? "Streaming…" : "Send"}
             </button>
+            {busy ? (
+              <button className="ghost-btn" type="button" onClick={handleStop}>
+                Stop
+              </button>
+            ) : null}
           </div>
         </form>
       </div>

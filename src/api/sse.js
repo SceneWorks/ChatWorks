@@ -136,8 +136,18 @@ export function chatRequestBody({ engineStatus, messages, params, thinkingCapabl
 /// POST one chat completion and consume its SSE stream, calling `onUpdate` as content/reasoning
 /// arrive. Returns the final `{content, thinking, toolCalls, finishReason}`. The local server emits
 /// each tool call whole in the final chunk's `delta.tool_calls`, so calls need no fragment assembly.
-export async function streamChatCompletion({ url, headers, body, onUpdate }) {
-  const response = await fetch(url, { method: "POST", headers, body: JSON.stringify(body) });
+///
+/// Pass an `AbortSignal` via `signal` to cancel the in-flight stream (F-004, PR #30 review): when the
+/// caller aborts, the `fetch` is aborted, the local server observes the dropped SSE receiver and
+/// cancels its generation, and this returns the partial content gathered so far (finishReason
+/// "stopped") instead of throwing. A non-abort error still throws.
+export async function streamChatCompletion({ url, headers, body, onUpdate, signal }) {
+  const response = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+    signal,
+  });
   if (!response.ok) {
     const errorBody = await response.json().catch(() => null);
     if (response.status === 413) {
@@ -155,7 +165,18 @@ export async function streamChatCompletion({ url, headers, body, onUpdate }) {
   let finishReason = null;
   let done = false;
   while (!done) {
-    const chunk = await reader.read();
+    let chunk;
+    try {
+      chunk = await reader.read();
+    } catch (cause) {
+      // An abort (caller-cancelled Stop) surfaces here as an AbortError. The local server has
+      // already observed the dropped connection and cancelled its generation; return the partial
+      // content gathered so far with a "stopped" finish reason rather than throwing (F-004).
+      if (signal?.aborted || cause?.name === "AbortError") {
+        return { content, thinking, toolCalls, finishReason: "stopped" };
+      }
+      throw cause;
+    }
     done = chunk.done;
     buffer += decoder.decode(chunk.value ?? new Uint8Array(), { stream: !done });
     buffer = readSseMessages(buffer, (data) => {
