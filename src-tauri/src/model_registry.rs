@@ -3,7 +3,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use core_llm::LoadSpec;
+use crate::core_llm::LoadSpec;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
@@ -632,13 +632,13 @@ fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, S
     }))
 }
 
-fn matching_provider(path: &Path) -> Result<Option<core_llm::TextLlmDescriptor>, String> {
+fn matching_provider(path: &Path) -> Result<Option<crate::core_llm::TextLlmDescriptor>, String> {
     let source = path.to_string_lossy().to_string();
     let spec = LoadSpec {
         source,
         quantize: None,
     };
-    Ok(core_llm::textllms()
+    Ok(crate::inference_runtime::textllms()
         .find(|registration| (registration.can_load)(&spec))
         .map(|registration| (registration.descriptor)()))
 }

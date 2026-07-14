@@ -9,9 +9,9 @@
 
 #![cfg(test)]
 
-use core_llm::{
-    Channel, FinishReason, LoadSpec, StreamEvent, TextLlm, TextLlmCapabilities,
-    TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingMode, Usage,
+use crate::core_llm::{
+    Channel, FinishReason, LoadSpec, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor,
+    TextLlmOutput, TextLlmRequest, ThinkingMode, Usage,
 };
 
 /// A weightless `TextLlm` that streams a reasoning token then a content token and finishes `Stop`.
@@ -25,7 +25,7 @@ impl TextLlm for FakeProvider {
         &self.descriptor
     }
 
-    fn validate(&self, req: &TextLlmRequest) -> core_llm::Result<()> {
+    fn validate(&self, req: &TextLlmRequest) -> crate::core_llm::Result<()> {
         self.descriptor
             .capabilities
             .validate_request(&self.descriptor.id, req)
@@ -35,13 +35,13 @@ impl TextLlm for FakeProvider {
         &self,
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(StreamEvent),
-    ) -> core_llm::Result<TextLlmOutput> {
+    ) -> crate::core_llm::Result<TextLlmOutput> {
         self.validate(req)?;
         assert_eq!(req.messages.len(), 1);
-        assert_eq!(req.messages[0].role, core_llm::Role::User);
+        assert_eq!(req.messages[0].role, crate::core_llm::Role::User);
         assert_eq!(
             req.messages[0].content,
-            vec![core_llm::Content::Text("hello".to_string())]
+            vec![crate::core_llm::Content::Text("hello".to_string())]
         );
         let thinking = if req.thinking == ThinkingMode::Disabled {
             None
@@ -80,7 +80,7 @@ impl TextLlm for FakeProvider {
 
 /// A loader that builds a [`FakeProvider`] whose descriptor advertises system prompts + thinking and
 /// caps `max_new_tokens` at 8 (so over-limit requests are rejected by `validate`).
-pub fn fake_loader(_: &LoadSpec) -> core_llm::Result<Box<dyn TextLlm>> {
+pub fn fake_loader(_: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
     Ok(Box::new(FakeProvider {
         descriptor: thinking_descriptor("fake", 8),
     }))
@@ -113,7 +113,7 @@ impl TextLlm for FakeToolProvider {
         &self.descriptor
     }
 
-    fn validate(&self, req: &TextLlmRequest) -> core_llm::Result<()> {
+    fn validate(&self, req: &TextLlmRequest) -> crate::core_llm::Result<()> {
         self.descriptor
             .capabilities
             .validate_request(&self.descriptor.id, req)
@@ -123,7 +123,7 @@ impl TextLlm for FakeToolProvider {
         &self,
         req: &TextLlmRequest,
         on_event: &mut dyn FnMut(StreamEvent),
-    ) -> core_llm::Result<TextLlmOutput> {
+    ) -> crate::core_llm::Result<TextLlmOutput> {
         self.validate(req)?;
         // The tools must have been threaded through to the core request.
         assert_eq!(req.tools.len(), 1);
@@ -141,7 +141,7 @@ impl TextLlm for FakeToolProvider {
         Ok(TextLlmOutput {
             text: String::new(),
             thinking: None,
-            tool_calls: vec![core_llm::ToolCall::new("get_weather", arguments)],
+            tool_calls: vec![crate::core_llm::ToolCall::new("get_weather", arguments)],
             usage,
             finish_reason: Some(FinishReason::Stop),
         })
@@ -149,7 +149,7 @@ impl TextLlm for FakeToolProvider {
 }
 
 /// A loader that builds a [`FakeToolProvider`] advertising tool support.
-pub fn fake_tool_loader(_: &LoadSpec) -> core_llm::Result<Box<dyn TextLlm>> {
+pub fn fake_tool_loader(_: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
     Ok(Box::new(FakeToolProvider {
         descriptor: TextLlmDescriptor {
             id: "fake-tools".to_string(),

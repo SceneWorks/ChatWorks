@@ -1,0 +1,4 @@
+[net]
+# SceneWorks/inference is private. Use the system Git client so Cargo honors the same credential
+# helper as `git clone` and `gh auth setup-git`.
+git-fetch-with-cli = true

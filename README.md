@@ -3,13 +3,21 @@
 A SceneWorks-styled desktop app for serving local LLMs. ChatWorks is a [Tauri](https://tauri.app/)
 application: a Rust backend that loads models and runs inference, fronted by an
 OpenAI-compatible HTTP server and a web chat UI. The inference backend is selected per-platform
-at build time — Apple **MLX** on macOS, cross-platform **Candle** on Windows/Linux — behind a
-single [`core-llm`](https://github.com/SceneWorks/core-llm) contract.
+at build time — Apple **MLX** on macOS, cross-platform **Candle** on Windows/Linux — through one
+immutable [`SceneWorks/inference`](https://github.com/SceneWorks/inference) runtime release. The
+current cutover pin is `runtime-2026.07.0`; the bundle re-exports the neutral `core-llm` contract
+and explicitly lists every available provider.
 
 - Running on Windows/Linux (Candle): see [WINDOWS.md](WINDOWS.md).
 - Sending video over the OpenAI-compatible API: see [docs/VIDEO_API.md](docs/VIDEO_API.md).
 
 ## Quick start (development)
+
+The Rust backend requires read access to the private
+[`SceneWorks/inference`](https://github.com/SceneWorks/inference) repository. Authenticate the
+system Git client (for example with `gh auth login` followed by `gh auth setup-git`) before running
+the development command. Unauthenticated clones cannot fetch the runtime while that repository
+remains private.
 
 ```sh
 npm install

@@ -8,10 +8,11 @@ inference backend, which is selected automatically at build time:
 | macOS (Apple)   | MLX         | `mlx-llama`     | Apple Metal     |
 | Windows / Linux | Candle      | `candle-llama`  | CPU             |
 
-Both backends implement the same [`core-llm`](https://github.com/SceneWorks/core-llm)
-contract, so the engine, OpenAI-compatible server, model import, and UI are identical
-across platforms. The selection lives in `src-tauri/Cargo.toml` (target-specific
-dependencies) and `src-tauri/src/lib.rs` (which backend crate gets linked).
+Both backends implement the same neutral `core-llm` contract and ship through one immutable
+[`SceneWorks/inference`](https://github.com/SceneWorks/inference) release. The engine,
+OpenAI-compatible server, model import, and UI are identical across platforms. The selection
+lives in `src-tauri/Cargo.toml`; `src-tauri/src/inference_runtime.rs` constructs the explicit
+provider catalog once for the process.
 
 ## Prerequisites
 
@@ -41,16 +42,18 @@ This produces MSI and NSIS installers under
 ## GPU acceleration (optional)
 
 The default Windows build runs Candle on the **CPU**, which works everywhere but is slow
-for larger models. To use an NVIDIA GPU, edit the `candle-llm` dependency in
-`src-tauri/Cargo.toml`:
+for larger models. Build the CUDA runtime profile without the default CPU profile:
 
-```toml
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-candle-llm = { git = "https://github.com/SceneWorks/candle-llm", branch = "main", features = ["cuda"] }
+```powershell
+npm run tauri:build -- --no-default-features --features cuda
 ```
 
-Then rebuild. This requires the CUDA toolkit to be installed. (`features = ["flash-attn"]`
-additionally enables fused FlashAttention-2 kernels.)
+This requires the CUDA toolkit. Add `flash-attn` to the feature list to enable the runtime's
+fused FlashAttention kernels:
+
+```powershell
+npm run tauri:build -- --no-default-features --features cuda,flash-attn
+```
 
 ## Model cache
 
