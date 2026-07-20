@@ -1,8 +1,7 @@
 name: Supply chain
 
-# Runs the core-inference dependency pin gate (code-review F-001, epic 9318). A `cargo update` that
-# floats a core dep off its pinned commit fails this job until a maintainer reviews the new commit
-# and updates scripts/git-deps-pinned.csv in the same PR. See scripts/check-git-deps.sh.
+# Ensures every platform bundle and resolved inference package comes from the one reviewed,
+# immutable SceneWorks/inference tag and resolved commit recorded in scripts/git-deps-pinned.csv.
 on:
   push:
     branches: [main]
@@ -13,5 +12,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Verify core inference deps match their pinned commits
+      - name: Verify the canonical inference release pin
         run: bash scripts/check-git-deps.sh

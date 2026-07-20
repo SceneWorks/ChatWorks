@@ -1,16 +1,25 @@
-// Link the platform's inference backend so its `core-llm` provider registers itself
-// (registration is a link-time `inventory::submit!`, pulled in only when the crate is linked).
-// macOS uses the Apple MLX backend; every other platform uses the cross-platform Candle backend.
-#[cfg(target_os = "macos")]
-use mlx_llm as _;
+#[cfg(all(not(target_os = "macos"), feature = "cpu", feature = "cuda"))]
+compile_error!("ChatWorks CPU and CUDA inference profiles are mutually exclusive");
+#[cfg(all(
+    not(target_os = "macos"),
+    not(any(feature = "cpu", feature = "cuda"))
+))]
+compile_error!("a non-macOS ChatWorks build must enable either the `cpu` or `cuda` feature");
 
-#[cfg(not(target_os = "macos"))]
-use candle_llm as _;
+// One platform bundle is the product's inference composition root. Re-exporting its neutral
+// contract preserves ChatWorks' public type paths without introducing a separately pinned source.
+#[cfg(target_os = "macos")]
+pub use runtime_macos::core_llm;
+#[cfg(all(not(target_os = "macos"), feature = "cpu", not(feature = "cuda")))]
+pub use runtime_cpu::core_llm;
+#[cfg(all(not(target_os = "macos"), feature = "cuda", not(feature = "cpu")))]
+pub use runtime_cuda::core_llm;
 
 pub mod app_settings;
 pub mod conversations;
 pub mod engine;
 pub mod fsutil;
+mod inference_runtime;
 pub mod model_registry;
 pub mod server;
 pub mod tools;

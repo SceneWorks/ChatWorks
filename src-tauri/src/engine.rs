@@ -2,17 +2,17 @@ use std::path::Path;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
-use core_llm::{
-    load_for_model, CancelFlag, Channel, Content, FinishReason, ImageRef, LoadSpec, Message,
-    Quantize, Role, Sampling, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor,
-    TextLlmRequest, ThinkingMode, ToolCall, ToolSpec, Usage, VideoRef,
+use crate::core_llm::{
+    CancelFlag, Channel, Content, FinishReason, ImageRef, LoadSpec, Message, Quantize, Role,
+    Sampling, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest,
+    ThinkingMode, ToolCall, ToolSpec, Usage, VideoRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub type EngineResult<T> = Result<T, String>;
 
-type Loader = fn(&LoadSpec) -> core_llm::Result<Box<dyn TextLlm>>;
+type Loader = fn(&LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>>;
 
 /// The in-flight generation's cancel flag, shared between the engine thread and the handle so a
 /// `cancel()` call can trip it without going through the actor's serial command loop (which is
@@ -38,7 +38,7 @@ pub struct EngineHandle {
 
 impl EngineHandle {
     pub fn spawn() -> Self {
-        Self::spawn_with_loader(load_for_model)
+        Self::spawn_with_loader(crate::inference_runtime::load_for_model)
     }
 
     pub(crate) fn spawn_with_loader(loader: Loader) -> Self {
@@ -242,7 +242,7 @@ impl EngineActor {
     fn status(&self) -> EngineStatus {
         EngineStatus {
             loaded: self.loaded.as_ref().map(LoadedModel::status),
-            providers: core_llm::textllms()
+            providers: crate::inference_runtime::textllms()
                 .map(|registration| ProviderSummary::from((registration.descriptor)()))
                 .collect(),
         }
@@ -530,14 +530,19 @@ fn decode_image(data: &str) -> EngineResult<ImageRef> {
     use base64::Engine as _;
     use image::GenericImageView;
     // Strip the optional `data:<mime>;base64,` prefix.
-    let b64 = data.rsplit_once(',').map(|(_, rest)| rest).unwrap_or(data).trim();
+    let b64 = data
+        .rsplit_once(',')
+        .map(|(_, rest)| rest)
+        .unwrap_or(data)
+        .trim();
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|error| format!("invalid base64 image attachment: {error}"))?;
     let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes));
-    reader.set_format(image::guess_format(&bytes).map_err(|error| {
-        format!("could not determine image attachment format: {error}")
-    })?);
+    reader.set_format(
+        image::guess_format(&bytes)
+            .map_err(|error| format!("could not determine image attachment format: {error}"))?,
+    );
     // Bomb guard: reject absurd per-axis dimensions before decoding the full buffer. Set generously
     // (MAX_IMAGE_AXIS); the real budget is the product check after decode.
     let mut limits = image::Limits::default();
