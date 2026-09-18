@@ -114,6 +114,8 @@ pub struct AdoptCachedModelRequest {
 struct HfModelRef {
     repo: String,
     revision: String,
+    /// An exact GGUF file selected by a Hugging Face `blob` / `resolve` URL.
+    file_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -137,12 +139,14 @@ pub fn list_cached_hf_models() -> Result<Vec<CachedModelCandidate>, String> {
     let mut seen = HashSet::new();
     for cache_dir in hf_cache_dirs() {
         for snapshot in cached_snapshot_dirs(&cache_dir)? {
-            let key = snapshot.to_string_lossy().to_string();
-            if !seen.insert(key) {
-                continue;
-            }
-            if let Some(candidate) = cached_model_candidate(&snapshot)? {
-                candidates.push(candidate);
+            for source in cached_model_sources(&snapshot)? {
+                let key = source.to_string_lossy().to_string();
+                if !seen.insert(key) {
+                    continue;
+                }
+                if let Some(candidate) = cached_model_candidate(&source)? {
+                    candidates.push(candidate);
+                }
             }
         }
     }
@@ -165,6 +169,7 @@ pub fn adopt_cached_hf_model(
     let model_ref = HfModelRef {
         repo: candidate.repo.clone(),
         revision: candidate.revision.clone(),
+        file_name: source_file_name(Path::new(&candidate.local_path)),
     };
     let entry = ModelEntry {
         id: model_id(&model_ref, request.quantize),
@@ -226,10 +231,10 @@ pub fn load_registered_model(
         .cloned()
         .ok_or_else(|| format!("model {model_id:?} is not in the registry"))?;
     let snapshot = Path::new(&entry.local_path);
-    validate_snapshot(snapshot)?;
-    recognized_snapshot_format(snapshot)?;
+    validate_model_source(snapshot)?;
+    recognized_model_format(snapshot)?;
     if matching_provider(snapshot)?.is_none() {
-        return Err("registered snapshot is no longer supported by the linked inference providers".to_string());
+        return Err(unsupported_model_source_error(snapshot, "registered model is no longer supported"));
     }
     let status = engine.load_model(LoadModelRequest {
         source: entry.local_path.clone(),
@@ -346,10 +351,11 @@ async fn import_hf_model_inner(
             total_bytes,
         },
     );
-    validate_snapshot(&snapshot_dir)?;
-    let provider = matching_provider(&snapshot_dir)?
-        .ok_or_else(|| "downloaded snapshot is not supported by the linked inference providers".to_string())?;
-    let (format, pack) = recognized_snapshot_format(&snapshot_dir)?;
+    let source = imported_model_source(&snapshot_dir, &model_ref)?;
+    validate_model_source(&source)?;
+    let provider = matching_provider(&source)?
+        .ok_or_else(|| unsupported_model_source_error(&source, "downloaded model is not supported"))?;
+    let (format, pack) = recognized_model_format(&source)?;
 
     let mut registry = read_registry(&manifest)?;
     let entry = ModelEntry {
@@ -358,7 +364,7 @@ async fn import_hf_model_inner(
         repo: model_ref.repo.clone(),
         revision: model_ref.revision.clone(),
         source_url: model_ref.source_url(),
-        local_path: snapshot_dir.to_string_lossy().to_string(),
+        local_path: source.to_string_lossy().to_string(),
         quantize: request.quantize,
         imported_at: now_secs(),
         file_count: files.len(),
@@ -419,7 +425,47 @@ async fn fetch_hf_files(
         files.push(file);
     }
     files.sort_by(|a, b| a.rfilename.cmp(&b.rfilename));
-    Ok(files)
+    select_import_files(files, model_ref)
+}
+
+/// Import one direct GGUF at a time. This prevents a repo that publishes PQ2, PTQ1, and projector
+/// files from silently downloading every variant or loading an arbitrary one.
+fn select_import_files(files: Vec<HfSibling>, model_ref: &HfModelRef) -> Result<Vec<HfSibling>, String> {
+    if let Some(file_name) = &model_ref.file_name {
+        if !is_gguf_model_file(file_name) {
+            return Err("file-specific HuggingFace imports require a non-projector .gguf model file".to_string());
+        }
+        return files
+            .into_iter()
+            .find(|file| file.rfilename == *file_name)
+            .map(|file| vec![file])
+            .ok_or_else(|| format!("HuggingFace revision does not contain {file_name:?}"));
+    }
+
+    let has_safetensors = files.iter().any(|file| file.rfilename.ends_with(".safetensors"));
+    if has_safetensors {
+        return Ok(files
+            .into_iter()
+            .filter(|file| !file.rfilename.ends_with(".gguf"))
+            .collect());
+    }
+
+    let gguf_files: Vec<_> = files
+        .into_iter()
+        .filter(|file| is_gguf_model_file(&file.rfilename))
+        .collect();
+    match gguf_files.as_slice() {
+        [file] => Ok(vec![file.clone()]),
+        [] => Ok(Vec::new()),
+        files => Err(format!(
+            "HuggingFace repo publishes multiple GGUF model files ({}); import one using its exact https://huggingface.co/<repo>/blob/<revision>/<file>.gguf URL",
+            files
+                .iter()
+                .map(|file| file.rfilename.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
 }
 
 struct DownloadContext<'a> {
@@ -514,28 +560,44 @@ impl HfModelRef {
         let marker = segments
             .iter()
             .position(|segment| matches!(*segment, "tree" | "blob" | "resolve"));
-        let (repo_segments, revision) = if let Some(index) = marker {
+        let (repo_segments, revision, file_name) = if let Some(index) = marker {
             if index == 0 {
                 return Err("HuggingFace repo path is required".to_string());
             }
             let revision = segments.get(index + 1).copied().unwrap_or("main");
-            (&segments[..index], revision)
+            let file_name = match segments[index] {
+                "blob" | "resolve" if segments.len() > index + 2 => {
+                    Some(segments[index + 2..].join("/"))
+                }
+                _ => None,
+            };
+            (&segments[..index], revision, file_name)
         } else if segments.len() >= 2 {
-            (&segments[..2], "main")
+            (&segments[..2], "main", None)
         } else {
-            (&segments[..1], "main")
+            (&segments[..1], "main", None)
         };
         let repo = repo_segments.join("/");
         validate_hf_path(&repo, "repo")?;
         validate_hf_path(revision, "revision")?;
+        if let Some(file_name) = &file_name {
+            validate_hf_file_name(file_name)?;
+        }
         Ok(Self {
             repo,
             revision: revision.to_string(),
+            file_name,
         })
     }
 
     fn source_url(&self) -> String {
-        format!("https://{}/{}/tree/{}", HF_HOST, self.repo, self.revision)
+        match &self.file_name {
+            Some(file_name) => format!(
+                "https://{}/{}/blob/{}/{}",
+                HF_HOST, self.repo, self.revision, file_name
+            ),
+            None => format!("https://{}/{}/tree/{}", HF_HOST, self.repo, self.revision),
+        }
     }
 }
 
@@ -559,19 +621,60 @@ fn is_loadable_model_file(name: &str) -> bool {
         || name == "PACK-RUNTIME"
         || name.ends_with(".safetensors")
         || name.ends_with(".safetensors.index.json")
+        || name.ends_with(".gguf")
+}
+
+fn is_gguf_model_file(name: &str) -> bool {
+    name.ends_with(".gguf") && !name.to_ascii_lowercase().contains("mmproj")
+}
+
+fn source_file_name(path: &Path) -> Option<String> {
+    path.is_file()
+        .then(|| path.file_name()?.to_str().map(str::to_string))
+        .flatten()
 }
 
 fn default_model_format() -> String { "hf-safetensors".to_string() }
 
 /// Labels a Prism/Bonsai pack only when its immutable pack sidecars are present. Model config
 /// strings remain insufficient: the linked loader's `can_load` decides support separately.
-fn recognized_snapshot_format(path: &Path) -> Result<(String, Option<String>), String> {
+fn recognized_model_format(path: &Path) -> Result<(String, Option<String>), String> {
+    if path.is_file() {
+        if !is_gguf_model_file(&path.to_string_lossy()) {
+            return Err("direct model source must be a non-projector .gguf file".to_string());
+        }
+        return Ok(("gguf-prism-packed".to_string(), Some("bonsai2-packed".to_string())));
+    }
     let hadamard = path.join("hadamard.json").is_file();
     let runtime = path.join("PACK-RUNTIME").is_file();
     match (hadamard, runtime) {
         (false, false) => Ok((default_model_format(), None)),
         (true, true) => Ok(("hf-safetensors".to_string(), Some("bonsai2-packed".to_string()))),
         _ => Err("Prism/Bonsai snapshot has incomplete packing sidecars (need hadamard.json and PACK-RUNTIME)".to_string()),
+    }
+}
+
+fn imported_model_source(snapshot_dir: &Path, model_ref: &HfModelRef) -> Result<PathBuf, String> {
+    if let Some(file_name) = &model_ref.file_name {
+        let source = snapshot_dir.join(file_name);
+        if !source.is_file() {
+            return Err(format!("downloaded GGUF file {file_name:?} is missing"));
+        }
+        return Ok(source);
+    }
+
+    let gguf_files: Vec<_> = fs::read_dir(snapshot_dir)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && is_gguf_model_file(&path.to_string_lossy()))
+        .collect();
+    match gguf_files.as_slice() {
+        [source] => Ok(source.clone()),
+        [] => Ok(snapshot_dir.to_path_buf()),
+        // `select_import_files` rejects this before any download. Keep this guard so a partially
+        // populated cache cannot pick an arbitrary quantization variant on retry.
+        _ => Err("downloaded snapshot has multiple GGUF model files; use an exact blob URL".to_string()),
     }
 }
 
@@ -584,6 +687,37 @@ fn validate_hf_file_name(name: &str) -> Result<(), String> {
         return Err(format!("invalid HuggingFace filename {name:?}"));
     }
     Ok(())
+}
+
+fn validate_model_source(path: &Path) -> Result<(), String> {
+    if path.is_file() {
+        if !is_gguf_model_file(&path.to_string_lossy()) {
+            return Err("direct model source must be a non-projector .gguf file".to_string());
+        }
+        let size = fs::metadata(path).map_err(|error| error.to_string())?.len();
+        if size < 4 {
+            return Err("GGUF model file is empty or corrupt".to_string());
+        }
+        let mut header = [0_u8; 4];
+        std::io::Read::read_exact(
+            &mut fs::File::open(path).map_err(|error| error.to_string())?,
+            &mut header,
+        )
+        .map_err(|error| error.to_string())?;
+        if header != *b"GGUF" {
+            return Err("GGUF model file has an invalid header or is corrupt".to_string());
+        }
+        return Ok(());
+    }
+    validate_snapshot(path)
+}
+
+fn unsupported_model_source_error(path: &Path, prefix: &str) -> String {
+    if path.is_file() && is_gguf_model_file(&path.to_string_lossy()) {
+        format!("{prefix}: GGUF must be a complete Qwen3.5 Prism/Bonsai model with valid packed metadata")
+    } else {
+        format!("{prefix} by the linked inference providers")
+    }
 }
 
 fn validate_snapshot(path: &Path) -> Result<(), String> {
@@ -635,8 +769,28 @@ fn validate_text_snapshot_config(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn cached_model_sources(snapshot: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut sources = Vec::new();
+    // A safetensors snapshot remains one directory source. GGUF variants are independently
+    // selectable files, excluding companion multimodal projectors.
+    let has_safetensors = fs::read_dir(snapshot)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .any(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("safetensors"));
+    if has_safetensors {
+        sources.push(snapshot.to_path_buf());
+    }
+    for entry in fs::read_dir(snapshot).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.is_file() && is_gguf_model_file(&path.to_string_lossy()) {
+            sources.push(path);
+        }
+    }
+    Ok(sources)
+}
+
 fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, String> {
-    if let Err(error) = validate_snapshot(path) {
+    if let Err(error) = validate_model_source(path) {
         if error.starts_with("unsupported model type ") {
             return Ok(None);
         }
@@ -648,13 +802,17 @@ fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, S
     let Some(provider) = matching_provider(path)? else {
         return Ok(None);
     };
-    if provider.capabilities.supports_vision && !is_joycaption_snapshot(path)? {
+    if path.is_dir() && provider.capabilities.supports_vision && !is_joycaption_snapshot(path)? {
         return Ok(None);
     }
-    let model_ref = HfModelRef { repo, revision };
+    let model_ref = HfModelRef {
+        repo,
+        revision,
+        file_name: source_file_name(path),
+    };
     let file_count = snapshot_file_count(path)?;
     let size_bytes = snapshot_size_bytes(path);
-    let (format, pack) = recognized_snapshot_format(path)?;
+    let (format, pack) = recognized_model_format(path)?;
     Ok(Some(CachedModelCandidate {
         id: model_id(&model_ref, None),
         name: model_name(&model_ref, None),
@@ -666,9 +824,10 @@ fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, S
         // The static provider descriptor is weightless, so the `mlx-llama` Qwen3.6/Qwen3-VL VLM
         // advertises vision only once loaded; detect it from the snapshot config so the UI offers
         // image input before load.
-        supports_vision: provider.capabilities.supports_vision
-            || is_qwen35_vision_snapshot(path)?
-            || is_qwen3vl_vision_snapshot(path)?,
+        supports_vision: path.is_dir()
+            && (provider.capabilities.supports_vision
+                || is_qwen35_vision_snapshot(path)?
+                || is_qwen3vl_vision_snapshot(path)?),
         format,
         pack,
         file_count,
@@ -813,8 +972,9 @@ fn cached_snapshot_dirs(cache_dir: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 fn parse_hf_cache_snapshot(path: &Path) -> Option<(String, String)> {
-    let revision = path.file_name()?.to_str()?.to_string();
-    let snapshots_dir = path.parent()?;
+    let snapshot = if path.is_file() { path.parent()? } else { path };
+    let revision = snapshot.file_name()?.to_str()?.to_string();
+    let snapshots_dir = snapshot.parent()?;
     if snapshots_dir.file_name()?.to_str()? != "snapshots" {
         return None;
     }
@@ -825,6 +985,9 @@ fn parse_hf_cache_snapshot(path: &Path) -> Option<(String, String)> {
 }
 
 fn snapshot_file_count(path: &Path) -> Result<usize, String> {
+    if path.is_file() {
+        return Ok(1);
+    }
     Ok(fs::read_dir(path)
         .map_err(|error| error.to_string())?
         .filter_map(Result::ok)
@@ -832,6 +995,9 @@ fn snapshot_file_count(path: &Path) -> Result<usize, String> {
 }
 
 fn snapshot_size_bytes(path: &Path) -> Option<u64> {
+    if path.is_file() {
+        return path.metadata().ok().map(|metadata| metadata.len());
+    }
     let mut total = 0_u64;
     for entry in fs::read_dir(path).ok()?.filter_map(Result::ok) {
         let metadata = entry.metadata().ok()?;
@@ -929,12 +1095,16 @@ fn model_id(model_ref: &HfModelRef, quantize: Option<QuantizeRequest>) -> String
         Some(QuantizeRequest::Q8) => "q8",
         None => "dense",
     };
-    format!(
+    let base = format!(
         "{}--{}--{}",
         safe_name(&model_ref.repo),
         safe_name(&model_ref.revision),
         suffix
-    )
+    );
+    match model_ref.file_name.as_deref() {
+        Some(file_name) => format!("{base}--{}", safe_name(file_name)),
+        None => base,
+    }
 }
 
 fn model_name(model_ref: &HfModelRef, quantize: Option<QuantizeRequest>) -> String {
@@ -943,10 +1113,17 @@ fn model_name(model_ref: &HfModelRef, quantize: Option<QuantizeRequest>) -> Stri
         .split('/')
         .next_back()
         .unwrap_or(model_ref.repo.as_str());
+    let source = model_ref
+        .file_name
+        .as_deref()
+        .and_then(|name| Path::new(name).file_name())
+        .and_then(|name| name.to_str())
+        .map(|name| format!(" ({name})"))
+        .unwrap_or_default();
     match quantize {
-        Some(QuantizeRequest::Q4) => format!("{base} Q4"),
-        Some(QuantizeRequest::Q8) => format!("{base} Q8"),
-        None => base.to_string(),
+        Some(QuantizeRequest::Q4) => format!("{base}{source} Q4"),
+        Some(QuantizeRequest::Q8) => format!("{base}{source} Q8"),
+        None => format!("{base}{source}"),
     }
 }
 
@@ -1000,18 +1177,95 @@ mod tests {
         assert!(is_loadable_model_file("config.json"));
         assert!(is_loadable_model_file("model-00001-of-00002.safetensors"));
         assert!(is_loadable_model_file("model.safetensors.index.json"));
-        assert!(!is_loadable_model_file("model.gguf"));
+        assert!(is_loadable_model_file("model.gguf"));
         assert!(!is_loadable_model_file("README.md"));
+    }
+
+    #[test]
+    fn recognizes_direct_prism_gguf_and_rejects_projectors() {
+        assert!(is_loadable_model_file("Ternary-Bonsai-2-27B-PQ2_0.gguf"));
+        assert!(is_gguf_model_file("Ternary-Bonsai-2-27B-PTQ1_0.gguf"));
+        assert!(!is_gguf_model_file("mmproj-Ternary-Bonsai-2-27B-F16.gguf"));
+
+        let dir = snapshot_dir("prism-gguf");
+        let source = dir.path().join("Ternary-Bonsai-2-27B-PQ2_0.gguf");
+        write_minimal_prism_gguf(&source);
+        assert!(validate_model_source(&source).is_ok());
+        assert_eq!(
+            recognized_model_format(&source).unwrap(),
+            ("gguf-prism-packed".to_string(), Some("bonsai2-packed".to_string()))
+        );
+    }
+
+    #[test]
+    fn direct_gguf_requires_valid_header() {
+        let dir = snapshot_dir("invalid-gguf");
+        let source = dir.path().join("broken.gguf");
+        fs::write(&source, b"bad!").unwrap();
+        assert_eq!(
+            validate_model_source(&source).unwrap_err(),
+            "GGUF model file has an invalid header or is corrupt"
+        );
+    }
+
+    #[test]
+    fn parses_and_selects_exact_gguf_huggingface_file() {
+        let model = HfModelRef::parse(
+            "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/blob/6ed5e12/PQ2_0.gguf",
+        )
+        .unwrap();
+        assert_eq!(model.file_name.as_deref(), Some("PQ2_0.gguf"));
+        assert!(model.source_url().ends_with("/blob/6ed5e12/PQ2_0.gguf"));
+
+        let files = vec![
+            HfSibling { rfilename: "PQ2_0.gguf".to_string(), size: Some(1) },
+            HfSibling { rfilename: "PTQ1_0.gguf".to_string(), size: Some(1) },
+            HfSibling { rfilename: "mmproj-F16.gguf".to_string(), size: Some(1) },
+        ];
+        let selected = select_import_files(files.clone(), &model).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].rfilename, "PQ2_0.gguf");
+        let repo = HfModelRef::parse("prism-ml/Ternary-Bonsai-2-27B-gguf").unwrap();
+        assert!(select_import_files(files, &repo).unwrap_err().contains("multiple GGUF"));
+    }
+
+    #[test]
+    fn generic_single_gguf_snapshot_loads_the_file_not_its_directory() {
+        let dir = snapshot_dir("single-gguf-source");
+        let source = dir.path().join("PQ2_0.gguf");
+        write_minimal_prism_gguf(&source);
+        let model = HfModelRef::parse("prism-ml/Ternary-Bonsai-2-27B-gguf").unwrap();
+        assert_eq!(imported_model_source(dir.path(), &model).unwrap(), source);
+    }
+
+    #[test]
+    fn cached_prism_gguf_is_a_separate_selectable_source() {
+        let root = snapshot_dir("hf-prism-gguf");
+        let snapshot = root
+            .join("models--prism-ml--Ternary-Bonsai-2-27B-gguf")
+            .join("snapshots")
+            .join("6ed5e12");
+        fs::create_dir_all(&snapshot).unwrap();
+        let pq2 = snapshot.join("PQ2_0.gguf");
+        write_minimal_prism_gguf(&pq2);
+        write_minimal_prism_gguf(&snapshot.join("mmproj-F16.gguf"));
+        let sources = cached_model_sources(&snapshot).unwrap();
+        assert_eq!(sources, vec![pq2.clone()]);
+        let candidate = cached_model_candidate(&pq2).unwrap().expect("native GGUF provider");
+        assert_eq!(candidate.format, "gguf-prism-packed");
+        assert_eq!(candidate.pack.as_deref(), Some("bonsai2-packed"));
+        assert_eq!(candidate.file_count, 1);
+        assert_eq!(candidate.local_path, pq2.to_string_lossy());
     }
 
     #[test]
     fn recognizes_only_complete_bonsai_packing_sidecars() {
         let dir = snapshot_dir("bonsai-sidecars");
-        assert_eq!(recognized_snapshot_format(dir.path()).unwrap(), ("hf-safetensors".to_string(), None));
+        assert_eq!(recognized_model_format(dir.path()).unwrap(), ("hf-safetensors".to_string(), None));
         write_snapshot_file(&dir, "hadamard.json", "{}");
-        assert!(recognized_snapshot_format(dir.path()).is_err());
+        assert!(recognized_model_format(dir.path()).is_err());
         write_snapshot_file(&dir, "PACK-RUNTIME", "ptq1");
-        assert_eq!(recognized_snapshot_format(dir.path()).unwrap().1.as_deref(), Some("bonsai2-packed"));
+        assert_eq!(recognized_model_format(dir.path()).unwrap().1.as_deref(), Some("bonsai2-packed"));
         assert!(is_loadable_model_file("hadamard.json"));
         assert!(is_loadable_model_file("PACK-RUNTIME"));
     }
@@ -1314,5 +1568,26 @@ mod tests {
 
     fn write_snapshot_file(dir: &Path, name: &str, body: &str) {
         fs::write(dir.join(name), body).unwrap();
+    }
+
+    /// A metadata-only GGUF accepted by the weightless Prism route. It has no tensors and is used
+    /// solely to verify registry discovery without loading real weights.
+    fn write_minimal_prism_gguf(path: &Path) {
+        fn string(out: &mut Vec<u8>, value: &str) {
+            out.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            out.extend_from_slice(value.as_bytes());
+        }
+        let mut body = Vec::new();
+        body.extend_from_slice(b"GGUF");
+        body.extend_from_slice(&3_u32.to_le_bytes());
+        body.extend_from_slice(&0_u64.to_le_bytes());
+        body.extend_from_slice(&2_u64.to_le_bytes());
+        string(&mut body, "general.architecture");
+        body.extend_from_slice(&8_u32.to_le_bytes()); // GGUF string
+        string(&mut body, "qwen35");
+        string(&mut body, "prism.hadamard.version");
+        body.extend_from_slice(&4_u32.to_le_bytes()); // GGUF u32
+        body.extend_from_slice(&1_u32.to_le_bytes());
+        fs::write(path, body).unwrap();
     }
 }

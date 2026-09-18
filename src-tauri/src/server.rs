@@ -1371,7 +1371,7 @@ mod tests {
     use super::*;
     // The weightless fakes are shared with the engine tests via `test_support` so the two can't
     // drift apart (code-review F-012).
-    use crate::test_support::{fake_loader, fake_tool_loader};
+    use crate::test_support::{fake_loader, fake_telemetry_loader, fake_tool_loader};
     use serde_json::{json, Value};
 
     fn loaded_fake_engine() -> EngineHandle {
@@ -1380,6 +1380,18 @@ mod tests {
             .load_model(crate::engine::LoadModelRequest {
                 source: "/tmp/fake-model".to_string(),
                 display_name: Some("fake-model".to_string()),
+                quantize: None,
+            })
+            .unwrap();
+        engine
+    }
+
+    fn loaded_telemetry_engine() -> EngineHandle {
+        let engine = EngineHandle::spawn_with_loader(fake_telemetry_loader);
+        engine
+            .load_model(crate::engine::LoadModelRequest {
+                source: "/tmp/fake-telemetry".to_string(),
+                display_name: Some("fake-telemetry".to_string()),
                 quantize: None,
             })
             .unwrap();
@@ -1858,6 +1870,38 @@ mod tests {
         assert!(response.contains("data: {\"id\":\"chatcmpl-"));
         assert!(response.contains("\"reasoning_content\":\"reason\""));
         assert!(response.contains("\"content\":\"ok\""));
+        assert!(response.contains("data: [DONE]"));
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn streams_terminal_native_telemetry_over_http() {
+        let server = OpenAiServerHandle::new();
+        let status = server
+            .start(
+                OpenAiServerConfig {
+                    port: 0,
+                    sampling_defaults: test_sampling_defaults(),
+                    ..Default::default()
+                },
+                loaded_telemetry_engine(),
+            )
+            .unwrap();
+        let addr = status.bound_addr.unwrap();
+        let response = http_post_json(
+            &addr,
+            "/v1/chat/completions",
+            json!({
+                "model": "fake-telemetry",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+                "mtp": {"mode": "enabled", "draft_tokens": 2},
+                "max_tokens": 8
+            }),
+            None,
+        );
+        assert!(response.contains("\"chatworks_mtp\":{\"proposed_tokens\":4,\"accepted_tokens\":3,\"target_forwards\":2}"));
+        assert!(response.contains("\"chatworks_timings\":{\"prefill_ms\":12,\"decode_ms\":34}"));
         assert!(response.contains("data: [DONE]"));
         server.stop().unwrap();
     }
