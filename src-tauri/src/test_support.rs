@@ -73,6 +73,8 @@ impl TextLlm for FakeProvider {
             thinking,
             tool_calls: Vec::new(),
             usage,
+            mtp: None,
+            timings: None,
             finish_reason: Some(FinishReason::Stop),
         })
     }
@@ -143,6 +145,8 @@ impl TextLlm for FakeToolProvider {
             thinking: None,
             tool_calls: vec![crate::core_llm::ToolCall::new("get_weather", arguments)],
             usage,
+            mtp: None,
+            timings: None,
             finish_reason: Some(FinishReason::Stop),
         })
     }

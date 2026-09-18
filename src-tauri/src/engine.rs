@@ -3,8 +3,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use crate::core_llm::{
-    CancelFlag, Channel, Constraint, FinishReason, ImageRef, LoadSpec, Message, MtpCapabilities,
-    MtpMode, MtpStats, Quantize, ReasoningEffort, Role, Sampling, StreamEvent, TextLlm,
+    CancelFlag, Channel, Constraint, FinishReason, GenerationTimings, ImageRef, LoadSpec, Message,
+    MtpCapabilities, MtpMode, MtpStats, Quantize, ReasoningEffort, Role, Sampling, StreamEvent, TextLlm,
     TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest, ThinkingMode, ToolCall, ToolSpec,
     Usage, VideoRef,
 };
@@ -238,6 +238,7 @@ impl EngineActor {
                 .unwrap_or("unknown")
                 .to_string(),
             mtp: output.mtp.map(MtpStatsPayload::from),
+            timings: output.timings.map(GenerationTimingsPayload::from),
         })
     }
 
@@ -818,6 +819,17 @@ impl From<MtpStats> for MtpStatsPayload {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct GenerationTimingsPayload {
+    pub prefill_ms: u128,
+    pub decode_ms: u128,
+}
+impl From<GenerationTimings> for GenerationTimingsPayload {
+    fn from(value: GenerationTimings) -> Self {
+        Self { prefill_ms: value.prefill.as_millis(), decode_ms: value.decode.as_millis() }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct GenerateResponse {
     pub text: String,
     pub thinking: Option<String>,
@@ -827,6 +839,8 @@ pub struct GenerateResponse {
     pub finish_reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mtp: Option<MtpStatsPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timings: Option<GenerationTimingsPayload>,
 }
 
 #[derive(Clone, Debug, Serialize)]
