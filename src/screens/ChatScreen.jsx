@@ -18,6 +18,7 @@ import { normalizeImageAttachment } from "../media/image";
 import { sampleVideoAttachment } from "../media/video";
 import { MessageActions } from "../components/MessageActions";
 import { MessageContent } from "../components/MessageContent";
+import { GenerationControls } from "../components/GenerationControls";
 import { formatToolArguments, ToolCallList, ToolResult } from "../components/ToolCallList";
 
 /// The maximum number of model→tool→model round-trips in a single send, to bound runaway loops.
@@ -596,6 +597,8 @@ export function ChatScreen() {
             </span>
           </label>
         ) : null}
+        <GenerationControls params={params} onChange={updateParam}
+          capabilities={engineStatus?.loaded?.provider?.capabilities ?? {}} />
         {toolsCapable ? (
           <label className="toggle-row">
             <input

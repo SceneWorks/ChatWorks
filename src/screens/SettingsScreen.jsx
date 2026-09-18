@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { StatusDot } from "@sceneworks/ui";
 import { useApp } from "../state/AppContext";
+import { GenerationControls } from "../components/GenerationControls";
+import { generationParams, generationSettings } from "../state/generation.js";
 
 export function settingsToForm(settings) {
   return {
@@ -14,6 +16,7 @@ export function settingsToForm(settings) {
     topP: String(settings.sampling.topP),
     maxTokens: String(settings.sampling.maxTokens),
     disableThinking: Boolean(settings.sampling.disableThinking),
+    ...generationParams(settings.sampling),
   };
 }
 
@@ -54,6 +57,7 @@ export function SettingsScreen() {
         topP: Number(nextForm.topP),
         maxTokens: Number(nextForm.maxTokens),
         disableThinking: nextForm.disableThinking,
+        ...generationSettings(nextForm),
       },
     };
   }
@@ -238,6 +242,7 @@ export function SettingsScreen() {
             <small>Applied when a thinking-capable loaded model supports no-think mode.</small>
           </span>
         </label>
+        <GenerationControls params={form} onChange={updateForm} prefix="default-generation" />
         <div className="panel-actions">
           <button className="primary-btn" disabled={busy} type="submit">
             {busy ? "Saving…" : "Save settings"}

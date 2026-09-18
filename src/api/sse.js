@@ -1,4 +1,5 @@
-import { parseNumber } from "../media/image";
+import { parseNumber } from "../media/image.js";
+import { generationOverrides } from "../state/generation.js";
 
 export function buildLocalApiBase(serverStatus) {
   if (!serverStatus?.running) return "http://127.0.0.1:8000";
@@ -59,7 +60,8 @@ export function readSseMessages(buffer, onData) {
 /// `tool_calls` (content `null`), a vision turn with `image_url` / `video_url` parts, or a plain text
 /// turn. Video parts (sc-8081) carry pre-sampled `frames` + per-frame `timestamps` (Text–Timestamp
 /// Alignment); visuals come before text, matching the Qwen3-VL convention.
-export function toOpenAiMessage({ role, content, images, videos, tool_calls: toolCalls }) {
+export function toOpenAiMessage({ role, content, thinking, images, videos, tool_calls: toolCalls }) {
+  const reasoning = role === "assistant" && thinking != null ? { reasoning_content: thinking } : {};
   if (role === "tool") {
     return { role: "tool", content: content ?? "" };
   }
@@ -67,6 +69,7 @@ export function toOpenAiMessage({ role, content, images, videos, tool_calls: too
     return {
       role: "assistant",
       content: content ? content : null,
+      ...reasoning,
       tool_calls: toolCalls.map((call, index) => ({
         id: call.id ?? `call_${index}`,
         type: "function",
@@ -90,9 +93,9 @@ export function toOpenAiMessage({ role, content, images, videos, tool_calls: too
       });
     }
     if (content) parts.push({ type: "text", text: content });
-    return { role, content: parts };
+    return { role, content: parts, ...reasoning };
   }
-  return { role, content };
+  return { role, content, ...reasoning };
 }
 
 /// Extract the plain-text content of an in-app message for Copy/Rewind (sc-8147). `content` is
@@ -121,6 +124,7 @@ export function chatRequestBody({ engineStatus, messages, params, thinkingCapabl
     model: engineStatus?.loaded?.name ?? "chatworks",
     messages: requestMessages,
     stream: true,
+    ...generationOverrides(params, engineStatus?.loaded?.provider?.capabilities),
   };
   const temperature = parseNumber(params.temperature);
   const topP = parseNumber(params.topP);

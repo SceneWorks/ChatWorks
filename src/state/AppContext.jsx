@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { DEFAULT_ACCENT, Icon } from "@sceneworks/ui";
+import { generationParams } from "./generation.js";
 
 export const AppContext = createContext(null);
 
@@ -149,5 +150,6 @@ export function paramsFromSettings(sampling) {
     topP: String(sampling.topP ?? ""),
     maxTokens: String(sampling.maxTokens ?? ""),
     disableThinking: Boolean(sampling.disableThinking),
+    ...generationParams(sampling),
   };
 }

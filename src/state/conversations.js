@@ -1,4 +1,5 @@
-import { parseNumber } from "../media/image";
+import { parseNumber } from "../media/image.js";
+import { generationParams, generationSettings } from "./generation.js";
 
 /// Cap for frontend-derived conversation titles. Matches the backend preview cap
 /// (conversations.rs `PREVIEW_MAX_CHARS`) so a frontend-derived title and the server-derived
@@ -16,6 +17,7 @@ export function paramsToConversation(params) {
     topP: parseNumber(params.topP) ?? 0,
     maxTokens: parseNumber(params.maxTokens) ?? 0,
     disableThinking: Boolean(params.disableThinking),
+    ...generationSettings(params),
   };
 }
 
@@ -30,6 +32,7 @@ export function paramsFromConversation(params) {
     topP: String(p.topP ?? ""),
     maxTokens: String(p.maxTokens ?? ""),
     disableThinking: Boolean(p.disableThinking),
+    ...generationParams(p),
   };
 }
 
