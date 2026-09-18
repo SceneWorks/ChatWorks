@@ -38,6 +38,20 @@ impl AppSettings {
         if self.sampling.max_tokens == 0 {
             return Err("max tokens must be at least 1".to_string());
         }
+        if !matches!(self.sampling.mtp_mode.as_str(), "off" | "auto" | "enabled") {
+            return Err("mtp mode must be off, auto, or enabled".to_string());
+        }
+        if !matches!(self.sampling.reasoning_effort.as_deref(), None | Some("low" | "medium" | "xhigh")) {
+            return Err("reasoning effort must be low, medium, or xhigh".to_string());
+        }
+        if self.sampling.mtp_draft_tokens == 0 {
+            return Err("MTP draft tokens must be at least 1".to_string());
+        }
+        if let Some(penalty) = self.sampling.repetition_penalty {
+            if penalty <= 0.0 || !penalty.is_finite() {
+                return Err("repetition penalty must be finite and greater than 0".to_string());
+            }
+        }
         Ok(self)
     }
 }
@@ -79,6 +93,22 @@ pub struct SamplingDefaults {
     pub max_tokens: u32,
     #[serde(default = "default_disable_thinking")]
     pub disable_thinking: bool,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub preserve_thinking: Option<bool>,
+    #[serde(default = "default_mtp_mode")]
+    pub mtp_mode: String,
+    #[serde(default = "default_mtp_draft_tokens")]
+    pub mtp_draft_tokens: u32,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub repetition_context: Option<usize>,
+    #[serde(default)]
+    pub seed: Option<u64>,
 }
 
 impl Default for SamplingDefaults {
@@ -89,6 +119,14 @@ impl Default for SamplingDefaults {
             top_p: default_top_p(),
             max_tokens: default_max_tokens(),
             disable_thinking: default_disable_thinking(),
+            reasoning_effort: None,
+            preserve_thinking: None,
+            mtp_mode: default_mtp_mode(),
+            mtp_draft_tokens: default_mtp_draft_tokens(),
+            top_k: None,
+            repetition_penalty: None,
+            repetition_context: None,
+            seed: None,
         }
     }
 }
@@ -183,6 +221,12 @@ fn default_max_tokens() -> u32 {
 fn default_disable_thinking() -> bool {
     true
 }
+fn default_mtp_mode() -> String {
+    "off".to_string()
+}
+fn default_mtp_draft_tokens() -> u32 {
+    3
+}
 
 #[cfg(test)]
 mod tests {
@@ -205,6 +249,17 @@ mod tests {
 
         assert_eq!(settings.server.host, "127.0.0.1");
         assert_eq!(settings.sampling.system_prompt, "hello");
+    }
+
+    #[test]
+    fn generation_defaults_round_trip_with_safe_mtp_defaults() {
+        let defaults = SamplingDefaults::default();
+        assert_eq!(defaults.mtp_mode, "off");
+        assert_eq!(defaults.mtp_draft_tokens, 3);
+        assert!(defaults.reasoning_effort.is_none());
+        let decoded: SamplingDefaults = serde_json::from_str("{}").unwrap();
+        assert_eq!(decoded.mtp_mode, "off");
+        assert_eq!(decoded.mtp_draft_tokens, 3);
     }
 
     #[test]

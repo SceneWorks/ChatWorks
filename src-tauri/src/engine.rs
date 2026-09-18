@@ -3,9 +3,10 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use crate::core_llm::{
-    CancelFlag, Channel, Content, FinishReason, ImageRef, LoadSpec, Message, Quantize, Role,
-    Sampling, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest,
-    ThinkingMode, ToolCall, ToolSpec, Usage, VideoRef,
+    CancelFlag, Channel, Constraint, FinishReason, ImageRef, LoadSpec, Message, MtpCapabilities,
+    MtpMode, MtpStats, Quantize, ReasoningEffort, Role, Sampling, StreamEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest, ThinkingMode, ToolCall, ToolSpec,
+    Usage, VideoRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -236,6 +237,7 @@ impl EngineActor {
                 .map(finish_reason_name)
                 .unwrap_or("unknown")
                 .to_string(),
+            mtp: output.mtp.map(MtpStatsPayload::from),
         })
     }
 
@@ -309,6 +311,23 @@ pub struct GenerateRequest {
     pub stop: Vec<String>,
     #[serde(default)]
     pub thinking: ThinkingRequest,
+    /// Explicit `enable_thinking` template kwarg. Kept separate from the legacy
+    /// `disable_thinking` wire flag so contradictory requests fail at the boundary.
+    #[serde(default)]
+    pub enable_thinking: Option<bool>,
+    /// Backwards-compatible no-think flag used by existing ChatWorks clients.
+    #[serde(default)]
+    pub disable_thinking: Option<bool>,
+    /// Qwen3.8's typed reasoning budget; rejected downstream unless the loaded provider
+    /// explicitly advertises this Qwen-specific control.
+    #[serde(default)]
+    pub reasoning_effort: Option<ReasoningEffortRequest>,
+    #[serde(default)]
+    pub preserve_thinking: Option<bool>,
+    #[serde(default)]
+    pub mtp: MtpRequest,
+    #[serde(default)]
+    pub constraint: Option<ConstraintRequest>,
     /// Tools / functions offered to the model. Rendered into the prompt by the chat template and used
     /// to type-coerce the model's parsed tool calls. Honored only by providers advertising
     /// `supports_tools`; a non-empty `tools` on a provider without it is rejected by the provider's
@@ -335,8 +354,11 @@ impl GenerateRequest {
             // the engine boundary (code-review F-014).
             max_new_tokens: self.max_new_tokens,
             seed: self.seed,
-            constraint: None,
-            thinking: self.thinking.into(),
+            constraint: self.constraint.map(ConstraintRequest::into_core),
+            thinking: resolve_thinking(self.thinking, self.enable_thinking, self.disable_thinking)?,
+            reasoning_effort: self.reasoning_effort.map(ReasoningEffortRequest::into_core),
+            preserve_thinking: self.preserve_thinking,
+            mtp: self.mtp.into_core()?,
             tools: self
                 .tools
                 .into_iter()
@@ -422,6 +444,86 @@ impl From<ThinkingRequest> for ThinkingMode {
     }
 }
 
+fn resolve_thinking(
+    thinking: ThinkingRequest,
+    enable_thinking: Option<bool>,
+    disable_thinking: Option<bool>,
+) -> EngineResult<ThinkingMode> {
+    if enable_thinking == Some(true) && disable_thinking == Some(true) {
+        return Err("enable_thinking=true conflicts with disable_thinking=true".to_string());
+    }
+    if enable_thinking.is_some() && !matches!(thinking, ThinkingRequest::Auto) {
+        return Err("enable_thinking cannot be combined with thinking".to_string());
+    }
+    if disable_thinking.is_some() && !matches!(thinking, ThinkingRequest::Auto) {
+        return Err("disable_thinking cannot be combined with thinking".to_string());
+    }
+    if let Some(enabled) = enable_thinking {
+        return Ok(if enabled {
+            ThinkingMode::Enabled
+        } else {
+            ThinkingMode::Disabled
+        });
+    }
+    if disable_thinking.unwrap_or(false) {
+        return Ok(ThinkingMode::Disabled);
+    }
+    Ok(thinking.into())
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffortRequest {
+    Low,
+    Medium,
+    Xhigh,
+}
+impl ReasoningEffortRequest {
+    fn into_core(self) -> ReasoningEffort {
+        match self {
+            Self::Low => ReasoningEffort::Low,
+            Self::Medium => ReasoningEffort::Medium,
+            Self::Xhigh => ReasoningEffort::XHigh,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum MtpRequest {
+    #[default]
+    Off,
+    Auto,
+    Enabled {
+        draft_tokens: u32,
+    },
+}
+impl MtpRequest {
+    fn into_core(self) -> EngineResult<MtpMode> {
+        match self {
+            Self::Off => Ok(MtpMode::Off),
+            Self::Auto => Ok(MtpMode::Auto),
+            Self::Enabled { draft_tokens: 0 } => {
+                Err("mtp.draft_tokens must be at least 1".to_string())
+            }
+            Self::Enabled { draft_tokens } => Ok(MtpMode::Enabled { draft_tokens }),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConstraintRequest {
+    Json,
+}
+impl ConstraintRequest {
+    fn into_core(self) -> Constraint {
+        match self {
+            Self::Json => Constraint::Json,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GenerateMessage {
     pub role: String,
@@ -440,6 +542,9 @@ pub struct GenerateMessage {
     /// non-tool turns.
     #[serde(default)]
     pub tool_calls: Vec<GenerateToolCall>,
+    /// Preserved assistant reasoning, accepted from OpenAI's `reasoning_content` history field.
+    #[serde(default, alias = "reasoning_content")]
+    pub thinking: Option<String>,
 }
 
 /// A sampled video attachment: ordered frame image data URLs + per-frame timestamps (seconds). The
@@ -490,7 +595,7 @@ impl GenerateMessage {
         Ok(Message {
             role: role_from_str(&self.role)?,
             content,
-            thinking: None,
+            thinking: self.thinking,
             tool_calls: self
                 .tool_calls
                 .into_iter()
@@ -653,7 +758,10 @@ pub struct CapabilitySummary {
     /// video attach affordance.
     pub supports_video: bool,
     pub supports_thinking: bool,
+    pub supports_reasoning_effort: bool,
+    pub supports_preserve_thinking: bool,
     pub supports_tools: bool,
+    pub mtp: Option<MtpCapabilitiesPayload>,
     pub supported_constraints: Vec<String>,
 }
 
@@ -666,12 +774,45 @@ impl From<TextLlmCapabilities> for CapabilitySummary {
             supports_vision: value.supports_vision,
             supports_video: value.supports_video,
             supports_thinking: value.supports_thinking,
+            supports_reasoning_effort: value.supports_reasoning_effort,
+            supports_preserve_thinking: value.supports_preserve_thinking,
             supports_tools: value.supports_tools,
+            mtp: value.mtp.map(MtpCapabilitiesPayload::from),
             supported_constraints: value
                 .supported_constraints
                 .into_iter()
                 .map(|constraint| format!("{constraint:?}"))
                 .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MtpCapabilitiesPayload {
+    pub max_draft_tokens: u32,
+    pub recommended_draft_tokens: u32,
+}
+impl From<MtpCapabilities> for MtpCapabilitiesPayload {
+    fn from(value: MtpCapabilities) -> Self {
+        Self {
+            max_draft_tokens: value.max_draft_tokens,
+            recommended_draft_tokens: value.recommended_draft_tokens,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MtpStatsPayload {
+    pub proposed_tokens: u32,
+    pub accepted_tokens: u32,
+    pub target_forwards: u32,
+}
+impl From<MtpStats> for MtpStatsPayload {
+    fn from(value: MtpStats) -> Self {
+        Self {
+            proposed_tokens: value.proposed_tokens,
+            accepted_tokens: value.accepted_tokens,
+            target_forwards: value.target_forwards,
         }
     }
 }
@@ -684,6 +825,8 @@ pub struct GenerateResponse {
     pub tool_calls: Vec<GenerateToolCall>,
     pub usage: UsagePayload,
     pub finish_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtp: Option<MtpStatsPayload>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -806,12 +949,19 @@ mod tests {
                         images: Vec::new(),
                         videos: Vec::new(),
                         tool_calls: Vec::new(),
+                        thinking: None,
                     }],
                     sampling: SamplingRequest::default(),
                     max_new_tokens: 8,
                     seed: None,
                     stop: Vec::new(),
                     thinking: ThinkingRequest::Auto,
+                    enable_thinking: None,
+                    disable_thinking: None,
+                    reasoning_effort: None,
+                    preserve_thinking: None,
+                    mtp: MtpRequest::Off,
+                    constraint: None,
                     tools: Vec::new(),
                 },
                 |event| events.push(event),
@@ -838,12 +988,19 @@ mod tests {
                     images: Vec::new(),
                     videos: Vec::new(),
                     tool_calls: Vec::new(),
+                    thinking: None,
                 }],
                 sampling: SamplingRequest::default(),
                 max_new_tokens: 8,
                 seed: None,
                 stop: Vec::new(),
                 thinking: ThinkingRequest::Auto,
+                enable_thinking: None,
+                disable_thinking: None,
+                reasoning_effort: None,
+                preserve_thinking: None,
+                mtp: MtpRequest::Off,
+                constraint: None,
                 tools: Vec::new(),
             },
             |_| {},
@@ -868,12 +1025,19 @@ mod tests {
                 images: Vec::new(),
                 videos: vec![GenerateVideo { frames, timestamps }],
                 tool_calls: Vec::new(),
+                thinking: None,
             }],
             sampling: SamplingRequest::default(),
             max_new_tokens: 8,
             seed: None,
             stop: Vec::new(),
             thinking: ThinkingRequest::Auto,
+            enable_thinking: None,
+            disable_thinking: None,
+            reasoning_effort: None,
+            preserve_thinking: None,
+            mtp: MtpRequest::Off,
+            constraint: None,
             tools: Vec::new(),
         };
         let engine = EngineHandle::spawn_with_loader(fake_loader);
@@ -889,6 +1053,22 @@ mod tests {
             err.contains("frames") && err.contains("per-video limit"),
             "expected a per-video frame-cap error, got: {err}"
         );
+    }
+
+    #[test]
+    fn qwen_controls_and_conflicts_are_typed_at_request_boundary() {
+        assert!(matches!(
+            resolve_thinking(ThinkingRequest::Auto, Some(true), Some(true)),
+            Err(message) if message.contains("conflicts")
+        ));
+        assert!(matches!(
+            MtpRequest::Enabled { draft_tokens: 0 }.into_core(),
+            Err(message) if message.contains("draft_tokens")
+        ));
+        assert!(matches!(
+            MtpRequest::Enabled { draft_tokens: 3 }.into_core(),
+            Ok(MtpMode::Enabled { draft_tokens: 3 })
+        ));
     }
 
     /// cancel() returns false when nothing is in flight and true once a generation's flag is
@@ -916,12 +1096,19 @@ mod tests {
                         images: Vec::new(),
                         videos: Vec::new(),
                         tool_calls: Vec::new(),
+                        thinking: None,
                     }],
                     sampling: SamplingRequest::default(),
                     max_new_tokens: 8,
                     seed: None,
                     stop: Vec::new(),
                     thinking: ThinkingRequest::Auto,
+                    enable_thinking: None,
+                    disable_thinking: None,
+                    reasoning_effort: None,
+                    preserve_thinking: None,
+                    mtp: MtpRequest::Off,
+                    constraint: None,
                     tools: Vec::new(),
                 },
                 |_| {},

@@ -17,9 +17,10 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::app_settings::SamplingDefaults;
 use crate::engine::{
-    EngineHandle, GenerateMessage, GenerateRequest, GenerateResponse, GenerateTool,
-    GenerateToolCall, GenerateVideo, LoadedModelStatus, SamplingRequest, StreamChannel,
-    StreamPayload, ThinkingRequest, UsagePayload,
+    ConstraintRequest, EngineHandle, GenerateMessage, GenerateRequest, GenerateResponse,
+    GenerateTool, GenerateToolCall, GenerateVideo, LoadedModelStatus, MtpRequest,
+    ReasoningEffortRequest, SamplingRequest, StreamChannel, StreamPayload, ThinkingRequest,
+    UsagePayload,
 };
 use crate::fsutil::{now_nanos, now_secs};
 
@@ -683,6 +684,12 @@ struct OpenAiChatRequest {
     #[serde(default)]
     top_p: Option<f32>,
     #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    repetition_penalty: Option<f32>,
+    #[serde(default)]
+    repetition_context: Option<usize>,
+    #[serde(default)]
     max_tokens: Option<u32>,
     #[serde(default)]
     max_completion_tokens: Option<u32>,
@@ -692,6 +699,16 @@ struct OpenAiChatRequest {
     stop: Option<StopValue>,
     #[serde(default)]
     disable_thinking: Option<bool>,
+    #[serde(default)]
+    enable_thinking: Option<bool>,
+    #[serde(default)]
+    reasoning_effort: Option<ReasoningEffortRequest>,
+    #[serde(default)]
+    preserve_thinking: Option<bool>,
+    #[serde(default)]
+    mtp: Option<MtpRequest>,
+    #[serde(default)]
+    response_format: Option<OpenAiResponseFormat>,
     /// Tools / functions offered to the model, in the OpenAI function-tool shape
     /// (`{"type":"function","function":{"name","description","parameters"}}`). Threaded to the
     /// provider, which rejects them with a 400 if it does not advertise tool support.
@@ -723,6 +740,7 @@ impl OpenAiChatRequest {
                 images: Vec::new(),
                 videos: Vec::new(),
                 tool_calls: Vec::new(),
+                thinking: None,
             });
         }
         for message in self.messages {
@@ -740,23 +758,67 @@ impl OpenAiChatRequest {
             sampling: SamplingRequest {
                 temperature: Some(self.temperature.unwrap_or(defaults.temperature)),
                 top_p: Some(self.top_p.unwrap_or(defaults.top_p)),
-                top_k: None,
-                repetition_penalty: None,
-                repetition_context: None,
+                top_k: self.top_k.or(defaults.top_k),
+                repetition_penalty: self.repetition_penalty.or(defaults.repetition_penalty),
+                repetition_context: self.repetition_context.or(defaults.repetition_context),
             },
             max_new_tokens: self
                 .max_completion_tokens
                 .or(self.max_tokens)
                 .unwrap_or(defaults.max_tokens),
-            seed: self.seed,
+            seed: self.seed.or(defaults.seed),
             stop: self.stop.map(StopValue::into_vec).unwrap_or_default(),
-            thinking: if disable_thinking {
-                ThinkingRequest::Disabled
-            } else {
-                ThinkingRequest::Auto
-            },
+            thinking: ThinkingRequest::Auto,
+            enable_thinking: self.enable_thinking,
+            disable_thinking: Some(disable_thinking),
+            reasoning_effort: self.reasoning_effort.or_else(|| {
+                defaults
+                    .reasoning_effort
+                    .as_deref()
+                    .and_then(parse_reasoning_effort)
+            }),
+            preserve_thinking: self.preserve_thinking.or(defaults.preserve_thinking),
+            mtp: self.mtp.unwrap_or_else(|| mtp_from_defaults(defaults)),
+            constraint: response_format_constraint(self.response_format)?,
             tools,
         })
+    }
+}
+
+fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffortRequest> {
+    match value {
+        "low" => Some(ReasoningEffortRequest::Low),
+        "medium" => Some(ReasoningEffortRequest::Medium),
+        "xhigh" => Some(ReasoningEffortRequest::Xhigh),
+        _ => None,
+    }
+}
+
+fn mtp_from_defaults(defaults: &SamplingDefaults) -> MtpRequest {
+    match defaults.mtp_mode.as_str() {
+        "auto" => MtpRequest::Auto,
+        "enabled" => MtpRequest::Enabled {
+            draft_tokens: defaults.mtp_draft_tokens,
+        },
+        _ => MtpRequest::Off,
+    }
+}
+
+#[derive(Deserialize)]
+struct OpenAiResponseFormat {
+    #[serde(rename = "type")]
+    kind: String,
+}
+fn response_format_constraint(
+    format: Option<OpenAiResponseFormat>,
+) -> Result<Option<ConstraintRequest>, ApiError> {
+    match format.map(|value| value.kind) {
+        None => Ok(None),
+        Some(value) if value == "text" => Ok(None),
+        Some(value) if value == "json_object" => Ok(Some(ConstraintRequest::Json)),
+        Some(value) => Err(ApiError::bad_request(format!(
+            "unsupported response_format type '{value}' (only json_object is supported)"
+        ))),
     }
 }
 
@@ -808,6 +870,8 @@ struct OpenAiChatMessage {
     content: Option<OpenAiMessageContent>,
     #[serde(default)]
     tool_calls: Vec<OpenAiToolCall>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 impl OpenAiChatMessage {
@@ -826,6 +890,7 @@ impl OpenAiChatMessage {
                 .into_iter()
                 .map(OpenAiToolCall::into_generate)
                 .collect::<Result<Vec<_>, _>>()?,
+            thinking: self.reasoning_content,
         })
     }
 }
@@ -936,7 +1001,10 @@ impl OpenAiMessageContent {
                                     (0..n).map(|i| i as f32 / fps).collect()
                                 }
                             };
-                            videos.push(GenerateVideo { frames: video.frames, timestamps });
+                            videos.push(GenerateVideo {
+                                frames: video.frames,
+                                timestamps,
+                            });
                         }
                         other => {
                             return Err(ApiError::bad_request(format!(
@@ -1376,6 +1444,42 @@ mod tests {
         assert!(matches!(generate.thinking, ThinkingRequest::Auto));
     }
 
+    #[test]
+    fn maps_native_qwen_controls_and_preserves_reasoning_history() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "assistant", "content": "answer", "reasoning_content": "trace"}],
+            "top_k": 12, "repetition_penalty": 1.1, "repetition_context": 32,
+            "reasoning_effort": "low", "preserve_thinking": true,
+            "mtp": {"mode": "enabled", "draft_tokens": 3},
+            "response_format": {"type": "json_object"}
+        })).unwrap();
+        let generate = request.into_generate(&test_sampling_defaults()).unwrap();
+        assert_eq!(generate.messages[0].thinking.as_deref(), Some("trace"));
+        assert_eq!(generate.sampling.top_k, Some(12));
+        assert_eq!(generate.sampling.repetition_penalty, Some(1.1));
+        assert_eq!(generate.sampling.repetition_context, Some(32));
+        assert!(matches!(generate.reasoning_effort, Some(ReasoningEffortRequest::Low)));
+        assert_eq!(generate.preserve_thinking, Some(true));
+        assert!(matches!(generate.mtp, MtpRequest::Enabled { draft_tokens: 3 }));
+        assert!(matches!(generate.constraint, Some(ConstraintRequest::Json)));
+    }
+
+    #[test]
+    fn rejects_contradictory_thinking_flags_and_unknown_response_format() {
+        let conflict: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "enable_thinking": true, "disable_thinking": true
+        })).unwrap();
+        let generated = conflict.into_generate(&test_sampling_defaults()).unwrap();
+        assert_eq!(generated.enable_thinking, Some(true));
+        assert_eq!(generated.disable_thinking, Some(true));
+        let unsupported: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "response_format": {"type": "json_schema"}
+        })).unwrap();
+        assert!(unsupported.into_generate(&test_sampling_defaults()).is_err());
+    }
+
     /// A `video_url` content part with pre-sampled frames + explicit timestamps parses into a
     /// `GenerateVideo` carrying the frames and timestamps verbatim, alongside the text (sc-8081).
     #[test]
@@ -1392,7 +1496,10 @@ mod tests {
             "max_tokens": 8
         }))
         .unwrap();
-        let defaults = SamplingDefaults { system_prompt: String::new(), ..Default::default() };
+        let defaults = SamplingDefaults {
+            system_prompt: String::new(),
+            ..Default::default()
+        };
         let generate = request.into_generate(&defaults).unwrap();
         let msg = &generate.messages[0];
         assert_eq!(msg.content, "what happens");
@@ -1418,9 +1525,15 @@ mod tests {
             "max_tokens": 8
         }))
         .unwrap();
-        let defaults = SamplingDefaults { system_prompt: String::new(), ..Default::default() };
+        let defaults = SamplingDefaults {
+            system_prompt: String::new(),
+            ..Default::default()
+        };
         let generate = request.into_generate(&defaults).unwrap();
-        assert_eq!(generate.messages[0].videos[0].timestamps, vec![0.0, 0.5, 1.0, 1.5]);
+        assert_eq!(
+            generate.messages[0].videos[0].timestamps,
+            vec![0.0, 0.5, 1.0, 1.5]
+        );
     }
 
     /// A `video_url` part with no frames is a 400, and a timestamp/frame-count mismatch is a 400.
@@ -1443,7 +1556,9 @@ mod tests {
             ]}]
         }))
         .unwrap();
-        assert!(mismatched.into_generate(&SamplingDefaults::default()).is_err());
+        assert!(mismatched
+            .into_generate(&SamplingDefaults::default())
+            .is_err());
     }
 
     #[test]
@@ -1661,7 +1776,9 @@ mod tests {
             None,
         );
         // Loopback (allow_lan=false) omits the CORS allow-origin header (code-review F-003).
-        assert!(!response.to_ascii_lowercase().contains("access-control-allow-origin"));
+        assert!(!response
+            .to_ascii_lowercase()
+            .contains("access-control-allow-origin"));
         assert!(response.contains("data: {\"id\":\"chatcmpl-"));
         assert!(response.contains("\"reasoning_content\":\"reason\""));
         assert!(response.contains("\"content\":\"ok\""));
@@ -1715,10 +1832,13 @@ mod tests {
             )
             .unwrap();
         let addr = status.bound_addr.unwrap();
-        let response = http_options_with_origin(&addr, "/v1/chat/completions", "http://evil.example");
+        let response =
+            http_options_with_origin(&addr, "/v1/chat/completions", "http://evil.example");
         assert!(response.starts_with("HTTP/1.1 204 No Content"));
         assert!(
-            !response.to_ascii_lowercase().contains("access-control-allow-origin"),
+            !response
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
             "loopback must not grant a non-webview origin: {response}"
         );
         server.stop().unwrap();
@@ -1742,7 +1862,8 @@ mod tests {
             .unwrap();
         let addr = status.bound_addr.unwrap();
         // The Vite dev webview origin.
-        let response = http_options_with_origin(&addr, "/v1/chat/completions", "http://127.0.0.1:5173");
+        let response =
+            http_options_with_origin(&addr, "/v1/chat/completions", "http://127.0.0.1:5173");
         assert!(response.starts_with("HTTP/1.1 204 No Content"));
         assert!(response.contains("access-control-allow-origin: http://127.0.0.1:5173"));
         assert!(response.contains("access-control-allow-methods: GET, POST, OPTIONS"));
@@ -1771,7 +1892,8 @@ mod tests {
             )
             .unwrap();
         let addr = status.bound_addr.unwrap();
-        let response = http_options_with_origin(&addr, "/v1/chat/completions", "http://evil.example");
+        let response =
+            http_options_with_origin(&addr, "/v1/chat/completions", "http://evil.example");
         assert!(response.starts_with("HTTP/1.1 204 No Content"));
         assert!(response.contains("access-control-allow-origin: *"));
         assert!(response.to_ascii_lowercase().contains("vary: origin"));

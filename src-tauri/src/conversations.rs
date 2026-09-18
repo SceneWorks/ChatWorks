@@ -17,9 +17,12 @@ const PREVIEW_MAX_CHARS: usize = 80;
 const META_SUFFIX: &str = ".meta";
 const JSON_SUFFIX: &str = ".json";
 
+fn default_mtp_mode() -> String { "off".to_string() }
+fn default_mtp_draft_tokens() -> u32 { 3 }
+
 /// Per-conversation sampling overrides. Mirrors the in-app sampling defaults shape so a
 /// conversation carries the exact params it was run with and round-trips untouched.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationParams {
     #[serde(default)]
@@ -32,6 +35,33 @@ pub struct ConversationParams {
     pub max_tokens: u32,
     #[serde(default)]
     pub disable_thinking: bool,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub preserve_thinking: Option<bool>,
+    #[serde(default = "default_mtp_mode")]
+    pub mtp_mode: String,
+    #[serde(default = "default_mtp_draft_tokens")]
+    pub mtp_draft_tokens: u32,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub repetition_context: Option<usize>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+}
+
+impl Default for ConversationParams {
+    fn default() -> Self {
+        Self {
+            system_prompt: String::new(), temperature: 0.0, top_p: 0.0, max_tokens: 0,
+            disable_thinking: false, reasoning_effort: None, preserve_thinking: None,
+            mtp_mode: default_mtp_mode(), mtp_draft_tokens: default_mtp_draft_tokens(),
+            top_k: None, repetition_penalty: None, repetition_context: None, seed: None,
+        }
+    }
 }
 
 /// Full conversation transcript + params. `messages` is kept as a flexible
