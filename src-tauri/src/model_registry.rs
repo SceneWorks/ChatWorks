@@ -62,6 +62,15 @@ pub struct ModelEntry {
     pub file_count: usize,
     #[serde(default)]
     pub size_bytes: Option<u64>,
+    /// Immutable source encoding recognized by the linked runtime loader.
+    #[serde(default = "default_model_format")]
+    pub format: String,
+    /// Native packed family label, populated only from required pack sidecars (never config naming).
+    #[serde(default)]
+    pub pack: Option<String>,
+    /// Weightless loader route selected by `can_load` for this exact snapshot.
+    #[serde(default)]
+    pub provider_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -87,6 +96,8 @@ pub struct CachedModelCandidate {
     pub provider_id: String,
     pub provider_family: String,
     pub supports_vision: bool,
+    pub format: String,
+    pub pack: Option<String>,
     pub file_count: usize,
     pub size_bytes: Option<u64>,
 }
@@ -166,6 +177,9 @@ pub fn adopt_cached_hf_model(
         imported_at: now_secs(),
         file_count: candidate.file_count,
         size_bytes: candidate.size_bytes,
+        format: candidate.format,
+        pack: candidate.pack,
+        provider_id: Some(candidate.provider_id),
     };
     let manifest = registry_path(app)?;
     let mut registry = read_registry(&manifest)?;
@@ -211,7 +225,12 @@ pub fn load_registered_model(
         .find(|model| model.id == model_id)
         .cloned()
         .ok_or_else(|| format!("model {model_id:?} is not in the registry"))?;
-    validate_snapshot(Path::new(&entry.local_path))?;
+    let snapshot = Path::new(&entry.local_path);
+    validate_snapshot(snapshot)?;
+    recognized_snapshot_format(snapshot)?;
+    if matching_provider(snapshot)?.is_none() {
+        return Err("registered snapshot is no longer supported by the linked inference providers".to_string());
+    }
     let status = engine.load_model(LoadModelRequest {
         source: entry.local_path.clone(),
         display_name: Some(entry.name.clone()),
@@ -328,6 +347,9 @@ async fn import_hf_model_inner(
         },
     );
     validate_snapshot(&snapshot_dir)?;
+    let provider = matching_provider(&snapshot_dir)?
+        .ok_or_else(|| "downloaded snapshot is not supported by the linked inference providers".to_string())?;
+    let (format, pack) = recognized_snapshot_format(&snapshot_dir)?;
 
     let mut registry = read_registry(&manifest)?;
     let entry = ModelEntry {
@@ -341,6 +363,9 @@ async fn import_hf_model_inner(
         imported_at: now_secs(),
         file_count: files.len(),
         size_bytes: total_bytes,
+        format,
+        pack,
+        provider_id: Some(provider.id),
     };
     upsert_model(&mut registry, entry);
     write_registry(&manifest, &registry)?;
@@ -530,8 +555,24 @@ fn is_loadable_model_file(name: &str) -> bool {
         || name == "tokenizer_config.json"
         || name == "special_tokens_map.json"
         || name == "generation_config.json"
+        || name == "hadamard.json"
+        || name == "PACK-RUNTIME"
         || name.ends_with(".safetensors")
         || name.ends_with(".safetensors.index.json")
+}
+
+fn default_model_format() -> String { "hf-safetensors".to_string() }
+
+/// Labels a Prism/Bonsai pack only when its immutable pack sidecars are present. Model config
+/// strings remain insufficient: the linked loader's `can_load` decides support separately.
+fn recognized_snapshot_format(path: &Path) -> Result<(String, Option<String>), String> {
+    let hadamard = path.join("hadamard.json").is_file();
+    let runtime = path.join("PACK-RUNTIME").is_file();
+    match (hadamard, runtime) {
+        (false, false) => Ok((default_model_format(), None)),
+        (true, true) => Ok(("hf-safetensors".to_string(), Some("bonsai2-packed".to_string()))),
+        _ => Err("Prism/Bonsai snapshot has incomplete packing sidecars (need hadamard.json and PACK-RUNTIME)".to_string()),
+    }
 }
 
 fn validate_hf_file_name(name: &str) -> Result<(), String> {
@@ -613,6 +654,7 @@ fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, S
     let model_ref = HfModelRef { repo, revision };
     let file_count = snapshot_file_count(path)?;
     let size_bytes = snapshot_size_bytes(path);
+    let (format, pack) = recognized_snapshot_format(path)?;
     Ok(Some(CachedModelCandidate {
         id: model_id(&model_ref, None),
         name: model_name(&model_ref, None),
@@ -627,6 +669,8 @@ fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, S
         supports_vision: provider.capabilities.supports_vision
             || is_qwen35_vision_snapshot(path)?
             || is_qwen3vl_vision_snapshot(path)?,
+        format,
+        pack,
         file_count,
         size_bytes,
     }))
@@ -961,6 +1005,18 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_only_complete_bonsai_packing_sidecars() {
+        let dir = snapshot_dir("bonsai-sidecars");
+        assert_eq!(recognized_snapshot_format(dir.path()).unwrap(), ("hf-safetensors".to_string(), None));
+        write_snapshot_file(&dir, "hadamard.json", "{}");
+        assert!(recognized_snapshot_format(dir.path()).is_err());
+        write_snapshot_file(&dir, "PACK-RUNTIME", "ptq1");
+        assert_eq!(recognized_snapshot_format(dir.path()).unwrap().1.as_deref(), Some("bonsai2-packed"));
+        assert!(is_loadable_model_file("hadamard.json"));
+        assert!(is_loadable_model_file("PACK-RUNTIME"));
+    }
+
+    #[test]
     fn rejects_unsafe_hf_file_names() {
         assert!(validate_hf_file_name("model.safetensors").is_ok());
         assert!(validate_hf_file_name("subdir/model.safetensors").is_ok());
@@ -1224,6 +1280,9 @@ mod tests {
                 imported_at: 1,
                 file_count: 3,
                 size_bytes: Some(10),
+                format: default_model_format(),
+                pack: None,
+                provider_id: None,
             },
         );
         upsert_model(
@@ -1239,6 +1298,9 @@ mod tests {
                 imported_at: 2,
                 file_count: 4,
                 size_bytes: Some(20),
+                format: default_model_format(),
+                pack: None,
+                provider_id: None,
             },
         );
         assert_eq!(registry.models.len(), 1);
