@@ -1076,6 +1076,12 @@ struct OpenAiChatResponse {
     model: String,
     choices: Vec<OpenAiChatChoice>,
     usage: OpenAiUsage,
+    /// ChatWorks extension: native MTP counters, absent when ordinary autoregressive decode ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chatworks_mtp: Option<crate::engine::MtpStatsPayload>,
+    /// ChatWorks extension: synchronized backend phase timings, absent when unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chatworks_timings: Option<crate::engine::GenerationTimingsPayload>,
 }
 
 impl OpenAiChatResponse {
@@ -1086,7 +1092,8 @@ impl OpenAiChatResponse {
             tool_calls,
             usage,
             finish_reason,
-            ..
+            mtp,
+            timings,
         } = response;
         let has_tool_calls = !tool_calls.is_empty();
         // A tool-call turn finishes with `tool_calls`, overriding the engine's stop/length reason.
@@ -1119,6 +1126,8 @@ impl OpenAiChatResponse {
                 finish_reason: Some(finish_reason),
             }],
             usage: OpenAiUsage::from(usage),
+            chatworks_mtp: mtp,
+            chatworks_timings: timings,
         }
     }
 }
@@ -1413,6 +1422,20 @@ mod tests {
             validate_config(&config).unwrap(),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), DEFAULT_OPENAI_PORT)
         );
+    }
+
+    #[test]
+    fn non_streaming_response_preserves_native_telemetry() {
+        let response = OpenAiChatResponse::from_generate("test".to_string(), GenerateResponse {
+            text: "ok".to_string(), thinking: None, tool_calls: Vec::new(),
+            usage: crate::engine::UsagePayload { prompt_tokens: 1, generated_tokens: 1, total_tokens: 2 },
+            finish_reason: "stop".to_string(),
+            mtp: Some(crate::engine::MtpStatsPayload { proposed_tokens: 4, accepted_tokens: 3, target_forwards: 2 }),
+            timings: Some(crate::engine::GenerationTimingsPayload { prefill_ms: 12, decode_ms: 34 }),
+        });
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["chatworks_mtp"]["accepted_tokens"], 3);
+        assert_eq!(json["chatworks_timings"]["prefill_ms"], 12);
     }
 
     #[test]
