@@ -1086,6 +1086,7 @@ impl OpenAiChatResponse {
             tool_calls,
             usage,
             finish_reason,
+            ..
         } = response;
         let has_tool_calls = !tool_calls.is_empty();
         // A tool-call turn finishes with `tool_calls`, overriding the engine's stop/length reason.
@@ -1574,6 +1575,7 @@ mod tests {
             top_p: 0.8,
             max_tokens: 64,
             disable_thinking: true,
+            ..Default::default()
         };
         let generate = request.into_generate(&defaults).unwrap();
         assert_eq!(generate.messages.len(), 2);
@@ -1582,7 +1584,8 @@ mod tests {
         assert_eq!(generate.sampling.temperature, Some(0.3));
         assert_eq!(generate.sampling.top_p, Some(0.8));
         assert_eq!(generate.max_new_tokens, 64);
-        assert!(matches!(generate.thinking, ThinkingRequest::Disabled));
+        assert!(matches!(generate.thinking, ThinkingRequest::Auto));
+        assert_eq!(generate.disable_thinking, Some(true));
     }
 
     #[test]
@@ -1594,7 +1597,8 @@ mod tests {
         .unwrap();
 
         let generate = request.into_generate(&SamplingDefaults::default()).unwrap();
-        assert!(matches!(generate.thinking, ThinkingRequest::Disabled));
+        assert!(matches!(generate.thinking, ThinkingRequest::Auto));
+        assert_eq!(generate.disable_thinking, Some(true));
     }
 
     #[test]

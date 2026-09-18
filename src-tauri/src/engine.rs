@@ -3,7 +3,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use crate::core_llm::{
-    CancelFlag, Channel, Constraint, FinishReason, GenerationTimings, ImageRef, LoadSpec, Message,
+    CancelFlag, Channel, Constraint, Content, FinishReason, GenerationTimings, ImageRef, LoadSpec, Message,
     MtpCapabilities, MtpMode, MtpStats, Quantize, ReasoningEffort, Role, Sampling, StreamEvent, TextLlm,
     TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest, ThinkingMode, ToolCall, ToolSpec,
     Usage, VideoRef,

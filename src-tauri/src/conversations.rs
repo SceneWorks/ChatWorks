@@ -369,6 +369,7 @@ mod tests {
             top_p: 0.8,
             max_tokens: 128,
             disable_thinking: false,
+            ..Default::default()
         };
         let conversation = Conversation {
             id: "abc".to_string(),

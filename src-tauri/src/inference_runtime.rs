@@ -41,7 +41,10 @@ mod tests {
             .collect();
 
         #[cfg(target_os = "macos")]
-        assert_eq!(ids, ["mlx-llama", "mlx-joycaption"]);
+        assert_eq!(
+            ids,
+            ["mlx-llama", "mlx-joycaption", "mlx-starvector-1b", "mlx-starvector-8b"]
+        );
 
         #[cfg(not(target_os = "macos"))]
         assert_eq!(ids, ["candle-llama", "candle-llava"]);
