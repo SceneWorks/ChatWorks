@@ -469,6 +469,10 @@ fn stream_chat_completion(
                     finish_reason,
                     Some(OpenAiUsage::from(response.usage)),
                     tool_calls,
+                    NativeTelemetry {
+                        mtp: response.mtp,
+                        timings: response.timings,
+                    },
                 );
                 let _ = tx.blocking_send(Ok(sse_json(&finish)));
                 let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
@@ -1133,6 +1137,12 @@ impl OpenAiChatResponse {
 }
 
 #[derive(Serialize)]
+struct NativeTelemetry {
+    mtp: Option<crate::engine::MtpStatsPayload>,
+    timings: Option<crate::engine::GenerationTimingsPayload>,
+}
+
+#[derive(Serialize)]
 struct OpenAiChatChunk {
     id: String,
     object: &'static str,
@@ -1141,6 +1151,12 @@ struct OpenAiChatChunk {
     choices: Vec<OpenAiChatChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<OpenAiUsage>,
+    /// ChatWorks extension: native MTP counters, emitted only on the terminal stream chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chatworks_mtp: Option<crate::engine::MtpStatsPayload>,
+    /// ChatWorks extension: synchronized backend phase timings, emitted only on the terminal stream chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chatworks_timings: Option<crate::engine::GenerationTimingsPayload>,
 }
 
 impl OpenAiChatChunk {
@@ -1161,6 +1177,8 @@ impl OpenAiChatChunk {
                 finish_reason: None,
             }],
             usage: None,
+            chatworks_mtp: None,
+            chatworks_timings: None,
         }
     }
 
@@ -1181,6 +1199,8 @@ impl OpenAiChatChunk {
                 finish_reason: None,
             }],
             usage: None,
+            chatworks_mtp: None,
+            chatworks_timings: None,
         }
     }
 
@@ -1191,6 +1211,7 @@ impl OpenAiChatChunk {
         finish_reason: String,
         usage: Option<OpenAiUsage>,
         tool_calls: Vec<OpenAiToolCallDelta>,
+        telemetry: NativeTelemetry,
     ) -> Self {
         Self {
             id,
@@ -1208,6 +1229,8 @@ impl OpenAiChatChunk {
                 finish_reason: Some(finish_reason),
             }],
             usage,
+            chatworks_mtp: telemetry.mtp,
+            chatworks_timings: telemetry.timings,
         }
     }
 }
@@ -1436,6 +1459,32 @@ mod tests {
         let json = serde_json::to_value(response).unwrap();
         assert_eq!(json["chatworks_mtp"]["accepted_tokens"], 3);
         assert_eq!(json["chatworks_timings"]["prefill_ms"], 12);
+    }
+
+    #[test]
+    fn streaming_terminal_chunk_preserves_native_telemetry() {
+        let response = OpenAiChatChunk::finish(
+            "chatcmpl-test".to_string(),
+            1,
+            "test".to_string(),
+            "stop".to_string(),
+            Some(OpenAiUsage { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }),
+            Vec::new(),
+            NativeTelemetry {
+                mtp: Some(crate::engine::MtpStatsPayload {
+                    proposed_tokens: 4,
+                    accepted_tokens: 3,
+                    target_forwards: 2,
+                }),
+                timings: Some(crate::engine::GenerationTimingsPayload {
+                    prefill_ms: 12,
+                    decode_ms: 34,
+                }),
+            },
+        );
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["chatworks_mtp"]["accepted_tokens"], 3);
+        assert_eq!(json["chatworks_timings"]["decode_ms"], 34);
     }
 
     #[test]
