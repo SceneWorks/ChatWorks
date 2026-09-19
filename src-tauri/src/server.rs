@@ -39,6 +39,8 @@ pub struct OpenAiServerConfig {
     #[serde(default)]
     pub allow_lan: bool,
     #[serde(default)]
+    pub allow_local_files: bool,
+    #[serde(default)]
     pub auth_token: Option<String>,
     #[serde(default)]
     pub sampling_defaults: SamplingDefaults,
@@ -50,6 +52,7 @@ impl Default for OpenAiServerConfig {
             host: default_host(),
             port: default_port(),
             allow_lan: false,
+            allow_local_files: false,
             auth_token: None,
             sampling_defaults: SamplingDefaults::default(),
         }
@@ -79,12 +82,12 @@ impl OpenAiServerHandle {
         config: OpenAiServerConfig,
         engine: EngineHandle,
     ) -> ServerResult<OpenAiServerStatus> {
-        let bind = validate_config(&config)?;
         let auth_token = normalize_token(config.auth_token.clone());
         let server_config = OpenAiServerConfig {
             auth_token,
             ..config
         };
+        let bind = validate_config(&server_config)?;
         self.stop()?;
 
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -251,6 +254,7 @@ async fn run_server(
             config.auth_token,
             config.sampling_defaults,
             config.allow_lan,
+            config.allow_local_files,
         ),
     )
     .with_graceful_shutdown(async {
@@ -265,6 +269,7 @@ fn openai_router(
     auth_token: Option<String>,
     sampling_defaults: SamplingDefaults,
     allow_lan: bool,
+    allow_local_files: bool,
 ) -> Router {
     Router::new()
         .route("/v1/models", get(models).options(cors_preflight))
@@ -276,6 +281,7 @@ fn openai_router(
             engine,
             auth_token,
             sampling_defaults,
+            allow_local_files,
         })
         .layer(DefaultBodyLimit::max(OPENAI_JSON_BODY_LIMIT_BYTES))
         .layer(axum::middleware::from_fn_with_state(
@@ -379,6 +385,7 @@ struct ApiState {
     engine: EngineHandle,
     auth_token: Option<String>,
     sampling_defaults: SamplingDefaults,
+    allow_local_files: bool,
 }
 
 async fn models(
@@ -403,6 +410,7 @@ async fn chat_completions(
     Json(request): Json<OpenAiChatRequest>,
 ) -> Result<Response, ApiError> {
     authorize(&headers, state.auth_token.as_deref())?;
+    request.authorize_local_media(state.allow_local_files)?;
     if request.stream {
         let stream = stream_chat_completion(state.engine, request, &state.sampling_defaults)?;
         Ok(stream.into_response())
@@ -547,6 +555,9 @@ fn validate_config(config: &OpenAiServerConfig) -> ServerResult<SocketAddr> {
         .map_err(|_| format!("invalid bind host '{}'", config.host))?;
     if is_unspecified(host) && !config.allow_lan {
         return Err("binding to 0.0.0.0 requires allow_lan=true".to_string());
+    }
+    if config.allow_local_files && config.auth_token.is_none() {
+        return Err("local media access requires a bearer token".to_string());
     }
     Ok(SocketAddr::new(host, config.port))
 }
@@ -728,6 +739,21 @@ impl OpenAiChatRequest {
             .clone()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "chatworks".to_string())
+    }
+
+    fn authorize_local_media(&self, allow_local_files: bool) -> Result<(), ApiError> {
+        let requests_local_file = self.messages.iter().any(|message| {
+            message
+                .content
+                .as_ref()
+                .is_some_and(OpenAiMessageContent::contains_local_media)
+        });
+        if requests_local_file && !allow_local_files {
+            return Err(ApiError::bad_request(
+                "local media paths are disabled for the HTTP API; enable authenticated local media access in Settings or use the desktop file picker",
+            ));
+        }
+        Ok(())
     }
 
     fn into_generate(self, defaults: &SamplingDefaults) -> Result<GenerateRequest, ApiError> {
@@ -949,6 +975,24 @@ enum OpenAiMessageContent {
 }
 
 impl OpenAiMessageContent {
+    fn contains_local_media(&self) -> bool {
+        match self {
+            Self::Text(_) => false,
+            Self::Parts(parts) => parts.iter().any(|part| match part.kind.as_str() {
+                "image_url" => part
+                    .image_url
+                    .as_ref()
+                    .is_some_and(|image| is_local_media_source(&image.url)),
+                "video_url" => part
+                    .video_url
+                    .as_ref()
+                    .and_then(|video| video.url.as_deref())
+                    .is_some_and(is_local_media_source),
+                _ => false,
+            }),
+        }
+    }
+
     /// Split OpenAI content into concatenated text, the ordered image-URL attachments, and the
     /// ordered video attachments. A plain string is text with no images/videos (the text path stays
     /// byte-identical).
@@ -1008,10 +1052,18 @@ impl OpenAiMessageContent {
                                 media.push(GenerateMedia::VideoSource { url });
                                 continue;
                             }
+                            if video.fps.is_some_and(|fps| !fps.is_finite() || fps <= 0.0) {
+                                return Err(ApiError::bad_request(
+                                    "video_url fps must be finite and greater than zero",
+                                ));
+                            }
                             // Derive timestamps when absent: explicit > fps-derived > 1-fps index.
                             let n = video.frames.len();
                             let timestamps = match video.timestamps {
-                                Some(ts) if ts.len() == n => ts,
+                                Some(ts) if ts.len() == n => {
+                                    validate_video_timestamps(&ts)?;
+                                    ts
+                                }
                                 Some(ts) => {
                                     return Err(ApiError::bad_request(format!(
                                         "video_url timestamps length {} != frame count {n}",
@@ -1019,7 +1071,7 @@ impl OpenAiMessageContent {
                                     )));
                                 }
                                 None => {
-                                    let fps = video.fps.filter(|f| *f > 0.0).unwrap_or(1.0);
+                                    let fps = video.fps.unwrap_or(1.0);
                                     (0..n).map(|i| i as f32 / fps).collect()
                                 }
                             };
@@ -1046,11 +1098,42 @@ impl OpenAiMessageContent {
     }
 }
 
+fn validate_video_timestamps(timestamps: &[f32]) -> Result<(), ApiError> {
+    if timestamps
+        .iter()
+        .any(|timestamp| !timestamp.is_finite() || *timestamp < 0.0)
+    {
+        return Err(ApiError::bad_request(
+            "video_url timestamps must be finite and non-negative",
+        ));
+    }
+    if timestamps.windows(2).any(|pair| pair[1] < pair[0]) {
+        return Err(ApiError::bad_request(
+            "video_url timestamps must be monotonically nondecreasing",
+        ));
+    }
+    Ok(())
+}
+
 fn is_media_source_url(value: &str) -> bool {
     let value = value.trim();
     value.starts_with("http://")
         || value.starts_with("https://")
-        || value.starts_with("file://")
+        || value.starts_with("file:")
+        || value.starts_with('/')
+        || (value
+            .as_bytes()
+            .get(1)
+            .is_some_and(|separator| *separator == b':')
+            && value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic))
+}
+
+fn is_local_media_source(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("file:")
         || value.starts_with('/')
         || (value
             .as_bytes()
@@ -1507,6 +1590,41 @@ mod tests {
     }
 
     #[test]
+    fn local_media_api_policy_requires_authentication_and_explicit_opt_in() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": [{
+                "type": "image_url", "image_url": {"url": "file:///tmp/private.png"}
+            }]}]
+        }))
+        .unwrap();
+        let error = request.authorize_local_media(false).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(request.authorize_local_media(true).is_ok());
+
+        let alternate_file_uri: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": [{
+                "type": "video_url", "video_url": {"url": "file:/tmp/private.mp4"}
+            }]}]
+        }))
+        .unwrap();
+        assert!(alternate_file_uri.authorize_local_media(false).is_err());
+
+        let unauthenticated = OpenAiServerConfig {
+            host: "0.0.0.0".to_string(),
+            allow_lan: true,
+            allow_local_files: true,
+            ..Default::default()
+        };
+        assert!(validate_config(&unauthenticated).is_err());
+        let authenticated = OpenAiServerConfig {
+            auth_token: Some("secret".to_string()),
+            ..unauthenticated
+        };
+        assert!(validate_config(&authenticated).is_ok());
+        assert!(authorize(&HeaderMap::new(), authenticated.auth_token.as_deref()).is_err());
+    }
+
+    #[test]
     fn non_streaming_response_preserves_native_telemetry() {
         let response = OpenAiChatResponse::from_generate(
             "test".to_string(),
@@ -1675,6 +1793,27 @@ mod tests {
         assert!(
             matches!(msg.media.as_slice(), [GenerateMedia::Video { timestamps, .. }] if timestamps == &vec![0.0, 0.5])
         );
+    }
+
+    #[test]
+    fn rejects_invalid_video_timestamps_and_fps_at_the_api_boundary() {
+        for timestamps in [vec![-1.0, 0.0], vec![2.0, 1.0], vec![f32::NAN, 1.0]] {
+            assert!(validate_video_timestamps(&timestamps).is_err());
+        }
+        assert!(validate_video_timestamps(&[0.0, 0.0, 1.5]).is_ok());
+
+        let invalid_fps = OpenAiMessageContent::Parts(vec![OpenAiContentPart {
+            kind: "video_url".to_string(),
+            text: None,
+            image_url: None,
+            video_url: Some(OpenAiVideoUrl {
+                url: None,
+                frames: vec!["data:image/jpeg;base64,AAA".to_string()],
+                timestamps: None,
+                fps: Some(f32::INFINITY),
+            }),
+        }]);
+        assert!(invalid_fps.into_parts().is_err());
     }
 
     #[test]
@@ -1898,6 +2037,38 @@ mod tests {
 
     fn response_body(response: &str) -> &str {
         response.split("\r\n\r\n").nth(1).unwrap_or_default()
+    }
+
+    #[test]
+    fn http_rejects_local_media_before_decoder_access_when_policy_is_off() {
+        let server = OpenAiServerHandle::new();
+        let status = server
+            .start(
+                OpenAiServerConfig {
+                    port: 0,
+                    sampling_defaults: test_sampling_defaults(),
+                    ..Default::default()
+                },
+                loaded_fake_engine(),
+            )
+            .unwrap();
+        let addr = status.bound_addr.unwrap();
+        let response = http_post_json(
+            &addr,
+            "/v1/chat/completions",
+            json!({
+                "model": "fake-model",
+                "messages": [{"role": "user", "content": [{
+                    "type": "image_url",
+                    "image_url": {"url": "file:///path/that/must/not/be-opened.png"}
+                }]}],
+                "max_tokens": 8
+            }),
+            None,
+        );
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(response_body(&response).contains("local media paths are disabled"));
+        server.stop().unwrap();
     }
 
     #[test]

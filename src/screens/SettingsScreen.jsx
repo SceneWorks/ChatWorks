@@ -11,6 +11,7 @@ export function settingsToForm(settings) {
     port: String(settings.server.port),
     allowLan: Boolean(settings.server.allowLan),
     authEnabled: Boolean(settings.server.authEnabled),
+    allowLocalFiles: Boolean(settings.server.allowLocalFiles),
     systemPrompt: settings.sampling.systemPrompt,
     temperature: String(settings.sampling.temperature),
     topP: String(settings.sampling.topP),
@@ -50,6 +51,7 @@ export function SettingsScreen() {
         port: Number(nextForm.port),
         allowLan: nextForm.allowLan,
         authEnabled: nextForm.authEnabled,
+        allowLocalFiles: nextForm.authEnabled && nextForm.allowLocalFiles,
       },
       sampling: {
         systemPrompt: nextForm.systemPrompt,
@@ -146,6 +148,18 @@ export function SettingsScreen() {
           <span>
             Allow LAN exposure
             <small>Required before binding to 0.0.0.0 or ::. Use an auth token for shared networks.</small>
+          </span>
+        </label>
+        <label className="toggle-row">
+          <input
+            checked={form.allowLocalFiles}
+            disabled={!form.authEnabled}
+            onChange={(event) => updateForm("allowLocalFiles", event.target.checked)}
+            type="checkbox"
+          />
+          <span>
+            Allow authenticated API clients to read local media
+            <small>Requires bearer authentication. Desktop file attachments remain available independently.</small>
           </span>
         </label>
         {lanWarning ? (

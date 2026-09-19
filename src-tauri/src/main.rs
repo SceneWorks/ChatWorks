@@ -12,7 +12,8 @@ use chatworks::conversations::{
     Conversation, ConversationMetadata,
 };
 use chatworks::engine::{
-    EngineHandle, EngineStatus, GenerateRequest, GenerateResponse, LoadModelRequest,
+    prepare_remote_media as prepare_remote_media_inner, EngineHandle, EngineStatus,
+    GenerateRequest, GenerateResponse, LoadModelRequest, PreparedMedia,
 };
 use chatworks::model_registry::{
     adopt_cached_hf_model as adopt_cached_hf_model_inner, clear_hf_token as clear_hf_token_inner,
@@ -61,6 +62,13 @@ fn stream_completion(
 #[tauri::command]
 fn stop_generation(engine: State<'_, EngineHandle>) -> bool {
     engine.cancel()
+}
+
+#[tauri::command]
+async fn prepare_remote_media(source: String, kind: String) -> Result<PreparedMedia, String> {
+    tauri::async_runtime::spawn_blocking(move || prepare_remote_media_inner(source, kind))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -226,6 +234,7 @@ fn server_config_from_settings(settings: &AppSettings) -> OpenAiServerConfig {
         host: settings.server.host.clone(),
         port: settings.server.port,
         allow_lan: settings.server.allow_lan,
+        allow_local_files: settings.server.allow_local_files,
         auth_token: if settings.server.auth_enabled {
             read_api_auth_token().ok().flatten()
         } else {
@@ -265,6 +274,7 @@ fn main() {
             engine_status,
             stream_completion,
             stop_generation,
+            prepare_remote_media,
             start_openai_server,
             stop_openai_server,
             openai_server_status,

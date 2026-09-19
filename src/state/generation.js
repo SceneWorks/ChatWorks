@@ -13,6 +13,19 @@ export function generationParams(value = {}) {
   };
 }
 
+export function applySamplingPreset(params, preset) {
+  if (!preset) return params;
+  return {
+    ...params,
+    temperature: String(preset.temperature),
+    topP: String(preset.top_p),
+    topK: String(preset.top_k),
+    presencePenalty: String(preset.presence_penalty),
+    repetitionPenalty: String(preset.repetition_penalty),
+    repetitionContext: String(preset.repetition_context),
+  };
+}
+
 function optionalNumber(value) {
   if (value == null || String(value).trim() === "") return null;
   const number = Number(value);

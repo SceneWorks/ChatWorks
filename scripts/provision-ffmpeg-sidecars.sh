@@ -14,33 +14,43 @@ cache_dir="${CHATWORKS_FFMPEG_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/chatworks/f
 work_dir="${CHATWORKS_FFMPEG_WORKDIR:-$cache_dir/build-$target}"
 out_dir="$root/src-tauri/binaries"
 
-if [[ "$target" != "$host" ]]; then
-  echo "Refusing to cross-build FFmpeg: target $target differs from native host $host." >&2
-  echo "Run this provisioning step on the matching release runner." >&2
-  exit 1
-fi
-
 case "$target" in
   aarch64-apple-darwin)
     configure_target=(--target-os=darwin --arch=aarch64)
+    binary_suffix=""
     ;;
   x86_64-apple-darwin)
     configure_target=(--target-os=darwin --arch=x86_64)
+    binary_suffix=""
     ;;
   x86_64-unknown-linux-gnu)
     configure_target=(--target-os=linux --arch=x86_64)
+    binary_suffix=""
     ;;
   aarch64-unknown-linux-gnu)
     configure_target=(--target-os=linux --arch=aarch64)
+    binary_suffix=""
     ;;
   x86_64-pc-windows-msvc)
     configure_target=(--target-os=win32 --arch=x86_64 --toolchain=msvc)
+    binary_suffix=".exe"
     ;;
   *)
     echo "No reviewed FFmpeg sidecar build recipe for target: $target" >&2
     exit 1
     ;;
 esac
+
+if [[ "${1:-}" == "--print-output-paths" ]]; then
+  printf '%s\n' "$out_dir/ffmpeg-$target$binary_suffix" "$out_dir/ffprobe-$target$binary_suffix"
+  exit 0
+fi
+
+if [[ "$target" != "$host" ]]; then
+  echo "Refusing to cross-build FFmpeg: target $target differs from native host $host." >&2
+  echo "Run this provisioning step on the matching release runner." >&2
+  exit 1
+fi
 
 mkdir -p "$cache_dir" "$work_dir" "$out_dir"
 archive_path="$cache_dir/$archive"
@@ -81,8 +91,8 @@ if [[ ! -f "$source_dir/config.mak" ]]; then
       --disable-programs --enable-ffmpeg --enable-ffprobe
   )
 fi
-make -C "$source_dir" -j"${CHATWORKS_FFMPEG_JOBS:-4}" ffmpeg ffprobe
-cp "$source_dir/ffmpeg" "$out_dir/ffmpeg-$target"
-cp "$source_dir/ffprobe" "$out_dir/ffprobe-$target"
-chmod 0755 "$out_dir/ffmpeg-$target" "$out_dir/ffprobe-$target"
+make -C "$source_dir" -j"${CHATWORKS_FFMPEG_JOBS:-4}" "ffmpeg$binary_suffix" "ffprobe$binary_suffix"
+cp "$source_dir/ffmpeg$binary_suffix" "$out_dir/ffmpeg-$target$binary_suffix"
+cp "$source_dir/ffprobe$binary_suffix" "$out_dir/ffprobe-$target$binary_suffix"
+chmod 0755 "$out_dir/ffmpeg-$target$binary_suffix" "$out_dir/ffprobe-$target$binary_suffix"
 printf 'Provisioned FFmpeg %s sidecars for %s.\n' "$version" "$target"

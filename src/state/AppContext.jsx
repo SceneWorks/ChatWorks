@@ -11,6 +11,7 @@ export const DEFAULT_APP_SETTINGS = {
     port: 8000,
     allowLan: false,
     authEnabled: false,
+    allowLocalFiles: false,
   },
   sampling: {
     systemPrompt: "You are a helpful local assistant.",

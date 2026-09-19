@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { chatRequestBody, toOpenAiMessage } from "../src/api/sse.js";
 import { paramsFromConversation, paramsToConversation } from "../src/state/conversations.js";
-import { generationParams } from "../src/state/generation.js";
+import { applySamplingPreset, generationParams } from "../src/state/generation.js";
+import { appendAttachmentPlaceholders, settleAttachment } from "../src/state/attachments.js";
+import { isExactGgufUrl, modelSubtitle } from "../src/state/models.js";
+import { prepareRemoteMedia } from "../src/state/media.js";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const capabilities = {
   supports_thinking: true,
@@ -85,4 +90,60 @@ test("a seed beyond JavaScript precision cannot silently change the requested ru
   assert.throws(() => request({ seed: "9007199254740993" }), /Seed must/);
   assert.throws(() => request({ seed: "-1" }), /Seed must/);
   assert.equal(request({ seed: "0" }).seed, 0);
+});
+
+test("model changes preserve explicit sampling until the user applies a recommendation", () => {
+  const explicit = {
+    temperature: "0.13", topP: "0.77", topK: "19", presencePenalty: "0.4",
+    repetitionPenalty: "1.23", repetitionContext: "91", maxTokens: "42",
+  };
+  assert.deepEqual({ ...explicit }, explicit);
+  const recommended = applySamplingPreset(explicit, {
+    temperature: 0.6, top_p: 0.95, top_k: 40, presence_penalty: 1,
+    repetition_penalty: 1.05, repetition_context: 128,
+  });
+  assert.equal(explicit.temperature, "0.13");
+  assert.equal(recommended.temperature, "0.6");
+  assert.equal(recommended.maxTokens, "42");
+});
+
+test("attachment placeholders preserve enqueue order when preparation resolves in reverse", () => {
+  let attachments = appendAttachmentPlaceholders([], [
+    { id: 1, type: "video", name: "slow.mp4" },
+    { id: 2, type: "image", name: "fast.jpg" },
+  ]);
+  attachments = settleAttachment(attachments, 2, { type: "image", url: "image" });
+  attachments = settleAttachment(attachments, 1, { type: "video", frames: ["video"], timestamps: [0], fps: 1 });
+  assert.deepEqual(attachments.map((item) => item.type), ["video", "image"]);
+  const wire = toOpenAiMessage({ role: "user", content: "ordered", media: attachments });
+  assert.deepEqual(wire.content.map((part) => part.type), ["video_url", "image_url", "text"]);
+});
+
+test("packed GGUF imports are identified and labeled by their real format", () => {
+  assert.equal(isExactGgufUrl("https://huggingface.co/prism/repo/blob/rev/PQ2_0.gguf"), true);
+  assert.equal(modelSubtitle({ format: "gguf-prism-packed", pack: "bonsai2-packed", quantize: null }), "Bonsai 2 packed");
+});
+
+test("Windows sidecar output paths include the executable extension", () => {
+  const root = fileURLToPath(new URL("..", import.meta.url));
+  const output = execFileSync("bash", ["scripts/provision-ffmpeg-sidecars.sh", "--print-output-paths"], {
+    cwd: root,
+    env: { ...process.env, MEDIA_SIDECAR_TARGET: "x86_64-pc-windows-msvc" },
+    encoding: "utf8",
+  });
+  assert.match(output, /ffmpeg-x86_64-pc-windows-msvc\.exe/);
+  assert.match(output, /ffprobe-x86_64-pc-windows-msvc\.exe/);
+});
+
+test("remote UI media is routed through native staging without browser fetch or decode", async () => {
+  const calls = [];
+  const prepared = await prepareRemoteMedia(async (command, payload) => {
+    calls.push({ command, payload });
+    return { type: "image", url: "data:image/jpeg;base64,AA==" };
+  }, "https://media.example/no-cors.jpg", "image");
+  assert.deepEqual(calls, [{
+    command: "prepare_remote_media",
+    payload: { source: "https://media.example/no-cors.jpg", kind: "image" },
+  }]);
+  assert.equal(prepared.url, "data:image/jpeg;base64,AA==");
 });

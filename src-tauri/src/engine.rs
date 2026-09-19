@@ -698,11 +698,74 @@ const VIDEO_SOURCE_MAX_AXIS: u32 = 768;
 
 fn decode_video_source(source: &str, cancel: &CancelFlag) -> EngineResult<VideoRef> {
     let staged = stage_video_source(source, cancel)?;
-    let result = decode_staged_video(&staged.path, cancel);
+    let result = sample_staged_video(&staged.path, cancel).and_then(GenerateVideo::into_core);
     if let Some(path) = staged.cleanup {
         let _ = fs::remove_file(path);
     }
     result
+}
+
+/// Normalized media returned to the trusted desktop composer. Remote URLs pass through the same
+/// native SSRF, byte, timeout, codec, and frame bounds used by HTTP generation before the browser
+/// ever sees their contents, so public servers need neither WebView CSP grants nor CORS headers.
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PreparedMedia {
+    Image {
+        url: String,
+    },
+    Video {
+        frames: Vec<String>,
+        timestamps: Vec<f32>,
+        fps: f32,
+    },
+}
+
+pub fn prepare_remote_media(source: String, kind: String) -> EngineResult<PreparedMedia> {
+    let source = source.trim();
+    if !source.starts_with("http://") && !source.starts_with("https://") {
+        return Err("desktop media URLs must use http or https".to_string());
+    }
+    let cancel = CancelFlag::new();
+    match kind.as_str() {
+        "image" => {
+            let staged = stage_media_source(source, MAX_IMAGE_SOURCE_BYTES, "image", &cancel)?;
+            let result = fs::read(&staged.path)
+                .map_err(|error| format!("could not read staged image: {error}"))
+                .and_then(|bytes| normalize_image_bytes(&bytes))
+                .map(|url| PreparedMedia::Image { url });
+            if let Some(path) = staged.cleanup {
+                let _ = fs::remove_file(path);
+            }
+            result
+        }
+        "video" => {
+            let staged = stage_video_source(source, &cancel)?;
+            let result = sample_staged_video(&staged.path, &cancel).map(|video| {
+                let span = video
+                    .timestamps
+                    .last()
+                    .zip(video.timestamps.first())
+                    .map(|(last, first)| last - first)
+                    .unwrap_or(0.0);
+                let fps = if span > 0.0 {
+                    (video.timestamps.len().saturating_sub(1)) as f32 / span
+                } else {
+                    1.0
+                };
+                PreparedMedia::Video {
+                    frames: video.frames,
+                    timestamps: video.timestamps,
+                    fps,
+                }
+            });
+            if let Some(path) = staged.cleanup {
+                let _ = fs::remove_file(path);
+            }
+            result
+        }
+        _ => Err("media kind must be image or video".to_string()),
+    }
 }
 
 fn decode_image_source(source: &str, cancel: &CancelFlag) -> EngineResult<ImageRef> {
@@ -735,8 +798,8 @@ fn stage_media_source(
     if value.is_empty() {
         return Err("video_url.url must not be empty".to_string());
     }
-    if let Some(raw) = value.strip_prefix("file://") {
-        let path = PathBuf::from(raw);
+    if value.starts_with("file:") {
+        let path = file_url_to_path(value, label)?;
         validate_media_file(&path, max_bytes, label)?;
         return Ok(StagedVideo {
             path,
@@ -747,11 +810,33 @@ fn stage_media_source(
         return download_media_url(value, max_bytes, label, cancel);
     }
     let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(format!("{label} file path must be absolute"));
+    }
     validate_media_file(&path, max_bytes, label)?;
     Ok(StagedVideo {
         path,
         cleanup: None,
     })
+}
+
+fn file_url_to_path(value: &str, label: &str) -> EngineResult<PathBuf> {
+    let url =
+        reqwest::Url::parse(value).map_err(|error| format!("invalid {label} file URL: {error}"))?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.query().is_some()
+        || url
+            .host_str()
+            .is_some_and(|host| !host.is_empty() && host != "localhost")
+    {
+        return Err(format!(
+            "{label} file URL must be local and contain no credentials, query, or fragment"
+        ));
+    }
+    url.to_file_path()
+        .map_err(|_| format!("invalid local {label} file URL"))
 }
 
 fn validate_media_file(path: &Path, max_bytes: u64, label: &str) -> EngineResult<()> {
@@ -818,19 +903,27 @@ fn download_media_url(
     }
     // Pin the connection to the addresses just checked. Without this resolver override, a hostile
     // hostname could answer public DNS here and a private address when reqwest resolves it again.
-    let mut builder = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(30));
-    for address in addresses {
-        builder = builder.resolve(host, address);
-    }
-    let client = builder
-        .build()
-        .map_err(|error| format!("could not prepare {label} download: {error}"))?;
-    let mut response = client
+    let client = media_http_client(host, &addresses, Duration::from_secs(30), label)?;
+    let response = client
         .get(url)
         .send()
         .map_err(|error| format!("could not download {label} URL: {error}"))?;
+    stage_http_response(
+        response,
+        max_bytes,
+        label,
+        cancel,
+        &std::env::temp_dir(),
+    )
+}
+
+fn stage_http_response(
+    mut response: reqwest::blocking::Response,
+    max_bytes: u64,
+    label: &str,
+    cancel: &CancelFlag,
+    stage_dir: &Path,
+) -> EngineResult<StagedVideo> {
     if !response.status().is_success() {
         return Err(format!("{label} URL returned HTTP {}", response.status()));
     }
@@ -843,7 +936,7 @@ fn download_media_url(
             max_bytes / 1024 / 1024
         ));
     }
-    let path = std::env::temp_dir().join(format!(
+    let path = stage_dir.join(format!(
         "chatworks-{label}-{}-{}.bin",
         std::process::id(),
         crate::fsutil::now_nanos()
@@ -884,6 +977,21 @@ fn download_media_url(
         path: path.clone(),
         cleanup: Some(path),
     })
+}
+
+fn media_http_client(
+    host: &str,
+    addresses: &[std::net::SocketAddr],
+    timeout: Duration,
+    label: &str,
+) -> EngineResult<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .resolve_to_addrs(host, addresses)
+        .build()
+        .map_err(|error| format!("could not prepare {label} download: {error}"))
 }
 
 fn disallowed_video_host(ip: IpAddr) -> bool {
@@ -1012,7 +1120,7 @@ fn run_media_command(
     }
 }
 
-fn decode_staged_video(path: &Path, cancel: &CancelFlag) -> EngineResult<VideoRef> {
+fn sample_staged_video(path: &Path, cancel: &CancelFlag) -> EngineResult<GenerateVideo> {
     let ffprobe = configured_media_binary("ffprobe")?;
     let mut probe_command = Command::new(&ffprobe);
     probe_command
@@ -1086,7 +1194,7 @@ fn decode_staged_video(path: &Path, cancel: &CancelFlag) -> EngineResult<VideoRe
             base64::engine::general_purpose::STANDARD.encode(bytes)
         ));
     }
-    GenerateVideo { frames, timestamps }.into_core()
+    Ok(GenerateVideo { frames, timestamps })
 }
 
 /// Decode an image attachment (`data:<mime>;base64,<data>` URL or bare base64) to an RGB8
@@ -1134,6 +1242,27 @@ fn decode_image_bytes(bytes: &[u8]) -> EngineResult<ImageRef> {
     // `into_rgb8()` moves the decoded buffer instead of cloning it (`.to_rgb8()` copies).
     let rgb = img.into_rgb8();
     ImageRef::new(width, height, rgb.into_raw())
+}
+
+fn normalize_image_bytes(bytes: &[u8]) -> EngineResult<String> {
+    use base64::Engine as _;
+    use image::codecs::jpeg::JpegEncoder;
+    use image::ColorType;
+
+    let image = decode_image_bytes(bytes)?;
+    let mut encoded = Vec::new();
+    JpegEncoder::new_with_quality(&mut encoded, 82)
+        .encode(
+            &image.pixels,
+            image.width,
+            image.height,
+            ColorType::Rgb8.into(),
+        )
+        .map_err(|error| format!("could not normalize image attachment: {error}"))?;
+    Ok(format!(
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(encoded)
+    ))
 }
 
 fn role_from_str(role: &str) -> EngineResult<Role> {
@@ -1643,6 +1772,108 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn file_urls_decode_percent_escapes_and_reject_remote_hosts() {
+        let dir = crate::fsutil::TempDir::new("encoded-media");
+        let path = dir.path().join("My Clip.png");
+        fs::write(&path, b"fixture").unwrap();
+        let url = reqwest::Url::from_file_path(&path).unwrap();
+        assert!(url.as_str().contains("My%20Clip.png"));
+        let staged = stage_media_source(
+            url.as_str(),
+            MAX_IMAGE_SOURCE_BYTES,
+            "image",
+            &CancelFlag::new(),
+        )
+        .unwrap();
+        assert_eq!(staged.path, path);
+        assert!(file_url_to_path("file://remote-host/share/image.png", "image").is_err());
+        assert!(file_url_to_path("file:///tmp/image.png#fragment", "image").is_err());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_file_url_uses_platform_path_rules() {
+        assert_eq!(
+            file_url_to_path("file:///C:/Media/My%20Clip.mp4", "video").unwrap(),
+            PathBuf::from(r"C:\Media\My Clip.mp4")
+        );
+    }
+
+    #[test]
+    fn media_client_ignores_system_proxy_and_uses_pinned_addresses() {
+        static PROXY_ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = PROXY_ENV_LOCK.lock().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let prior_http = std::env::var_os("HTTP_PROXY");
+        let prior_https = std::env::var_os("HTTPS_PROXY");
+        std::env::set_var("HTTP_PROXY", &proxy);
+        std::env::set_var("HTTPS_PROXY", &proxy);
+
+        let pinned = ["93.184.216.34:9".parse().unwrap()];
+        let client = media_http_client(
+            "public.example",
+            &pinned,
+            Duration::from_millis(100),
+            "image",
+        )
+        .unwrap();
+        let _ = client.get("http://public.example/test.jpg").send();
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+
+        match prior_http {
+            Some(value) => std::env::set_var("HTTP_PROXY", value),
+            None => std::env::remove_var("HTTP_PROXY"),
+        }
+        match prior_https {
+            Some(value) => std::env::set_var("HTTPS_PROXY", value),
+            None => std::env::remove_var("HTTPS_PROXY"),
+        }
+    }
+
+    #[test]
+    fn stalled_remote_media_times_out_and_removes_partial_stage() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n")
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let client = media_http_client(
+            "public.example",
+            &[address],
+            Duration::from_millis(50),
+            "image",
+        )
+        .unwrap();
+        let response = client.get("http://public.example/stalled.jpg").send().unwrap();
+        let dir = crate::fsutil::TempDir::new("stalled-media");
+        let started = std::time::Instant::now();
+        let error = stage_http_response(
+            response,
+            MAX_IMAGE_SOURCE_BYTES,
+            "image",
+            &CancelFlag::new(),
+            dir.path(),
+        )
+        .err()
+        .expect("stalled body must time out");
+        assert!(error.contains("could not read image URL"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+        server.join().unwrap();
     }
 
     /// cancel() returns false when nothing is in flight and true once a generation's flag is

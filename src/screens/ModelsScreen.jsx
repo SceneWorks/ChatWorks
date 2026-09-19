@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { CompactSelector, StatusDot } from "@sceneworks/ui";
 import { useApp } from "../state/AppContext";
+import { formatBytes, isExactGgufUrl, modelSubtitle } from "../state/models.js";
 
 export const QUANTIZE_OPTIONS = [
   { id: "dense", label: "Dense (full precision)", value: null },
@@ -10,31 +11,11 @@ export const QUANTIZE_OPTIONS = [
   { id: "q8", label: "Quantize Q8", value: "q8" },
 ];
 
-export function formatBytes(bytes) {
-  if (!bytes && bytes !== 0) return "";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value.toFixed(value >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
-}
-
-export function modelSubtitle(model) {
-  const parts = [];
-  if (model.quantize === "q4") parts.push("Q4");
-  else if (model.quantize === "q8") parts.push("Q8");
-  else parts.push("Dense");
-  if (model.sizeBytes) parts.push(formatBytes(model.sizeBytes));
-  return parts.join(" · ");
-}
-
 export function ModelsScreen() {
   const { engineStatus, refreshEngineStatus } = useApp();
   const [registry, setRegistry] = useState({ models: [], selectedId: null });
   const [sourceUrl, setSourceUrl] = useState("");
+  const [projectorUrl, setProjectorUrl] = useState("");
   const [quantizeId, setQuantizeId] = useState("dense");
   const [tokenStatus, setTokenStatus] = useState({ present: false });
   const [tokenInput, setTokenInput] = useState("");
@@ -50,6 +31,7 @@ export function ModelsScreen() {
 
   const loadedSource = engineStatus?.loaded?.source ?? null;
   const selectedModel = registry.models.find((model) => model.id === registry.selectedId) ?? null;
+  const exactGgufImport = isExactGgufUrl(sourceUrl);
 
   const refreshRegistry = useCallback(() => {
     return invoke("list_registered_models")
@@ -89,11 +71,16 @@ export function ModelsScreen() {
     const option = QUANTIZE_OPTIONS.find((item) => item.id === quantizeId) ?? QUANTIZE_OPTIONS[0];
     try {
       const next = await invoke("import_hf_model", {
-        request: { sourceUrl: sourceUrl.trim(), quantize: option.value },
+        request: {
+          sourceUrl: sourceUrl.trim(),
+          quantize: exactGgufImport ? null : option.value,
+          projectorSource: projectorUrl.trim() || null,
+        },
       });
       setRegistry(next);
       setNotice("Model imported and added to the registry.");
       setSourceUrl("");
+      setProjectorUrl("");
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -123,11 +110,12 @@ export function ModelsScreen() {
     setError(null);
     setNotice(null);
     const option = QUANTIZE_OPTIONS.find((item) => item.id === quantizeId) ?? QUANTIZE_OPTIONS[0];
+    const packed = candidate.pack === "bonsai2-packed" || candidate.format === "gguf-prism-packed";
     try {
       const next = await invoke("adopt_cached_hf_model", {
         request: {
           localPath: candidate.localPath,
-          quantize: option.value,
+          quantize: packed ? null : option.value,
           projectorSource: candidate.projectorSource,
         },
       });
@@ -210,14 +198,31 @@ export function ModelsScreen() {
             value={sourceUrl}
           />
         </div>
+        {exactGgufImport ? (
+          <div className="field">
+            <label htmlFor="hf-projector-url">Companion projector URL (optional)</label>
+            <input
+              autoComplete="off"
+              disabled={busy}
+              id="hf-projector-url"
+              onChange={(event) => setProjectorUrl(event.target.value)}
+              placeholder="https://huggingface.co/owner/repo/blob/revision/mmproj-F16.gguf"
+              spellCheck={false}
+              type="url"
+              value={projectorUrl}
+            />
+            <small>Choose one exact mmproj artifact from the same repository and revision. Empty remains text-only.</small>
+          </div>
+        ) : null}
         <div className="field">
           <span className="field-label">Conversion</span>
+          {exactGgufImport ? <p className="view-copy">Existing GGUF encoding (conversion unavailable)</p> : null}
           <div className="segmented" role="radiogroup" aria-label="Quantization">
             {QUANTIZE_OPTIONS.map((option) => (
               <button
                 aria-checked={quantizeId === option.id}
                 className={quantizeId === option.id ? "segmented-item active" : "segmented-item"}
-                disabled={busy}
+                disabled={busy || exactGgufImport}
                 key={option.id}
                 onClick={() => setQuantizeId(option.id)}
                 role="radio"
@@ -273,7 +278,7 @@ export function ModelsScreen() {
                   <div className="model-row-main">
                     <span className="model-row-name">{model.name}</span>
                     <span className="model-row-meta">
-                      {model.repo} · {model.providerFamily} · {model.supportsVision ? "Vision" : "Text"}
+                      {model.repo} · {model.providerFamily} · {model.pack === "bonsai2-packed" ? "Bonsai 2 packed" : "Dense"} · {model.supportsVision ? "Vision" : "Text"}
                     </span>
                   </div>
                   <span className="model-row-meta">{formatBytes(model.sizeBytes)}</span>

@@ -184,6 +184,11 @@ pub fn adopt_cached_hf_model(
     let candidate = cached_model_candidate(&path)?.ok_or_else(|| {
         "cached snapshot is not supported by the linked inference providers".to_string()
     })?;
+    validate_quantize_request(
+        &candidate.format,
+        candidate.pack.as_deref(),
+        request.quantize,
+    )?;
     let model_ref = HfModelRef {
         repo: candidate.repo.clone(),
         revision: candidate.revision.clone(),
@@ -322,6 +327,7 @@ async fn import_hf_model_inner(
     job_id: &str,
 ) -> Result<ModelRegistry, String> {
     let model_ref = HfModelRef::parse(&request.source_url)?;
+    let projector_ref = parse_projector_ref(&model_ref, request.projector_source.as_deref())?;
     let data_dir = app_data_dir(app)?;
     let snapshots_dir = data_dir.join("models").join("snapshots");
     let snapshot_dir = snapshots_dir.join(snapshot_dir_name(&model_ref));
@@ -341,7 +347,13 @@ async fn import_hf_model_inner(
         },
     );
 
-    let files = fetch_hf_files(&client, &model_ref, token.as_deref()).await?;
+    let files = fetch_hf_files(
+        &client,
+        &model_ref,
+        projector_ref.as_ref(),
+        token.as_deref(),
+    )
+    .await?;
     if files.is_empty() {
         return Err("no loadable model files found in the HuggingFace repo".to_string());
     }
@@ -398,6 +410,15 @@ async fn import_hf_model_inner(
         unsupported_model_source_error(&source, "downloaded model is not supported")
     })?;
     let (format, pack) = recognized_model_format(&source)?;
+    validate_quantize_request(&format, pack.as_deref(), request.quantize)?;
+    let projector_source = projector_ref
+        .as_ref()
+        .and_then(|projector| projector.file_name.as_deref())
+        .map(|name| snapshot_dir.join(name));
+    let projector_source = validate_projector_source(
+        &source,
+        projector_source.as_ref().and_then(|path| path.to_str()),
+    )?;
 
     let mut registry = read_registry(&manifest)?;
     let entry = ModelEntry {
@@ -414,7 +435,7 @@ async fn import_hf_model_inner(
         format,
         pack,
         provider_id: Some(provider.id),
-        projector_source: validate_projector_source(&source, request.projector_source.as_deref())?,
+        projector_source,
         projector_sources: if source.is_file() {
             sibling_projector_sources(&source)?
         } else {
@@ -442,6 +463,7 @@ async fn import_hf_model_inner(
 async fn fetch_hf_files(
     client: &reqwest::Client,
     model_ref: &HfModelRef,
+    projector_ref: Option<&HfModelRef>,
     token: Option<&str>,
 ) -> Result<Vec<HfSibling>, String> {
     let url = format!(
@@ -473,7 +495,7 @@ async fn fetch_hf_files(
         files.push(file);
     }
     files.sort_by(|a, b| a.rfilename.cmp(&b.rfilename));
-    select_import_files(files, model_ref)
+    select_import_files(files, model_ref, projector_ref)
 }
 
 /// Import one direct GGUF at a time. This prevents a repo that publishes PQ2, PTQ1, and projector
@@ -481,6 +503,7 @@ async fn fetch_hf_files(
 fn select_import_files(
     files: Vec<HfSibling>,
     model_ref: &HfModelRef,
+    projector_ref: Option<&HfModelRef>,
 ) -> Result<Vec<HfSibling>, String> {
     if let Some(file_name) = &model_ref.file_name {
         if !is_gguf_model_file(file_name) {
@@ -489,11 +512,23 @@ fn select_import_files(
                     .to_string(),
             );
         }
-        return files
-            .into_iter()
+        let model = files
+            .iter()
             .find(|file| file.rfilename == *file_name)
-            .map(|file| vec![file])
-            .ok_or_else(|| format!("HuggingFace revision does not contain {file_name:?}"));
+            .cloned()
+            .ok_or_else(|| format!("HuggingFace revision does not contain {file_name:?}"))?;
+        let mut selected = vec![model];
+        if let Some(projector_name) = projector_ref.and_then(|value| value.file_name.as_deref()) {
+            let projector = files
+                .iter()
+                .find(|file| file.rfilename == projector_name)
+                .cloned()
+                .ok_or_else(|| {
+                    format!("HuggingFace revision does not contain {projector_name:?}")
+                })?;
+            selected.push(projector);
+        }
+        return Ok(selected);
     }
 
     let has_safetensors = files
@@ -522,6 +557,49 @@ fn select_import_files(
                 .join(", ")
         )),
     }
+}
+
+fn parse_projector_ref(
+    model_ref: &HfModelRef,
+    requested: Option<&str>,
+) -> Result<Option<HfModelRef>, String> {
+    let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if model_ref.file_name.is_none() {
+        return Err(
+            "a projector can only accompany an exact HuggingFace GGUF language-file URL"
+                .to_string(),
+        );
+    }
+    let projector = HfModelRef::parse(requested)?;
+    let projector_name = projector.file_name.as_deref().ok_or_else(|| {
+        "projector source must be an exact HuggingFace blob/resolve .gguf URL".to_string()
+    })?;
+    if !is_projector_file(projector_name) {
+        return Err("projector source must name an mmproj .gguf artifact".to_string());
+    }
+    if projector.repo != model_ref.repo || projector.revision != model_ref.revision {
+        return Err(
+            "projector must come from the same HuggingFace repository and revision as the language GGUF"
+                .to_string(),
+        );
+    }
+    Ok(Some(projector))
+}
+
+fn validate_quantize_request(
+    format: &str,
+    pack: Option<&str>,
+    quantize: Option<QuantizeRequest>,
+) -> Result<(), String> {
+    if quantize.is_some() && (format == "gguf-prism-packed" || pack == Some("bonsai2-packed")) {
+        return Err(
+            "packed Bonsai/Prism artifacts cannot be quantized again; choose Native packed"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 struct DownloadContext<'a> {
@@ -1358,13 +1436,67 @@ mod tests {
                 size: Some(1),
             },
         ];
-        let selected = select_import_files(files.clone(), &model).unwrap();
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].rfilename, "PQ2_0.gguf");
+        let projector = parse_projector_ref(
+            &model,
+            Some("https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/blob/6ed5e12/mmproj-F16.gguf"),
+        )
+        .unwrap();
+        let selected = select_import_files(files.clone(), &model, projector.as_ref()).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|file| file.rfilename.as_str())
+                .collect::<Vec<_>>(),
+            vec!["PQ2_0.gguf", "mmproj-F16.gguf"]
+        );
+        let text_only = select_import_files(files.clone(), &model, None).unwrap();
+        assert_eq!(text_only.len(), 1);
+        assert_eq!(selected.len(), 2);
         let repo = HfModelRef::parse("prism-ml/Ternary-Bonsai-2-27B-gguf").unwrap();
-        assert!(select_import_files(files, &repo)
+        assert!(select_import_files(files, &repo, None)
             .unwrap_err()
             .contains("multiple GGUF"));
+    }
+
+    #[test]
+    fn projector_import_requires_one_explicit_same_revision_artifact() {
+        let model =
+            HfModelRef::parse("https://huggingface.co/prism/model/blob/rev-a/PQ2_0.gguf").unwrap();
+        assert!(parse_projector_ref(&model, None).unwrap().is_none());
+        assert!(parse_projector_ref(
+            &model,
+            Some("https://huggingface.co/prism/model/blob/rev-a/mmproj-Q8.gguf")
+        )
+        .is_ok());
+        assert!(parse_projector_ref(
+            &model,
+            Some("https://huggingface.co/prism/model/blob/rev-b/mmproj-Q8.gguf")
+        )
+        .is_err());
+        assert!(parse_projector_ref(
+            &model,
+            Some("https://huggingface.co/prism/model/blob/rev-a/PTQ1_0.gguf")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn packed_bonsai_artifacts_reject_requantization() {
+        assert!(validate_quantize_request(
+            "gguf-prism-packed",
+            Some("bonsai2-packed"),
+            Some(QuantizeRequest::Q4)
+        )
+        .is_err());
+        assert!(validate_quantize_request(
+            "hf-safetensors",
+            Some("bonsai2-packed"),
+            Some(QuantizeRequest::Q8)
+        )
+        .is_err());
+        assert!(
+            validate_quantize_request("gguf-prism-packed", Some("bonsai2-packed"), None).is_ok()
+        );
     }
 
     #[test]
@@ -1720,13 +1852,26 @@ mod tests {
                 format: default_model_format(),
                 pack: None,
                 provider_id: None,
-                projector_source: None,
-                projector_sources: Vec::new(),
+                projector_source: Some("/tmp/mmproj-F16.gguf".to_string()),
+                projector_sources: vec!["/tmp/mmproj-F16.gguf".to_string()],
             },
         );
         assert_eq!(registry.models.len(), 1);
         assert_eq!(registry.models[0].name, "new");
         assert_eq!(registry.models[0].file_count, 4);
+
+        let dir = TempDir::new("registry-projector-roundtrip");
+        let manifest = dir.path().join("manifest.json");
+        write_registry(&manifest, &registry).unwrap();
+        let restored = read_registry(&manifest).unwrap();
+        assert_eq!(
+            restored.models[0].projector_source.as_deref(),
+            Some("/tmp/mmproj-F16.gguf")
+        );
+        assert_eq!(
+            restored.models[0].projector_sources,
+            vec!["/tmp/mmproj-F16.gguf"]
+        );
     }
 
     fn snapshot_dir(name: &str) -> TempDir {

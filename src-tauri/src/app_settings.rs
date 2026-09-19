@@ -28,6 +28,11 @@ impl AppSettings {
         if self.server.port == 0 {
             return Err("port must be between 1 and 65535".to_string());
         }
+        if self.server.allow_local_files && !self.server.auth_enabled {
+            return Err(
+                "local media access for API clients requires bearer authentication".to_string(),
+            );
+        }
         self.sampling.system_prompt = self.sampling.system_prompt.trim().to_string();
         if !(0.0..=2.0).contains(&self.sampling.temperature) {
             return Err("temperature must be between 0 and 2".to_string());
@@ -72,6 +77,10 @@ pub struct ServerSettings {
     pub allow_lan: bool,
     #[serde(default)]
     pub auth_enabled: bool,
+    /// Permit authenticated OpenAI API callers to reference local media paths. Desktop file
+    /// attachments use trusted Tauri IPC and do not depend on this network-facing policy.
+    #[serde(default)]
+    pub allow_local_files: bool,
 }
 
 impl Default for ServerSettings {
@@ -81,6 +90,7 @@ impl Default for ServerSettings {
             port: default_port(),
             allow_lan: false,
             auth_enabled: false,
+            allow_local_files: false,
         }
     }
 }

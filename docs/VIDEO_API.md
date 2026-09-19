@@ -32,14 +32,15 @@ A video is sent as a content part of type `video_url` whose object carries an or
 
 - `frames` (**required**): the sampled frames in temporal order, each an image data URL
   (`data:image/…;base64,…`) or bare base64. Decoded to RGB8 exactly like an `image_url` part.
-- `timestamps` (optional): per-frame wall-clock seconds, one per frame. Drives **Text–Timestamp
+- `timestamps` (optional): finite, non-negative, monotonically nondecreasing wall-clock seconds,
+  one per frame. Drives **Text–Timestamp
   Alignment** — the model is told `<{t:.1f} seconds>` before each frame, which is what lets it answer
   temporal questions ("what is shown first / at the end / when does X happen").
-- `fps` (optional): sampling rate. When `timestamps` is omitted, timestamps are derived as `i / fps`;
+- `fps` (optional): finite, positive sampling rate. When `timestamps` is omitted, timestamps are derived as `i / fps`;
   lacking both, they default to the frame index in seconds (1 fps).
 
-Validation: at least one frame is required; if `timestamps` is present it must have exactly one entry
-per frame (otherwise the request is a 400).
+Validation: at least one frame is required; invalid `fps`, timestamp count, value, or temporal order
+returns a 400 before generation.
 
 ### File and URL sources
 
@@ -52,6 +53,10 @@ samples eight timestamped JPEG frames, and sends them through the same temporal 
   "video_url": { "url": "file:///Users/me/Movies/example.mp4" }
 }
 ```
+
+HTTP API access to local paths is disabled by default. It can be enabled in Settings only while
+bearer authentication is enabled; every such request must authenticate. Desktop file-picker
+attachments use trusted Tauri IPC and remain available independently of this network policy.
 
 Remote URLs must resolve to a public address; loopback, private, link-local, and reserved destinations are
 rejected. Redirects are not followed, downloads are capped at 256 MiB, clips at ten minutes, and
@@ -75,7 +80,8 @@ notice in [`third_party/ffmpeg`](../third_party/ffmpeg). Development builds may 
 
 ## The ChatWorks frontend
 
-The frontend's "Video" attach button samples up to 8 evenly-spaced frames from the chosen video file
-client-side (`<video>` element + canvas, no native decoder), downscales them, and sends them as a
-`video_url` part with derived timestamps. The button is shown only when the loaded model advertises
-`supports_video`.
+The frontend's "Video" attach button samples up to 8 evenly-spaced frames from a chosen local video
+client-side, downscales them, and sends them as a `video_url` part with derived timestamps. Public
+image/video URLs instead pass through native bounded staging and decoding, so the remote server does
+not need WebView CORS headers and ChatWorks does not widen its CSP. The button is shown only when the
+loaded model advertises `supports_video`.
