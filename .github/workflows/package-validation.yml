@@ -95,7 +95,7 @@ jobs:
             xz
 
       - name: Test package evidence contract
-        run: node --test tests/package-evidence.test.mjs
+        run: node --test tests/package-evidence.test.mjs tests/package-workflow.test.mjs
 
       - name: Install frontend dependencies
         run: npm ci
@@ -141,6 +141,9 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, windows, cuda]
     timeout-minutes: 120
+    defaults:
+      run:
+        shell: powershell
     concurrency:
       group: chatworks-windows-cuda-package
       cancel-in-progress: false
@@ -153,11 +156,16 @@ jobs:
       CUDA_PATH: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
       VCVARS: 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
     steps:
+      - name: Select Git Bash for Rust toolchain setup
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
       - name: Select isolated CUDA build directory
-        shell: pwsh
+        shell: powershell
         run: '"CARGO_TARGET_DIR=$env:RUNNER_TEMP/chatworks-cuda-${{ github.run_id }}-${{ github.run_attempt }}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
       - name: Preserve committed LF bytes on Windows
-        shell: pwsh
+        shell: powershell
         run: git config --global core.autocrlf input
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -176,7 +184,7 @@ jobs:
         with:
           arch: x64
       - name: Test package evidence contract
-        run: node --test tests/package-evidence.test.mjs
+        run: node --test tests/package-evidence.test.mjs tests/package-workflow.test.mjs
 
       - name: Install frontend dependencies
         run: npm ci
@@ -184,7 +192,7 @@ jobs:
         shell: msys2 {0}
         run: bash scripts/provision-ffmpeg-sidecars.sh
       - name: Stage CUDA runtime redistributables beside the installed executable
-        shell: pwsh
+        shell: powershell
         run: node scripts/package-evidence.mjs stage-cuda "$env:GITHUB_WORKSPACE" "$env:CUDA_PATH" "$env:RUNNER_TEMP/chatworks-cuda-runtime"
       - name: Build CUDA installer without running a model
         shell: cmd
@@ -199,7 +207,7 @@ jobs:
           CHATWORKS_PACKAGE_BACKEND: cuda
         run: bash scripts/verify-tauri-package.sh
       - name: Preserve exact CUDA package and source identity
-        shell: pwsh
+        shell: powershell
         run: node scripts/package-evidence.mjs collect "$env:GITHUB_WORKSPACE" "$env:CARGO_TARGET_DIR" "$env:RUNNER_TEMP/chatworks-cuda-package" x86_64-pc-windows-msvc cuda "$env:GITHUB_SHA" "$env:RUNNER_TEMP/chatworks-cuda-runtime"
       - name: Upload verified CUDA installer and checksums
         uses: actions/upload-artifact@v4
