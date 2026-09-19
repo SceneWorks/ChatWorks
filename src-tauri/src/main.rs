@@ -64,11 +64,53 @@ fn stop_generation(engine: State<'_, EngineHandle>) -> bool {
     engine.cancel()
 }
 
+type MediaPreparations =
+    std::sync::Mutex<std::collections::HashMap<String, chatworks::core_llm::CancelFlag>>;
+
 #[tauri::command]
-async fn prepare_remote_media(source: String, kind: String) -> Result<PreparedMedia, String> {
-    tauri::async_runtime::spawn_blocking(move || prepare_remote_media_inner(source, kind))
-        .await
-        .map_err(|error| error.to_string())?
+fn begin_media_preparation(preparations: State<'_, MediaPreparations>) -> Result<String, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    preparations
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(id.clone(), chatworks::core_llm::CancelFlag::new());
+    Ok(id)
+}
+
+#[tauri::command]
+fn cancel_media_preparation(
+    id: String,
+    preparations: State<'_, MediaPreparations>,
+) -> Result<(), String> {
+    if let Some(flag) = preparations.lock().map_err(|e| e.to_string())?.remove(&id) {
+        flag.cancel();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn prepare_remote_media(
+    id: String,
+    source: String,
+    kind: String,
+    preparations: State<'_, MediaPreparations>,
+) -> Result<PreparedMedia, String> {
+    let flag = preparations
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get(&id)
+        .cloned()
+        .ok_or("media preparation cancelled")?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        prepare_remote_media_inner(source, kind, flag)
+    })
+    .await
+    .map_err(|error| error.to_string());
+    preparations.lock().map_err(|e| e.to_string())?.remove(&id);
+    result?
 }
 
 #[tauri::command]
@@ -254,6 +296,7 @@ fn start_server_from_settings(
 
 fn main() {
     tauri::Builder::default()
+        .manage(MediaPreparations::default())
         .setup(|app| {
             let engine = EngineHandle::spawn();
             let server = OpenAiServerHandle::new();
@@ -274,6 +317,8 @@ fn main() {
             engine_status,
             stream_completion,
             stop_generation,
+            begin_media_preparation,
+            cancel_media_preparation,
             prepare_remote_media,
             start_openai_server,
             stop_openai_server,

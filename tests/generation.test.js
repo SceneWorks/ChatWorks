@@ -3,8 +3,8 @@ import test from "node:test";
 import { chatRequestBody, toOpenAiMessage } from "../src/api/sse.js";
 import { paramsFromConversation, paramsToConversation } from "../src/state/conversations.js";
 import { applySamplingPreset, generationParams } from "../src/state/generation.js";
-import { appendAttachmentPlaceholders, settleAttachment } from "../src/state/attachments.js";
-import { isExactGgufUrl, modelSubtitle } from "../src/state/models.js";
+import { appendAttachmentPlaceholders, settleAttachment, registerPreparation } from "../src/state/attachments.js";
+import { isExactGgufUrl, modelSubtitle, unloadServedModel } from "../src/state/models.js";
 import { prepareRemoteMedia } from "../src/state/media.js";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -27,7 +27,9 @@ function request(params, caps = capabilities) {
 
 test("model defaults remain omitted and MTP defaults off", () => {
   const body = request({});
-  for (const field of ["reasoning_effort", "preserve_thinking", "mtp", "top_k", "seed"]) {
+  assert.deepEqual(body.mtp, { mode: "off" });
+  assert.deepEqual(body.model_defaults, ["reasoning_effort", "preserve_thinking"]);
+  for (const field of ["reasoning_effort", "preserve_thinking", "top_k", "seed"]) {
     assert.equal(Object.hasOwn(body, field), false, field);
   }
 });
@@ -139,11 +141,99 @@ test("remote UI media is routed through native staging without browser fetch or 
   const calls = [];
   const prepared = await prepareRemoteMedia(async (command, payload) => {
     calls.push({ command, payload });
+    if (command === "begin_media_preparation") return "1";
     return { type: "image", url: "data:image/jpeg;base64,AA==" };
   }, "https://media.example/no-cors.jpg", "image");
-  assert.deepEqual(calls, [{
+  assert.deepEqual(calls, [{ command: "begin_media_preparation", payload: undefined }, {
     command: "prepare_remote_media",
-    payload: { source: "https://media.example/no-cors.jpg", kind: "image" },
+    payload: { id: "1", source: "https://media.example/no-cors.jpg", kind: "image" },
   }]);
   assert.equal(prepared.url, "data:image/jpeg;base64,AA==");
+});
+
+test("desktop wire fixture explicitly clears global controls and preserves Off after restore", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const fixture = JSON.parse(await readFile(new URL("generation-wire.json", import.meta.url)));
+  const restored = paramsFromConversation(paramsToConversation({ ...generationParams(), disableThinking: true }));
+  const body = request(restored);
+  assert.deepEqual({ model_defaults: body.model_defaults, mtp: body.mtp }, fixture);
+  assert.equal(body.disable_thinking, true);
+});
+
+test("cancel before native registration finishes never starts preparation", async () => {
+  const controller = new AbortController();
+  const calls = [];
+  let register;
+  const result = prepareRemoteMedia((command, payload) => {
+    calls.push([command, payload]);
+    if (command === "begin_media_preparation") return new Promise((resolve) => { register = resolve; });
+    return Promise.resolve();
+  }, "https://example.com/video.mp4", "video", controller.signal);
+  controller.abort(); register("operation");
+  await assert.rejects(result, { name: "AbortError" });
+  assert.deepEqual(calls.map(([command]) => command), ["begin_media_preparation", "cancel_media_preparation"]);
+});
+
+test("removing a pending native operation cancels its own ID and settles once", async () => {
+  const controller = new AbortController();
+  let rejectWork;
+  let cancelled = 0;
+  const result = prepareRemoteMedia(async (command, payload) => {
+    if (command === "begin_media_preparation") return "operation";
+    if (command === "prepare_remote_media") return new Promise((_, reject) => { rejectWork = reject; });
+    assert.equal(payload.id, "operation"); cancelled += 1;
+    rejectWork(new DOMException("cancelled", "AbortError"));
+  }, "https://example.com/video.mp4", "video", controller.signal);
+  await new Promise((resolve) => setImmediate(resolve));
+  controller.abort(); controller.abort();
+  await assert.rejects(result, { name: "AbortError" });
+  assert.equal(cancelled, 1);
+});
+
+
+test("remove and conversation cleanup release pending slots once before late completion", () => {
+  const operations = new Map();
+  let pending = 2;
+  const first = registerPreparation(operations, 1, () => pending--);
+  const second = registerPreparation(operations, 2, () => pending--);
+  first.cancel();
+  assert.equal(pending, 1);
+  assert.equal(first.controller.signal.aborted, true);
+  for (const entry of operations.values()) entry.cancel();
+  assert.equal(pending, 0); // Send is available even while old work's promise settles.
+  first.release(); second.release();
+  assert.equal(pending, 0);
+  assert.equal(operations.size, 0);
+});
+
+
+test("unload refuses active UI generation and preserves errors without claiming refreshed status", async () => {
+  const calls = [];
+  const invoke = async (command) => { calls.push(command); if (command === "unload_model") throw new Error("unload failed"); };
+  const refreshStatus = async () => { calls.push("refresh"); };
+  await assert.rejects(unloadServedModel({ invoke, busy: true, refreshStatus }), /Stop generation/);
+  assert.deepEqual(calls, []);
+  await assert.rejects(unloadServedModel({ invoke, busy: false, refreshStatus }), /unload failed/);
+  assert.deepEqual(calls, ["stop_generation", "unload_model"]);
+  calls.length = 0;
+  await unloadServedModel({ invoke: async (command) => { calls.push(command); }, busy: false, refreshStatus });
+  assert.deepEqual(calls, ["stop_generation", "unload_model", "refresh"]);
+});
+
+
+test("browser video metadata wait aborts and releases its decoder source", async () => {
+  const { sampleVideoAttachment } = await import("../src/media/video.js");
+  const previous = globalThis.document;
+  const actions = [];
+  const video = { pause: () => actions.push("pause"), removeAttribute: (name) => actions.push(`remove:${name}`), load: () => actions.push("load") };
+  globalThis.document = { createElement: () => video };
+  try {
+    const controller = new AbortController();
+    const work = sampleVideoAttachment("https://example.com/stalled.mp4", controller.signal);
+    controller.abort();
+    await assert.rejects(work, { name: "AbortError" });
+    assert.ok(actions.includes("pause"));
+    assert.ok(actions.includes("remove:src"));
+    assert.ok(actions.includes("load"));
+  } finally { globalThis.document = previous; }
 });

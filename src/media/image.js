@@ -33,8 +33,9 @@ export function readBlobAsDataUrl(blob) {
   });
 }
 
-export async function loadDrawableImage(source) {
-  if (typeof source !== "string" && typeof createImageBitmap === "function") {
+export async function loadDrawableImage(source, signal) {
+  signal?.throwIfAborted();
+  if (!signal && typeof source !== "string" && typeof createImageBitmap === "function") {
     try {
       const bitmap = await createImageBitmap(source, { imageOrientation: "from-image" });
       return {
@@ -56,7 +57,14 @@ export async function loadDrawableImage(source) {
     // Canvas must remain origin-clean because the normalized attachment is sent as a data URL.
     // A remote server without CORS permission fails here rather than silently sending unusable data.
     if (remote) image.crossOrigin = "anonymous";
-    image.onload = () =>
+    const abort = () => {
+      image.src = "";
+      if (!remote) URL.revokeObjectURL(url);
+      reject(new DOMException("Media preparation cancelled", "AbortError"));
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    image.onload = () => {
+      signal?.removeEventListener("abort", abort);
       resolve({
         source: image,
         width: image.naturalWidth,
@@ -65,7 +73,9 @@ export async function loadDrawableImage(source) {
           if (!remote) URL.revokeObjectURL(url);
         },
       });
+    };
     image.onerror = () => {
+      signal?.removeEventListener("abort", abort);
       if (!remote) URL.revokeObjectURL(url);
       reject(new Error(`Could not decode ${name}. Remote image URLs must allow CORS for attachment processing.`));
     };
@@ -73,8 +83,8 @@ export async function loadDrawableImage(source) {
   });
 }
 
-export async function normalizeImageAttachment(source) {
-  const drawable = await loadDrawableImage(source);
+export async function normalizeImageAttachment(source, signal) {
+  const drawable = await loadDrawableImage(source, signal);
   try {
     const scale = Math.min(1, IMAGE_ATTACHMENT_MAX_DIMENSION / Math.max(drawable.width, drawable.height));
     const width = Math.max(1, Math.round(drawable.width * scale));
@@ -89,6 +99,7 @@ export async function normalizeImageAttachment(source) {
     context.drawImage(drawable.source, 0, 0, width, height);
 
     for (const quality of IMAGE_ATTACHMENT_QUALITY_STEPS) {
+      signal?.throwIfAborted();
       const blob = await canvasToBlob(canvas, "image/jpeg", quality);
       if (blob.size <= IMAGE_ATTACHMENT_MAX_BYTES) return readBlobAsDataUrl(blob);
     }

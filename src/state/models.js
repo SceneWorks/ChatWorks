@@ -23,3 +23,11 @@ export function modelSubtitle(model) {
 export function isExactGgufUrl(value) {
   return /huggingface\.co\/[^/]+\/[^/]+\/(?:blob|resolve)\/[^/]+\/.+\.gguf(?:[?#].*)?$/i.test(value.trim());
 }
+
+export async function unloadServedModel({ invoke, busy, refreshStatus }) {
+  if (busy) throw new Error("Stop generation before unloading the model.");
+  // Also stop requests from external API clients, then let the engine's serial queue finish cleanup.
+  await invoke("stop_generation");
+  await invoke("unload_model");
+  await refreshStatus();
+}

@@ -1,4 +1,4 @@
-import { canvasToBlob, readBlobAsDataUrl } from "./image";
+import { canvasToBlob, readBlobAsDataUrl } from "./image.js";
 
 // Video frame sampling (sc-8081): the frontend samples a small number of evenly-spaced frames from
 // an attached video client-side (no native decoder needed) and sends them as a `video_url` part with
@@ -14,7 +14,7 @@ export const VIDEO_FRAME_QUALITY = 0.7;
 /// wall-clock seconds of each sampled frame — exactly the `video_url` shape the local server expects
 /// (sc-8081). `fps` is the *sampled* rate (frames per second over the captured span), forwarded so
 /// the server can derive timestamps if needed.
-export async function sampleVideoAttachment(source) {
+export async function sampleVideoAttachment(source, signal) {
   const remote = typeof source === "string";
   const url = remote ? source : URL.createObjectURL(source);
   const name = remote ? source : source.name || "video attachment";
@@ -25,12 +25,22 @@ export async function sampleVideoAttachment(source) {
   if (remote) video.crossOrigin = "anonymous";
   video.src = url;
 
+  let rejectPending;
+  const onAbort = () => {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+    rejectPending?.(new DOMException("Media preparation cancelled", "AbortError"));
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
   const ready = new Promise((resolve, reject) => {
+    rejectPending = reject;
     video.onloadedmetadata = () => resolve();
     video.onerror = () => reject(new Error(`Could not decode ${name}. Remote video URLs must allow CORS for frame sampling.`));
   });
 
   try {
+    signal?.throwIfAborted();
     await ready;
     const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
     const count = Math.max(1, Math.min(VIDEO_ATTACHMENT_MAX_FRAMES, duration > 0 ? VIDEO_ATTACHMENT_MAX_FRAMES : 1));
@@ -52,6 +62,8 @@ export async function sampleVideoAttachment(source) {
 
     const seekTo = (t) =>
       new Promise((resolve, reject) => {
+        signal?.throwIfAborted();
+        rejectPending = reject;
         const onSeeked = () => {
           video.removeEventListener("seeked", onSeeked);
           resolve();
@@ -65,6 +77,7 @@ export async function sampleVideoAttachment(source) {
     const frames = [];
     const timestamps = [];
     for (const t of times) {
+      signal?.throwIfAborted();
       await seekTo(t);
       context.drawImage(video, 0, 0, width, height);
       const blob = await canvasToBlob(canvas, "image/jpeg", VIDEO_FRAME_QUALITY);
@@ -75,6 +88,10 @@ export async function sampleVideoAttachment(source) {
     const fps = span > 0 ? (timestamps.length - 1) / span : 1;
     return { frames, timestamps, fps };
   } finally {
+    signal?.removeEventListener("abort", onAbort);
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
     if (!remote) URL.revokeObjectURL(url);
   }
 }

@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{Mutex, mpsc};
+use std::sync::{mpsc, Mutex};
 use std::thread;
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -411,12 +411,23 @@ async fn chat_completions(
 ) -> Result<Response, ApiError> {
     authorize(&headers, state.auth_token.as_deref())?;
     request.authorize_local_media(state.allow_local_files)?;
+    let status_engine = state.engine.clone();
+    let status = tokio::task::spawn_blocking(move || status_engine.status())
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .map_err(ApiError::engine)?;
+    let capabilities = &status
+        .loaded
+        .ok_or_else(|| ApiError::bad_request("load a model before generating"))?
+        .provider
+        .capabilities;
+    let defaults = request.resolve_inherited_defaults(&state.sampling_defaults, capabilities);
     if request.stream {
-        let stream = stream_chat_completion(state.engine, request, &state.sampling_defaults)?;
+        let stream = stream_chat_completion(state.engine, request, &defaults)?;
         Ok(stream.into_response())
     } else {
         let model = request.model_name();
-        let generate_request = request.into_generate(&state.sampling_defaults)?;
+        let generate_request = request.into_generate(&defaults)?;
         let response =
             tokio::task::spawn_blocking(move || state.engine.generate(generate_request, |_| {}))
                 .await
@@ -720,6 +731,9 @@ struct OpenAiChatRequest {
     enable_thinking: Option<bool>,
     #[serde(default)]
     reasoning_effort: Option<ReasoningEffortRequest>,
+    /// Explicitly clear application overrides and use the model default.
+    #[serde(default)]
+    model_defaults: Vec<ModelDefaultControl>,
     #[serde(default)]
     preserve_thinking: Option<bool>,
     #[serde(default)]
@@ -733,7 +747,62 @@ struct OpenAiChatRequest {
     tools: Option<Vec<OpenAiTool>>,
 }
 
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ModelDefaultControl {
+    ReasoningEffort,
+    PreserveThinking,
+    Mtp,
+}
+
 impl OpenAiChatRequest {
+    fn resolve_inherited_defaults(
+        &self,
+        defaults: &SamplingDefaults,
+        caps: &crate::engine::CapabilitySummary,
+    ) -> SamplingDefaults {
+        let mut resolved = defaults.clone();
+        let disabled = self
+            .disable_thinking
+            .unwrap_or(defaults.disable_thinking && self.enable_thinking != Some(true))
+            || self.enable_thinking == Some(false);
+        if disabled
+            || !caps.supports_reasoning_effort
+            || self
+                .model_defaults
+                .contains(&ModelDefaultControl::ReasoningEffort)
+        {
+            resolved.reasoning_effort = None;
+        }
+        if !caps.supports_preserve_thinking
+            || self
+                .model_defaults
+                .contains(&ModelDefaultControl::PreserveThinking)
+        {
+            resolved.preserve_thinking = None;
+        }
+        if caps.mtp.is_none() || self.model_defaults.contains(&ModelDefaultControl::Mtp) {
+            resolved.mtp_mode = "off".to_string();
+        }
+        resolved
+    }
+
+    #[cfg(test)]
+    fn into_generate_for_engine(
+        self,
+        defaults: &SamplingDefaults,
+        engine: &EngineHandle,
+    ) -> Result<GenerateRequest, ApiError> {
+        let status = engine.status().map_err(ApiError::engine)?;
+        let caps = &status
+            .loaded
+            .ok_or_else(|| ApiError::bad_request("load a model before generating"))?
+            .provider
+            .capabilities;
+        let resolved = self.resolve_inherited_defaults(defaults, caps);
+        self.into_generate(&resolved)
+    }
+
     fn model_name(&self) -> String {
         self.model
             .clone()
@@ -785,7 +854,9 @@ impl OpenAiChatRequest {
             .into_iter()
             .map(OpenAiTool::into_generate)
             .collect::<Result<Vec<_>, _>>()?;
-        let disable_thinking = self.disable_thinking.unwrap_or(defaults.disable_thinking);
+        let disable_thinking = self
+            .disable_thinking
+            .unwrap_or(defaults.disable_thinking && self.enable_thinking != Some(true));
         Ok(GenerateRequest {
             messages,
             sampling: SamplingRequest {
@@ -806,13 +877,36 @@ impl OpenAiChatRequest {
             enable_thinking: self.enable_thinking,
             disable_thinking: Some(disable_thinking),
             reasoning_effort: self.reasoning_effort.or_else(|| {
+                if disable_thinking
+                    || self.enable_thinking == Some(false)
+                    || self
+                        .model_defaults
+                        .contains(&ModelDefaultControl::ReasoningEffort)
+                {
+                    return None;
+                }
                 defaults
                     .reasoning_effort
                     .as_deref()
                     .and_then(parse_reasoning_effort)
             }),
-            preserve_thinking: self.preserve_thinking.or(defaults.preserve_thinking),
-            mtp: self.mtp.unwrap_or_else(|| mtp_from_defaults(defaults)),
+            preserve_thinking: self.preserve_thinking.or(
+                if self
+                    .model_defaults
+                    .contains(&ModelDefaultControl::PreserveThinking)
+                {
+                    None
+                } else {
+                    defaults.preserve_thinking
+                },
+            ),
+            mtp: self.mtp.unwrap_or_else(|| {
+                if self.model_defaults.contains(&ModelDefaultControl::Mtp) {
+                    MtpRequest::Off
+                } else {
+                    mtp_from_defaults(defaults)
+                }
+            }),
             constraint: response_format_constraint(self.response_format)?,
             tools,
         })
@@ -1499,7 +1593,7 @@ mod tests {
     // The weightless fakes are shared with the engine tests via `test_support` so the two can't
     // drift apart (code-review F-012).
     use crate::test_support::{fake_loader, fake_telemetry_loader, fake_tool_loader};
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
 
     fn loaded_fake_engine() -> EngineHandle {
         let engine = EngineHandle::spawn_with_loader(fake_loader);
@@ -1685,6 +1779,118 @@ mod tests {
     }
 
     #[test]
+    fn inherited_controls_resolve_through_loaded_engine_but_explicit_unsupported_controls_error() {
+        let engine = loaded_fake_engine();
+        let defaults = SamplingDefaults {
+            system_prompt: String::new(),
+            max_tokens: 8,
+            reasoning_effort: Some("xhigh".into()),
+            preserve_thinking: Some(true),
+            mtp_mode: "enabled".into(),
+            ..Default::default()
+        };
+        let base = json!({"messages":[{"role":"user","content":"hello"}]});
+        let request: OpenAiChatRequest = serde_json::from_value(base.clone()).unwrap();
+        let generated = request
+            .into_generate_for_engine(&defaults, &engine)
+            .unwrap();
+        assert!(engine.generate(generated, |_| {}).is_ok());
+        for (key, value, expected) in [
+            ("reasoning_effort", json!("low"), "reasoning_effort"),
+            ("preserve_thinking", json!(true), "preserve_thinking"),
+            ("mtp", json!({"mode":"enabled", "draft_tokens":3}), "MTP"),
+        ] {
+            let mut wire = base.clone();
+            wire[key] = value;
+            let request: OpenAiChatRequest = serde_json::from_value(wire).unwrap();
+            let generated = request
+                .into_generate_for_engine(&defaults, &engine)
+                .unwrap();
+            assert!(engine
+                .generate(generated, |_| {})
+                .unwrap_err()
+                .contains(expected));
+        }
+    }
+
+    #[test]
+    fn effective_thinking_filters_only_inherited_effort() {
+        let mut caps = crate::engine::CapabilitySummary::from(
+            crate::test_support::thinking_descriptor("fixture", 8).capabilities,
+        );
+        caps.supports_reasoning_effort = true;
+        let defaults = SamplingDefaults {
+            disable_thinking: true,
+            reasoning_effort: Some("xhigh".into()),
+            ..Default::default()
+        };
+        for (control, disabled, has_effort) in [
+            (json!({"disable_thinking":true}), true, false),
+            (json!({"enable_thinking":true}), false, true),
+        ] {
+            let mut wire = control;
+            wire["messages"] = json!([{"role":"user", "content":"hello"}]);
+            let request: OpenAiChatRequest = serde_json::from_value(wire).unwrap();
+            let resolved = request.resolve_inherited_defaults(&defaults, &caps);
+            let generated = request.into_generate(&resolved).unwrap();
+            assert_eq!(generated.disable_thinking, Some(disabled));
+            assert_eq!(generated.reasoning_effort.is_some(), has_effort);
+        }
+    }
+
+    #[test]
+    fn desktop_controls_clear_nontrivial_defaults_across_capability_switches() {
+        let mut wire: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/generation-wire.json")).unwrap();
+        wire["messages"] = json!([{"role":"user", "content":"hello"}]);
+        wire["disable_thinking"] = json!(true);
+        let defaults = SamplingDefaults {
+            system_prompt: String::new(),
+            reasoning_effort: Some("xhigh".into()),
+            preserve_thinking: Some(true),
+            mtp_mode: "enabled".into(),
+            ..Default::default()
+        };
+        for supported in [true, false] {
+            let mut caps = crate::test_support::thinking_descriptor("fixture", 8).capabilities;
+            caps.supports_reasoning_effort = supported;
+            caps.supports_preserve_thinking = supported;
+            let summary = crate::engine::CapabilitySummary::from(caps);
+            let request: OpenAiChatRequest = serde_json::from_value(wire.clone()).unwrap();
+            let resolved = request.resolve_inherited_defaults(&defaults, &summary);
+            let output = request.into_generate(&resolved).unwrap();
+            assert!(output.reasoning_effort.is_none());
+            assert!(output.preserve_thinking.is_none());
+            assert!(matches!(output.mtp, MtpRequest::Off));
+        }
+        // An ordinary external API client inherits only controls supported by this model.
+        let caps = crate::engine::CapabilitySummary::from(
+            crate::test_support::thinking_descriptor("fixture", 8).capabilities,
+        );
+        let request: OpenAiChatRequest =
+            serde_json::from_value(json!({"messages":[{"role":"user","content":"hello"}]}))
+                .unwrap();
+        let resolved = request.resolve_inherited_defaults(&defaults, &caps);
+        let output = request.into_generate(&resolved).unwrap();
+        assert!(output.reasoning_effort.is_none());
+        assert!(output.preserve_thinking.is_none());
+        assert!(matches!(output.mtp, MtpRequest::Off));
+        // Explicit unsupported intent is retained, for actionable native capability validation.
+        wire["reasoning_effort"] = json!("low");
+        wire["preserve_thinking"] = json!(true);
+        wire["mtp"] = json!({"mode":"auto"});
+        let request: OpenAiChatRequest = serde_json::from_value(wire).unwrap();
+        let resolved = request.resolve_inherited_defaults(&defaults, &caps);
+        let output = request.into_generate(&resolved).unwrap();
+        assert!(matches!(
+            output.reasoning_effort,
+            Some(ReasoningEffortRequest::Low)
+        ));
+        assert_eq!(output.preserve_thinking, Some(true));
+        assert!(matches!(output.mtp, MtpRequest::Auto));
+    }
+
+    #[test]
     fn maps_chat_request_to_engine_request() {
         let request: OpenAiChatRequest = serde_json::from_value(json!({
             "model": "fake",
@@ -1756,11 +1962,9 @@ mod tests {
             "response_format": {"type": "json_schema"}
         }))
         .unwrap();
-        assert!(
-            unsupported
-                .into_generate(&test_sampling_defaults())
-                .is_err()
-        );
+        assert!(unsupported
+            .into_generate(&test_sampling_defaults())
+            .is_err());
     }
 
     /// A `video_url` content part with pre-sampled frames + explicit timestamps parses into a
@@ -1921,11 +2125,9 @@ mod tests {
             ]}]
         }))
         .unwrap();
-        assert!(
-            mismatched
-                .into_generate(&SamplingDefaults::default())
-                .is_err()
-        );
+        assert!(mismatched
+            .into_generate(&SamplingDefaults::default())
+            .is_err());
     }
 
     #[test]
@@ -2178,11 +2380,9 @@ mod tests {
             None,
         );
         // Loopback (allow_lan=false) omits the CORS allow-origin header (code-review F-003).
-        assert!(
-            !response
-                .to_ascii_lowercase()
-                .contains("access-control-allow-origin")
-        );
+        assert!(!response
+            .to_ascii_lowercase()
+            .contains("access-control-allow-origin"));
         assert!(response.contains("data: {\"id\":\"chatcmpl-"));
         assert!(response.contains("\"reasoning_content\":\"reason\""));
         assert!(response.contains("\"content\":\"ok\""));

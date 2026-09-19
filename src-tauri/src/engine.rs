@@ -1,10 +1,10 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{IpAddr, ToSocketAddrs};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -721,13 +721,19 @@ pub enum PreparedMedia {
     },
 }
 
-pub fn prepare_remote_media(source: String, kind: String) -> EngineResult<PreparedMedia> {
+pub fn prepare_remote_media(
+    source: String,
+    kind: String,
+    cancel: CancelFlag,
+) -> EngineResult<PreparedMedia> {
     let source = source.trim();
     if !source.starts_with("http://") && !source.starts_with("https://") {
         return Err("desktop media URLs must use http or https".to_string());
     }
-    let cancel = CancelFlag::new();
-    match kind.as_str() {
+    if cancel.is_cancelled() {
+        return Err("media preparation cancelled".into());
+    }
+    let result = match kind.as_str() {
         "image" => {
             let staged = stage_media_source(source, MAX_IMAGE_SOURCE_BYTES, "image", &cancel)?;
             let result = fs::read(&staged.path)
@@ -765,6 +771,11 @@ pub fn prepare_remote_media(source: String, kind: String) -> EngineResult<Prepar
             result
         }
         _ => Err("media kind must be image or video".to_string()),
+    };
+    if cancel.is_cancelled() {
+        Err("media preparation cancelled".into())
+    } else {
+        result
     }
 }
 
@@ -882,41 +893,109 @@ fn download_media_url(
     if url.scheme() != "https" && url.scheme() != "http" {
         return Err(format!("{label} URL must use http or https"));
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| format!("{label} URL is missing a host"))?;
-    let port = url.port_or_known_default().unwrap_or(443);
-    let addresses = (host, port)
-        .to_socket_addrs()
-        .map_err(|error| format!("could not resolve {label} URL host: {error}"))?
-        .collect::<Vec<_>>();
-    if addresses.is_empty() {
-        return Err(format!("could not resolve {label} URL host"));
-    }
-    if addresses
-        .iter()
-        .any(|address| disallowed_video_host(address.ip()))
-    {
-        return Err(format!(
-            "{label} URL resolves to a loopback, private, or reserved address"
-        ));
-    }
-    // Pin the connection to the addresses just checked. Without this resolver override, a hostile
-    // hostname could answer public DNS here and a private address when reqwest resolves it again.
-    let client = media_http_client(host, &addresses, Duration::from_secs(30), label)?;
-    let response = client
-        .get(url)
-        .send()
-        .map_err(|error| format!("could not download {label} URL: {error}"))?;
-    stage_http_response(
-        response,
-        max_bytes,
-        label,
-        cancel,
-        &std::env::temp_dir(),
-    )
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        let work = async {
+            let host = url
+                .host_str()
+                .ok_or("media URL is missing a host")?
+                .to_string();
+            let port = url.port_or_known_default().unwrap_or(443);
+            let addresses = tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|e| e.to_string())?
+                .collect::<Vec<_>>();
+            if addresses.is_empty()
+                || addresses
+                    .iter()
+                    .any(|address| disallowed_video_host(address.ip()))
+            {
+                return Err(
+                    "media URL resolves to a loopback, private, or reserved address".to_string(),
+                );
+            }
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(30))
+                .resolve_to_addrs(&host, &addresses)
+                .build()
+                .map_err(|e| e.to_string())?;
+            stage_async_response(
+                client.get(url).send().await.map_err(|e| e.to_string())?,
+                max_bytes,
+                label,
+                &std::env::temp_dir(),
+            )
+            .await
+        };
+        cancel_media_future(work, cancel).await
+    })
 }
 
+async fn cancel_media_future<T>(
+    work: impl std::future::Future<Output = EngineResult<T>>,
+    cancel: &CancelFlag,
+) -> EngineResult<T> {
+    tokio::select! {
+        result = work => result,
+        _ = async { while !cancel.is_cancelled() { tokio::time::sleep(Duration::from_millis(20)).await; } } => Err("media preparation cancelled".into()),
+    }
+}
+
+struct OwnedMediaFile {
+    path: PathBuf,
+    retained: bool,
+}
+impl Drop for OwnedMediaFile {
+    fn drop(&mut self) {
+        if !self.retained {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+async fn stage_async_response(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+    label: &str,
+    stage_dir: &Path,
+) -> EngineResult<StagedVideo> {
+    if !response.status().is_success() {
+        return Err(format!("{label} URL returned HTTP {}", response.status()));
+    }
+    if response.content_length().is_some_and(|n| n > max_bytes) {
+        return Err("media URL exceeds byte limit".into());
+    }
+    let mut owned = OwnedMediaFile {
+        path: stage_dir.join(format!(
+            "chatworks-{label}-{}-{}.bin",
+            std::process::id(),
+            crate::fsutil::now_nanos()
+        )),
+        retained: false,
+    };
+    let mut file = fs::File::create(&owned.path).map_err(|e| e.to_string())?;
+    let mut downloaded = 0_u64;
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        if downloaded > max_bytes {
+            return Err("media URL exceeds byte limit".into());
+        }
+        file.write_all(&chunk).map_err(|e| e.to_string())?;
+    }
+    drop(file);
+    owned.retained = true;
+    Ok(StagedVideo {
+        path: owned.path.clone(),
+        cleanup: Some(owned.path.clone()),
+    })
+}
+
+#[cfg(test)]
 fn stage_http_response(
     mut response: reqwest::blocking::Response,
     max_bytes: u64,
@@ -979,6 +1058,7 @@ fn stage_http_response(
     })
 }
 
+#[cfg(test)]
 fn media_http_client(
     host: &str,
     addresses: &[std::net::SocketAddr],
@@ -1091,33 +1171,47 @@ fn run_media_command(
     let mut child = command
         .spawn()
         .map_err(|error| format!("FFmpeg could not {operation} the video: {error}"))?;
+    // Drain while the child runs: a frame can exceed the OS pipe capacity before exit.
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or("media decoder stdout unavailable")?;
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_IMAGE_SOURCE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() as u64 > MAX_IMAGE_SOURCE_BYTES {
+            return Err("media decoder output exceeds byte limit".to_string());
+        }
+        Ok(bytes)
+    });
     let deadline = Instant::now() + MEDIA_COMMAND_TIMEOUT;
-    loop {
+    let status = loop {
         if cancel.is_cancelled() {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("request cancelled while decoding media".to_string());
+            break Err("request cancelled while decoding media".to_string());
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(format!(
+            break Err(format!(
                 "FFmpeg timed out while attempting to {operation} the video"
             ));
         }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("could not wait for FFmpeg: {error}"))?
-        {
-            let mut stdout = Vec::new();
-            if let Some(mut pipe) = child.stdout.take() {
-                pipe.read_to_end(&mut stdout)
-                    .map_err(|error| format!("could not read FFmpeg output: {error}"))?;
-            }
-            return Ok((status, stdout));
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => thread::sleep(Duration::from_millis(25)),
+            Err(error) => break Err(format!("could not wait for FFmpeg: {error}")),
         }
-        thread::sleep(Duration::from_millis(25));
+    };
+    if status.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
+    let output = reader
+        .join()
+        .map_err(|_| "media decoder output reader failed".to_string());
+    let status = status?;
+    Ok((status, output??))
 }
 
 fn sample_staged_video(path: &Path, cancel: &CancelFlag) -> EngineResult<GenerateVideo> {
@@ -1763,15 +1857,13 @@ mod tests {
         assert!(disallowed_video_host("::1".parse().unwrap()));
         assert!(disallowed_video_host("::ffff:127.0.0.1".parse().unwrap()));
         assert!(!disallowed_video_host("8.8.8.8".parse().unwrap()));
-        assert!(
-            download_media_url(
-                "http://127.0.0.1/example.mp4",
-                MAX_VIDEO_SOURCE_BYTES,
-                "video",
-                &CancelFlag::new()
-            )
-            .is_err()
-        );
+        assert!(download_media_url(
+            "http://127.0.0.1/example.mp4",
+            MAX_VIDEO_SOURCE_BYTES,
+            "video",
+            &CancelFlag::new()
+        )
+        .is_err());
     }
 
     #[test]
@@ -1858,7 +1950,10 @@ mod tests {
             "image",
         )
         .unwrap();
-        let response = client.get("http://public.example/stalled.jpg").send().unwrap();
+        let response = client
+            .get("http://public.example/stalled.jpg")
+            .send()
+            .unwrap();
         let dir = crate::fsutil::TempDir::new("stalled-media");
         let started = std::time::Instant::now();
         let error = stage_http_response(
@@ -1923,5 +2018,132 @@ mod tests {
             .unwrap();
         // Generation finished: the flag is cleared, so cancel is again a no-op.
         assert!(!engine.cancel());
+    }
+}
+
+#[cfg(test)]
+mod preparation_cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn stalled_download_cancellation_removes_owned_file_before_return() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            assert!(socket.read(&mut request).unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\nx")
+                .unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        });
+        let dir = std::env::temp_dir().join(format!("cancel-stage-{}", crate::fsutil::now_nanos()));
+        fs::create_dir(&dir).unwrap();
+        let cancel = CancelFlag::new();
+        let flag = cancel.clone();
+        let watched = dir.clone();
+        let canceller = thread::spawn(move || {
+            for _ in 0..200 {
+                if fs::read_dir(&watched).unwrap().next().is_some() {
+                    flag.cancel();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("download did not begin staging");
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                cancel_media_future(
+                    async {
+                        let response = reqwest::Client::builder()
+                            .no_proxy()
+                            .build()
+                            .unwrap()
+                            .get(format!("http://{address}"))
+                            .send()
+                            .await
+                            .unwrap();
+                        stage_async_response(response, 100000, "fixture", &dir).await
+                    },
+                    &cancel,
+                ),
+            )
+            .await
+            .expect("cancellation must beat ordinary network timeout")
+        });
+        done_tx.send(()).unwrap();
+        canceller.join().unwrap();
+        server.join().unwrap();
+        assert!(result.err().unwrap().contains("cancelled"));
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decoder_output_larger_than_pipe_is_drained_before_exit() {
+        let mut command = Command::new("head");
+        command.args(["-c", "1048576", "/dev/zero"]);
+        let (status, bytes) =
+            run_media_command(&mut command, &CancelFlag::new(), "large frame").unwrap();
+        assert!(status.success());
+        assert_eq!(bytes.len(), 1048576);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn decoder_output_over_budget_is_rejected() {
+        let mut command = Command::new("head");
+        command.args(["-c", "33554434", "/dev/zero"]);
+        assert!(
+            run_media_command(&mut command, &CancelFlag::new(), "oversized frame")
+                .unwrap_err()
+                .contains("byte limit")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_decoder_cancellation_kills_and_reaps_child() {
+        let pid_file =
+            std::env::temp_dir().join(format!("decoder-pid-{}", crate::fsutil::now_nanos()));
+        let cancel = CancelFlag::new();
+        let flag = cancel.clone();
+        let watched = pid_file.clone();
+        let canceller = thread::spawn(move || {
+            for _ in 0..200 {
+                if watched.exists() {
+                    flag.cancel();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("decoder did not start");
+        });
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "echo $$ > \"$1\"; exec sleep 30", "fixture"])
+            .arg(&pid_file);
+        assert!(run_media_command(&mut command, &cancel, "fixture")
+            .unwrap_err()
+            .contains("cancelled"));
+        canceller.join().unwrap();
+        let pid = fs::read_to_string(&pid_file).unwrap();
+        assert!(!Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+        fs::remove_file(pid_file).unwrap();
     }
 }

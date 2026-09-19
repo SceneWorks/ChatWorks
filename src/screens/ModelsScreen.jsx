@@ -3,7 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { CompactSelector, StatusDot } from "@sceneworks/ui";
 import { useApp } from "../state/AppContext";
-import { formatBytes, isExactGgufUrl, modelSubtitle } from "../state/models.js";
+import { useConversations } from "../state/ConversationsContext";
+import { formatBytes, isExactGgufUrl, modelSubtitle, unloadServedModel } from "../state/models.js";
 
 export const QUANTIZE_OPTIONS = [
   { id: "dense", label: "Dense (full precision)", value: null },
@@ -13,6 +14,8 @@ export const QUANTIZE_OPTIONS = [
 
 export function ModelsScreen() {
   const { engineStatus, refreshEngineStatus } = useApp();
+  const { busy: generationBusy } = useConversations();
+  const [unloading, setUnloading] = useState(false);
   const [registry, setRegistry] = useState({ models: [], selectedId: null });
   const [sourceUrl, setSourceUrl] = useState("");
   const [projectorUrl, setProjectorUrl] = useState("");
@@ -129,7 +132,7 @@ export function ModelsScreen() {
   }
 
   async function handleSelect(model) {
-    if (loadingId) return;
+    if (loadingId || unloading || generationBusy) return;
     setLoadingId(model.id);
     setError(null);
     setNotice(null);
@@ -145,6 +148,21 @@ export function ModelsScreen() {
       setError(String(cause));
     } finally {
       setLoadingId("");
+    }
+  }
+
+  async function handleUnload() {
+    if (unloading || loadingId || generationBusy) return;
+    setUnloading(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await unloadServedModel({ invoke, busy: generationBusy, refreshStatus: refreshEngineStatus });
+      setNotice("Model unloaded. Select a registered model to load it again.");
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setUnloading(false);
     }
   }
 
@@ -314,9 +332,12 @@ export function ModelsScreen() {
           <h2>Local models</h2>
           <p className="view-copy">Pick the one model ChatWorks serves over the OpenAI-compatible API.</p>
         </div>
+        {loadedSource ? <button className="ghost-btn" type="button"
+          disabled={unloading || Boolean(loadingId) || generationBusy}
+          onClick={handleUnload}>{unloading ? "Unloading…" : "Unload model"}</button> : null}
         <CompactSelector
           items={registry.models}
-          selectedId={registry.selectedId ?? ""}
+          selectedId={loadedSource ? registry.selectedId ?? "" : ""}
           onSelect={handleSelect}
           getSubtitle={modelSubtitle}
           busyId={loadingId}

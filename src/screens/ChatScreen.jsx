@@ -20,7 +20,7 @@ import { MessageActions } from "../components/MessageActions";
 import { MessageContent } from "../components/MessageContent";
 import { GenerationControls } from "../components/GenerationControls";
 import { formatToolArguments, ToolCallList, ToolResult } from "../components/ToolCallList";
-import { appendAttachmentPlaceholders, settleAttachment } from "../state/attachments.js";
+import { appendAttachmentPlaceholders, settleAttachment, registerPreparation } from "../state/attachments.js";
 import { applySamplingPreset } from "../state/generation.js";
 import { prepareRemoteMedia } from "../state/media.js";
 
@@ -64,6 +64,20 @@ export function ChatScreen() {
   // backend generation (F-004). `null` when no stream is in flight.
   const abortRef = useRef(null);
   const attachmentSequenceRef = useRef(0);
+  const preparationsRef = useRef(new Map());
+  const cancelPreparation = useCallback((id) => {
+    const entry = preparationsRef.current.get(id);
+    entry?.cancel();
+  }, []);
+  useEffect(() => () => {
+    for (const id of preparationsRef.current.keys()) cancelPreparation(id);
+  }, [activeConversationId, cancelPreparation]);
+  useEffect(() => {
+    const retained = new Set(mediaAttachments.map((item) => item.id));
+    for (const id of preparationsRef.current.keys()) {
+      if (!retained.has(id)) cancelPreparation(id);
+    }
+  }, [mediaAttachments, cancelPreparation]);
   const thinkingCapable = supportsThinking(engineStatus);
   const visionCapable = supportsVision(engineStatus);
   const videoCapable = supportsVideo(engineStatus);
@@ -331,18 +345,23 @@ export function ChatScreen() {
     setMediaAttachments((current) => appendAttachmentPlaceholders(current, queued));
     setPendingAttachments((current) => current + files.length);
     files.forEach((file, index) => {
+      const id = queued[index].id;
+      const { controller, release } = registerPreparation(preparationsRef.current, id,
+        () => setPendingAttachments((current) => Math.max(0, current - 1)));
       Promise.resolve()
-        .then(() => prepare(file))
+        .then(() => { controller.signal.throwIfAborted(); return prepare(file, controller.signal); })
         .then((value) => {
+          if (controller.signal.aborted) return;
           setMediaAttachments((current) =>
             settleAttachment(current, queued[index].id, toAttachment(value, file)),
           );
         })
         .catch((cause) => {
+          if (controller.signal.aborted) return;
           setMediaAttachments((current) => settleAttachment(current, queued[index].id, null));
           setError(String(cause?.message ?? cause));
         })
-        .finally(() => setPendingAttachments((current) => Math.max(0, current - 1)));
+        .finally(release);
     });
   }
 
@@ -384,7 +403,7 @@ export function ChatScreen() {
     const sourceName = source.split("/").pop() || `${type} URL`;
     prepareMedia(
       [source],
-      (url) => prepareRemoteMedia(invoke, url, type),
+      (url, signal) => prepareRemoteMedia(invoke, url, type, signal),
       (prepared) => ({ ...prepared, name: sourceName }),
     );
   }
@@ -500,7 +519,7 @@ export function ChatScreen() {
                   <button
                     type="button"
                     aria-label={`Remove ${item.type}`}
-                    onClick={() => setMediaAttachments((current) => current.filter((_, i) => i !== index))}
+                    onClick={() => { cancelPreparation(item.id); setMediaAttachments((current) => current.filter((_, i) => i !== index)); }}
                   >
                     ×
                   </button>

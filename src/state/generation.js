@@ -54,7 +54,7 @@ export function generationSettings(params) {
 
 export function generationOverrides(params, capabilities = {}) {
   const values = generationSettings(params);
-  const body = {};
+  const body = { model_defaults: ["reasoning_effort", "preserve_thinking"] };
   for (const [key, wire] of [["topK", "top_k"], ["presencePenalty", "presence_penalty"], ["repetitionPenalty", "repetition_penalty"],
     ["repetitionContext", "repetition_context"], ["seed", "seed"]]) {
     if (values[key] != null) body[wire] = values[key];
@@ -65,10 +65,10 @@ export function generationOverrides(params, capabilities = {}) {
   if (capabilities.supports_preserve_thinking && values.preserveThinking != null) {
     body.preserve_thinking = values.preserveThinking;
   }
-  if (capabilities.mtp && values.mtpMode !== "off") {
+  if (capabilities.mtp) {
     body.mtp = values.mtpMode === "enabled"
       ? { mode: "enabled", draft_tokens: values.mtpDraftTokens }
-      : { mode: "auto" };
+      : { mode: values.mtpMode === "off" ? "off" : "auto" };
   }
   return body;
 }
