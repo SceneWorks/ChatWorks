@@ -13,6 +13,7 @@ host="$(rustc -vV | sed -n 's/^host: //p')"
 cache_dir="${CHATWORKS_FFMPEG_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/chatworks/ffmpeg}"
 work_dir="${CHATWORKS_FFMPEG_WORKDIR:-$cache_dir/build-$target}"
 out_dir="$root/src-tauri/binaries"
+requires_msvc=false
 
 case "$target" in
   aarch64-apple-darwin)
@@ -34,6 +35,7 @@ case "$target" in
   x86_64-pc-windows-msvc)
     configure_target=(--target-os=win32 --arch=x86_64 --toolchain=msvc)
     binary_suffix=".exe"
+    requires_msvc=true
     ;;
   *)
     echo "No reviewed FFmpeg sidecar build recipe for target: $target" >&2
@@ -50,6 +52,18 @@ if [[ "$target" != "$host" ]]; then
   echo "Refusing to cross-build FFmpeg: target $target differs from native host $host." >&2
   echo "Run this provisioning step on the matching release runner." >&2
   exit 1
+fi
+
+if [[ "$requires_msvc" == true ]]; then
+  # MSYS puts its POSIX `link` ahead of the MSVC linker. Put the directory containing `cl.exe`
+  # first so FFmpeg's MSVC toolchain also resolves the matching link.exe and lib.exe.
+  msvc_cc="$(command -v cl.exe || true)"
+  if [[ -z "$msvc_cc" ]]; then
+    echo "The Windows FFmpeg recipe requires an initialized MSVC developer environment." >&2
+    exit 1
+  fi
+  msvc_dir="$(dirname "$msvc_cc")"
+  export PATH="$msvc_dir:$PATH"
 fi
 
 mkdir -p "$cache_dir" "$work_dir" "$out_dir"
@@ -95,4 +109,14 @@ make -C "$source_dir" -j"${CHATWORKS_FFMPEG_JOBS:-4}" "ffmpeg$binary_suffix" "ff
 cp "$source_dir/ffmpeg$binary_suffix" "$out_dir/ffmpeg-$target$binary_suffix"
 cp "$source_dir/ffprobe$binary_suffix" "$out_dir/ffprobe-$target$binary_suffix"
 chmod 0755 "$out_dir/ffmpeg-$target$binary_suffix" "$out_dir/ffprobe-$target$binary_suffix"
+ffmpeg_version="$("$out_dir/ffmpeg-$target$binary_suffix" -version 2>&1 | sed -n '1p')"
+ffprobe_version="$("$out_dir/ffprobe-$target$binary_suffix" -version 2>&1 | sed -n '1p')"
+if [[ "$ffmpeg_version" != "ffmpeg version $version"* ]]; then
+  echo "Provisioned ffmpeg did not report the pinned $version version: $ffmpeg_version" >&2
+  exit 1
+fi
+if [[ "$ffprobe_version" != "ffprobe version $version"* ]]; then
+  echo "Provisioned ffprobe did not report the pinned $version version: $ffprobe_version" >&2
+  exit 1
+fi
 printf 'Provisioned FFmpeg %s sidecars for %s.\n' "$version" "$target"

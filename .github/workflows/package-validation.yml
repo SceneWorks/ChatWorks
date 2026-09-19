@@ -1,0 +1,129 @@
+name: Package validation
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: ${{ matrix.target }} (${{ matrix.bundle }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            target: aarch64-apple-darwin
+            bundle: app
+          - runner: macos-26-intel
+            target: x86_64-apple-darwin
+            bundle: app
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundle: deb
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundle: deb
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            bundle: nsis
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      MEDIA_SIDECAR_TARGET: ${{ matrix.target }}
+
+    steps:
+      - name: Preserve LF scripts on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: git config --global core.autocrlf input
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux build prerequisites
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget \
+            xz-utils
+
+      - name: Configure the Windows compiler
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install the Windows POSIX build shell
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          path-type: inherit
+          install: >-
+            diffutils
+            make
+            xz
+
+      - name: Configure private inference access
+        shell: bash
+        env:
+          INFERENCE_TOKEN: ${{ secrets.SCENEWORKS_INFERENCE_TOKEN }}
+        run: |
+          if [[ -z "$INFERENCE_TOKEN" ]]; then
+            echo 'SCENEWORKS_INFERENCE_TOKEN is required to resolve the private inference runtime.' >&2
+            exit 1
+          fi
+          git config --global \
+            url."https://x-access-token:${INFERENCE_TOKEN}@github.com/SceneWorks/inference".insteadOf \
+            "https://github.com/SceneWorks/inference"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and verify FFmpeg sidecars
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/provision-ffmpeg-sidecars.sh
+
+      - name: Build and verify FFmpeg sidecars on Windows
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: bash scripts/provision-ffmpeg-sidecars.sh
+
+      - name: Build the native Tauri package
+        run: npm exec tauri -- build --ci --no-sign --bundles ${{ matrix.bundle }}
+
+      - name: Verify packaged sidecars
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/verify-tauri-package.sh
+
+      - name: Verify packaged sidecars on Windows
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: bash scripts/verify-tauri-package.sh

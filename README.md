@@ -12,6 +12,19 @@ and explicitly lists every available provider.
 - Sending video over the OpenAI-compatible API: see [docs/VIDEO_API.md](docs/VIDEO_API.md).
 - Release packaging provisions pinned FFmpeg/ffprobe sidecars with `npm run provision:media`; see [the FFmpeg notice](third_party/ffmpeg/NOTICE.md).
 
+## Package validation
+
+`.github/workflows/package-validation.yml` builds native packages on standard GitHub-hosted
+runners for Apple Silicon macOS (`aarch64-apple-darwin`), Intel macOS
+(`x86_64-apple-darwin`), x64 Linux (`x86_64-unknown-linux-gnu`), arm64 Linux
+(`aarch64-unknown-linux-gnu`), and x64 Windows (`x86_64-pc-windows-msvc`). The jobs build the
+checksum-pinned FFmpeg 9.0 source on each native runner, build an unsigned `.app`, `.deb`,
+or NSIS package, then inspect that package for both FFmpeg and ffprobe.
+
+The repository must define an Actions secret named `SCENEWORKS_INFERENCE_TOKEN` with read access to
+the private `SceneWorks/inference` repository. Packaging does not publish artifacts, create a
+release, or require production signing credentials.
+
 ## Quick start (development)
 
 The Rust backend requires read access to the private
