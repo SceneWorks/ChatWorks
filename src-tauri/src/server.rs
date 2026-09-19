@@ -1,6 +1,6 @@
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::{mpsc, Mutex};
+use std::sync::{Mutex, mpsc};
 use std::thread;
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -17,8 +17,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::app_settings::SamplingDefaults;
 use crate::engine::{
-    ConstraintRequest, EngineHandle, GenerateMessage, GenerateRequest, GenerateResponse,
-    GenerateTool, GenerateToolCall, GenerateVideo, LoadedModelStatus, MtpRequest,
+    ConstraintRequest, EngineHandle, GenerateMedia, GenerateMessage, GenerateRequest,
+    GenerateResponse, GenerateTool, GenerateToolCall, GenerateVideo, LoadedModelStatus, MtpRequest,
     ReasoningEffortRequest, SamplingRequest, StreamChannel, StreamPayload, ThinkingRequest,
     UsagePayload,
 };
@@ -690,6 +690,8 @@ struct OpenAiChatRequest {
     #[serde(default)]
     top_k: Option<usize>,
     #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
     repetition_penalty: Option<f32>,
     #[serde(default)]
     repetition_context: Option<usize>,
@@ -743,6 +745,7 @@ impl OpenAiChatRequest {
                 content: defaults.system_prompt.clone(),
                 images: Vec::new(),
                 videos: Vec::new(),
+                media: Vec::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
             });
@@ -763,6 +766,7 @@ impl OpenAiChatRequest {
                 temperature: Some(self.temperature.unwrap_or(defaults.temperature)),
                 top_p: Some(self.top_p.unwrap_or(defaults.top_p)),
                 top_k: self.top_k.or(defaults.top_k),
+                presence_penalty: self.presence_penalty.or(defaults.presence_penalty),
                 repetition_penalty: self.repetition_penalty.or(defaults.repetition_penalty),
                 repetition_context: self.repetition_context.or(defaults.repetition_context),
             },
@@ -880,15 +884,16 @@ struct OpenAiChatMessage {
 
 impl OpenAiChatMessage {
     fn into_generate(self) -> Result<GenerateMessage, ApiError> {
-        let (content, images, videos) = match self.content {
+        let (content, images, videos, media) = match self.content {
             Some(content) => content.into_parts()?,
-            None => (String::new(), Vec::new(), Vec::new()),
+            None => (String::new(), Vec::new(), Vec::new(), Vec::new()),
         };
         Ok(GenerateMessage {
             role: self.role,
             content,
             images,
             videos,
+            media,
             tool_calls: self
                 .tool_calls
                 .into_iter()
@@ -948,9 +953,10 @@ impl OpenAiMessageContent {
     /// ordered video attachments. A plain string is text with no images/videos (the text path stays
     /// byte-identical).
     ///
-    /// **Video representation (sc-8081).** There is no standard OpenAI `image_url` analog for video.
-    /// We accept a **`video_url` content part carrying pre-sampled frames** plus optional per-frame
-    /// timestamps:
+    /// **Video representation.** There is no standard OpenAI `image_url` analog for video. A
+    /// `video_url` accepts either pre-sampled frames plus timestamps, or one explicit file/URL in
+    /// `video_url.url`. The latter is staged under bounded download/file limits and decoded by the
+    /// app's FFmpeg media component before it reaches the same temporal frame path.
     /// ```json
     /// { "type": "video_url",
     ///   "video_url": {
@@ -959,19 +965,24 @@ impl OpenAiMessageContent {
     ///     "fps": 2.0                  // optional; used to derive timestamps when absent
     ///   } }
     /// ```
-    /// The host (the ChatWorks frontend) samples frames client-side, so v1 needs **no heavy
-    /// server-side video-file decoder** (arbitrary `.mp4` decode is a tracked follow-up). Each frame
-    /// is an image data URL decoded exactly like an `image_url`. If `timestamps` is omitted it is
+    /// The ChatWorks frontend may sample frames client-side, while an explicit `video_url.url`
+    /// uses the bundled FFmpeg sidecar. Each frame is an image data URL decoded exactly like an
+    /// `image_url`. If `timestamps` is omitted it is
     /// derived from `fps` (`i / fps`) or, lacking both, frame index seconds (`i`, i.e. 1 fps) — the
-    /// engine forwards these straight into `VideoRef`, which drives Text–Timestamp Alignment.
+    /// engine forwards these straight into `VideoRef`, which drives Text–Timestamp Alignment. A
+    /// single `url` is intentionally not combined with `frames`; frames take precedence to retain
+    /// backwards-compatible caller control of exact sampling.
     #[allow(clippy::type_complexity)]
-    fn into_parts(self) -> Result<(String, Vec<String>, Vec<GenerateVideo>), ApiError> {
+    fn into_parts(
+        self,
+    ) -> Result<(String, Vec<String>, Vec<GenerateVideo>, Vec<GenerateMedia>), ApiError> {
         match self {
-            Self::Text(value) => Ok((value, Vec::new(), Vec::new())),
+            Self::Text(value) => Ok((value, Vec::new(), Vec::new(), Vec::new())),
             Self::Parts(parts) => {
                 let mut text = String::new();
                 let mut images = Vec::new();
                 let mut videos = Vec::new();
+                let mut media = Vec::new();
                 for part in parts {
                     match part.kind.as_str() {
                         "text" => text.push_str(&part.text.unwrap_or_default()),
@@ -979,16 +990,23 @@ impl OpenAiMessageContent {
                             let url = part.image_url.map(|image| image.url).ok_or_else(|| {
                                 ApiError::bad_request("image_url part is missing its url")
                             })?;
-                            images.push(url);
+                            images.push(url.clone());
+                            if is_media_source_url(&url) {
+                                media.push(GenerateMedia::ImageSource { url });
+                            } else {
+                                media.push(GenerateMedia::Image { url });
+                            }
                         }
                         "video_url" => {
                             let video = part.video_url.ok_or_else(|| {
                                 ApiError::bad_request("video_url part is missing its video_url")
                             })?;
                             if video.frames.is_empty() {
-                                return Err(ApiError::bad_request(
-                                    "video_url part must carry at least one frame",
-                                ));
+                                let url = video.url.ok_or_else(|| ApiError::bad_request(
+                                    "video_url part must carry frames or a file/URL in video_url.url",
+                                ))?;
+                                media.push(GenerateMedia::VideoSource { url });
+                                continue;
                             }
                             // Derive timestamps when absent: explicit > fps-derived > 1-fps index.
                             let n = video.frames.len();
@@ -998,29 +1016,50 @@ impl OpenAiMessageContent {
                                     return Err(ApiError::bad_request(format!(
                                         "video_url timestamps length {} != frame count {n}",
                                         ts.len()
-                                    )))
+                                    )));
                                 }
                                 None => {
                                     let fps = video.fps.filter(|f| *f > 0.0).unwrap_or(1.0);
                                     (0..n).map(|i| i as f32 / fps).collect()
                                 }
                             };
-                            videos.push(GenerateVideo {
+                            let generated = GenerateVideo {
                                 frames: video.frames,
                                 timestamps,
+                            };
+                            media.push(GenerateMedia::Video {
+                                frames: generated.frames.clone(),
+                                timestamps: generated.timestamps.clone(),
                             });
+                            videos.push(generated);
                         }
                         other => {
                             return Err(ApiError::bad_request(format!(
                                 "unsupported content part type '{other}'"
-                            )))
+                            )));
                         }
                     }
                 }
-                Ok((text, images, videos))
+                Ok((text, images, videos, media))
             }
         }
     }
+}
+
+fn is_media_source_url(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("file://")
+        || value.starts_with('/')
+        || (value
+            .as_bytes()
+            .get(1)
+            .is_some_and(|separator| *separator == b':')
+            && value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic))
 }
 
 #[derive(Deserialize)]
@@ -1045,7 +1084,12 @@ struct OpenAiImageUrl {
 /// [`OpenAiMessageContent::into_parts`] for the decision rationale and the wire shape.
 #[derive(Deserialize)]
 struct OpenAiVideoUrl {
+    /// A local file path, `file://` URI, or HTTP(S) URL. It is decoded by the native media
+    /// component into bounded timestamped frames. Mutually exclusive with `frames`.
+    #[serde(default)]
+    url: Option<String>,
     /// Sampled frames, in temporal order, each a `data:image/…;base64,…` URL (or bare base64).
+    #[serde(default)]
     frames: Vec<String>,
     /// Optional per-frame timestamps in seconds (one per frame). Derived from `fps` / frame index
     /// when absent.
@@ -1372,7 +1416,7 @@ mod tests {
     // The weightless fakes are shared with the engine tests via `test_support` so the two can't
     // drift apart (code-review F-012).
     use crate::test_support::{fake_loader, fake_telemetry_loader, fake_tool_loader};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     fn loaded_fake_engine() -> EngineHandle {
         let engine = EngineHandle::spawn_with_loader(fake_loader);
@@ -1381,6 +1425,7 @@ mod tests {
                 source: "/tmp/fake-model".to_string(),
                 display_name: Some("fake-model".to_string()),
                 quantize: None,
+                projector_source: None,
             })
             .unwrap();
         engine
@@ -1393,6 +1438,7 @@ mod tests {
                 source: "/tmp/fake-telemetry".to_string(),
                 display_name: Some("fake-telemetry".to_string()),
                 quantize: None,
+                projector_source: None,
             })
             .unwrap();
         engine
@@ -1405,6 +1451,7 @@ mod tests {
                 source: "/tmp/fake-tools".to_string(),
                 display_name: Some("fake-tools".to_string()),
                 quantize: None,
+                projector_source: None,
             })
             .unwrap();
         engine
@@ -1461,13 +1508,29 @@ mod tests {
 
     #[test]
     fn non_streaming_response_preserves_native_telemetry() {
-        let response = OpenAiChatResponse::from_generate("test".to_string(), GenerateResponse {
-            text: "ok".to_string(), thinking: None, tool_calls: Vec::new(),
-            usage: crate::engine::UsagePayload { prompt_tokens: 1, generated_tokens: 1, total_tokens: 2 },
-            finish_reason: "stop".to_string(),
-            mtp: Some(crate::engine::MtpStatsPayload { proposed_tokens: 4, accepted_tokens: 3, target_forwards: 2 }),
-            timings: Some(crate::engine::GenerationTimingsPayload { prefill_ms: 12, decode_ms: 34 }),
-        });
+        let response = OpenAiChatResponse::from_generate(
+            "test".to_string(),
+            GenerateResponse {
+                text: "ok".to_string(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                usage: crate::engine::UsagePayload {
+                    prompt_tokens: 1,
+                    generated_tokens: 1,
+                    total_tokens: 2,
+                },
+                finish_reason: "stop".to_string(),
+                mtp: Some(crate::engine::MtpStatsPayload {
+                    proposed_tokens: 4,
+                    accepted_tokens: 3,
+                    target_forwards: 2,
+                }),
+                timings: Some(crate::engine::GenerationTimingsPayload {
+                    prefill_ms: 12,
+                    decode_ms: 34,
+                }),
+            },
+        );
         let json = serde_json::to_value(response).unwrap();
         assert_eq!(json["chatworks_mtp"]["accepted_tokens"], 3);
         assert_eq!(json["chatworks_timings"]["prefill_ms"], 12);
@@ -1480,7 +1543,11 @@ mod tests {
             1,
             "test".to_string(),
             "stop".to_string(),
-            Some(OpenAiUsage { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }),
+            Some(OpenAiUsage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            }),
             Vec::new(),
             NativeTelemetry {
                 mtp: Some(crate::engine::MtpStatsPayload {
@@ -1533,7 +1600,7 @@ mod tests {
     fn maps_native_qwen_controls_and_preserves_reasoning_history() {
         let request: OpenAiChatRequest = serde_json::from_value(json!({
             "messages": [{"role": "assistant", "content": "answer", "reasoning_content": "trace"}],
-            "top_k": 12, "repetition_penalty": 1.1, "repetition_context": 32,
+            "top_k": 12, "presence_penalty": 1.5, "repetition_penalty": 1.1, "repetition_context": 32,
             "reasoning_effort": "low", "preserve_thinking": true,
             "mtp": {"mode": "enabled", "draft_tokens": 3},
             "response_format": {"type": "json_object"}
@@ -1541,11 +1608,18 @@ mod tests {
         let generate = request.into_generate(&test_sampling_defaults()).unwrap();
         assert_eq!(generate.messages[0].thinking.as_deref(), Some("trace"));
         assert_eq!(generate.sampling.top_k, Some(12));
+        assert_eq!(generate.sampling.presence_penalty, Some(1.5));
         assert_eq!(generate.sampling.repetition_penalty, Some(1.1));
         assert_eq!(generate.sampling.repetition_context, Some(32));
-        assert!(matches!(generate.reasoning_effort, Some(ReasoningEffortRequest::Low)));
+        assert!(matches!(
+            generate.reasoning_effort,
+            Some(ReasoningEffortRequest::Low)
+        ));
         assert_eq!(generate.preserve_thinking, Some(true));
-        assert!(matches!(generate.mtp, MtpRequest::Enabled { draft_tokens: 3 }));
+        assert!(matches!(
+            generate.mtp,
+            MtpRequest::Enabled { draft_tokens: 3 }
+        ));
         assert!(matches!(generate.constraint, Some(ConstraintRequest::Json)));
     }
 
@@ -1554,15 +1628,21 @@ mod tests {
         let conflict: OpenAiChatRequest = serde_json::from_value(json!({
             "messages": [{"role": "user", "content": "hello"}],
             "enable_thinking": true, "disable_thinking": true
-        })).unwrap();
+        }))
+        .unwrap();
         let generated = conflict.into_generate(&test_sampling_defaults()).unwrap();
         assert_eq!(generated.enable_thinking, Some(true));
         assert_eq!(generated.disable_thinking, Some(true));
         let unsupported: OpenAiChatRequest = serde_json::from_value(json!({
             "messages": [{"role": "user", "content": "hello"}],
             "response_format": {"type": "json_schema"}
-        })).unwrap();
-        assert!(unsupported.into_generate(&test_sampling_defaults()).is_err());
+        }))
+        .unwrap();
+        assert!(
+            unsupported
+                .into_generate(&test_sampling_defaults())
+                .is_err()
+        );
     }
 
     /// A `video_url` content part with pre-sampled frames + explicit timestamps parses into a
@@ -1592,6 +1672,67 @@ mod tests {
         assert_eq!(msg.videos.len(), 1);
         assert_eq!(msg.videos[0].frames.len(), 2);
         assert_eq!(msg.videos[0].timestamps, vec![0.0, 0.5]);
+        assert!(
+            matches!(msg.media.as_slice(), [GenerateMedia::Video { timestamps, .. }] if timestamps == &vec![0.0, 0.5])
+        );
+    }
+
+    #[test]
+    fn preserves_mixed_media_order_and_accepts_a_video_file_or_url_source() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA"}},
+                {"type": "video_url", "video_url": {"url": "file:///tmp/example.mp4"}},
+                {"type": "video_url", "video_url": {
+                    "frames": ["data:image/jpeg;base64,BBB"], "timestamps": [3.5]
+                }},
+                {"type": "text", "text": "compare them"}
+            ]}]
+        }))
+        .unwrap();
+        let generated = request
+            .into_generate(&SamplingDefaults {
+                system_prompt: String::new(),
+                ..Default::default()
+            })
+            .unwrap();
+        let message = &generated.messages[0];
+        assert_eq!(message.content, "compare them");
+        assert!(matches!(message.media.as_slice(), [
+            GenerateMedia::Image { url },
+            GenerateMedia::VideoSource { url: source },
+            GenerateMedia::Video { timestamps, .. },
+        ] if url == "data:image/jpeg;base64,AAA"
+            && source == "file:///tmp/example.mp4"
+            && timestamps == &vec![3.5]));
+    }
+
+    #[test]
+    fn recognizes_windows_file_paths_as_native_media_sources() {
+        assert!(is_media_source_url(r"C:\Users\me\clip.mp4"));
+        assert!(is_media_source_url(r"z:\cache\image.jpg"));
+        assert!(!is_media_source_url("data:image/jpeg;base64,AAA"));
+    }
+
+    #[test]
+    fn maps_file_and_http_image_urls_to_bounded_native_sources() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "file:///tmp/picture.png"}},
+                {"type": "image_url", "image_url": {"url": "https://cdn.example.test/picture.jpg"}}
+            ]}]
+        }))
+        .unwrap();
+        let generated = request
+            .into_generate(&SamplingDefaults {
+                system_prompt: String::new(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(matches!(generated.messages[0].media.as_slice(), [
+            GenerateMedia::ImageSource { url: local },
+            GenerateMedia::ImageSource { url: remote },
+        ] if local == "file:///tmp/picture.png" && remote == "https://cdn.example.test/picture.jpg"));
     }
 
     /// When `timestamps` is omitted, they are derived from `fps` (`i / fps`).
@@ -1641,9 +1782,11 @@ mod tests {
             ]}]
         }))
         .unwrap();
-        assert!(mismatched
-            .into_generate(&SamplingDefaults::default())
-            .is_err());
+        assert!(
+            mismatched
+                .into_generate(&SamplingDefaults::default())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1864,9 +2007,11 @@ mod tests {
             None,
         );
         // Loopback (allow_lan=false) omits the CORS allow-origin header (code-review F-003).
-        assert!(!response
-            .to_ascii_lowercase()
-            .contains("access-control-allow-origin"));
+        assert!(
+            !response
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin")
+        );
         assert!(response.contains("data: {\"id\":\"chatcmpl-"));
         assert!(response.contains("\"reasoning_content\":\"reason\""));
         assert!(response.contains("\"content\":\"ok\""));
@@ -1900,7 +2045,9 @@ mod tests {
             }),
             None,
         );
-        assert!(response.contains("\"chatworks_mtp\":{\"proposed_tokens\":4,\"accepted_tokens\":3,\"target_forwards\":2}"));
+        assert!(response.contains(
+            "\"chatworks_mtp\":{\"proposed_tokens\":4,\"accepted_tokens\":3,\"target_forwards\":2}"
+        ));
         assert!(response.contains("\"chatworks_timings\":{\"prefill_ms\":12,\"decode_ms\":34}"));
         assert!(response.contains("data: [DONE]"));
         server.stop().unwrap();

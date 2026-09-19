@@ -46,6 +46,8 @@ pub struct ConversationParams {
     #[serde(default)]
     pub top_k: Option<usize>,
     #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
     pub repetition_penalty: Option<f32>,
     #[serde(default)]
     pub repetition_context: Option<usize>,
@@ -59,7 +61,7 @@ impl Default for ConversationParams {
             system_prompt: String::new(), temperature: 0.0, top_p: 0.0, max_tokens: 0,
             disable_thinking: false, reasoning_effort: None, preserve_thinking: None,
             mtp_mode: default_mtp_mode(), mtp_draft_tokens: default_mtp_draft_tokens(),
-            top_k: None, repetition_penalty: None, repetition_context: None, seed: None,
+            top_k: None, presence_penalty: None, repetition_penalty: None, repetition_context: None, seed: None,
         }
     }
 }

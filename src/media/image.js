@@ -33,10 +33,10 @@ export function readBlobAsDataUrl(blob) {
   });
 }
 
-export async function loadDrawableImage(file) {
-  if (typeof createImageBitmap === "function") {
+export async function loadDrawableImage(source) {
+  if (typeof source !== "string" && typeof createImageBitmap === "function") {
     try {
-      const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+      const bitmap = await createImageBitmap(source, { imageOrientation: "from-image" });
       return {
         source: bitmap,
         width: bitmap.width,
@@ -49,25 +49,32 @@ export async function loadDrawableImage(file) {
   }
 
   return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
+    const remote = typeof source === "string";
+    const url = remote ? source : URL.createObjectURL(source);
+    const name = remote ? source : source.name || "image attachment";
     const image = new Image();
+    // Canvas must remain origin-clean because the normalized attachment is sent as a data URL.
+    // A remote server without CORS permission fails here rather than silently sending unusable data.
+    if (remote) image.crossOrigin = "anonymous";
     image.onload = () =>
       resolve({
         source: image,
         width: image.naturalWidth,
         height: image.naturalHeight,
-        close: () => URL.revokeObjectURL(url),
+        close: () => {
+          if (!remote) URL.revokeObjectURL(url);
+        },
       });
     image.onerror = () => {
-      URL.revokeObjectURL(url);
-      reject(new Error(`Could not decode ${file.name || "image attachment"}.`));
+      if (!remote) URL.revokeObjectURL(url);
+      reject(new Error(`Could not decode ${name}. Remote image URLs must allow CORS for attachment processing.`));
     };
     image.src = url;
   });
 }
 
-export async function normalizeImageAttachment(file) {
-  const drawable = await loadDrawableImage(file);
+export async function normalizeImageAttachment(source) {
+  const drawable = await loadDrawableImage(source);
   try {
     const scale = Math.min(1, IMAGE_ATTACHMENT_MAX_DIMENSION / Math.max(drawable.width, drawable.height));
     const width = Math.max(1, Math.round(drawable.width * scale));
@@ -89,5 +96,6 @@ export async function normalizeImageAttachment(file) {
     drawable.close?.();
   }
 
-  throw new Error(`${file.name || "Image attachment"} is too large after compression.`);
+  const name = typeof source === "string" ? source : source.name || "Image attachment";
+  throw new Error(`${name} is too large after compression.`);
 }

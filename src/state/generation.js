@@ -6,6 +6,7 @@ export function generationParams(value = {}) {
     mtpMode: value.mtpMode ?? "off",
     mtpDraftTokens: String(value.mtpDraftTokens ?? 3),
     topK: String(value.topK ?? ""),
+    presencePenalty: String(value.presencePenalty ?? ""),
     repetitionPenalty: String(value.repetitionPenalty ?? ""),
     repetitionContext: String(value.repetitionContext ?? ""),
     seed: String(value.seed ?? ""),
@@ -31,6 +32,7 @@ export function generationSettings(params) {
     mtpMode: params.mtpMode ?? "off",
     mtpDraftTokens: optionalNumber(params.mtpDraftTokens) ?? 3,
     topK: optionalNumber(params.topK),
+    presencePenalty: optionalNumber(params.presencePenalty),
     repetitionPenalty: optionalNumber(params.repetitionPenalty),
     repetitionContext: optionalNumber(params.repetitionContext),
     seed,
@@ -40,7 +42,7 @@ export function generationSettings(params) {
 export function generationOverrides(params, capabilities = {}) {
   const values = generationSettings(params);
   const body = {};
-  for (const [key, wire] of [["topK", "top_k"], ["repetitionPenalty", "repetition_penalty"],
+  for (const [key, wire] of [["topK", "top_k"], ["presencePenalty", "presence_penalty"], ["repetitionPenalty", "repetition_penalty"],
     ["repetitionContext", "repetition_context"], ["seed", "seed"]]) {
     if (values[key] != null) body[wire] = values[key];
   }

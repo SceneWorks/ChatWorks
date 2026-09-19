@@ -162,8 +162,9 @@ fn load_registered_model(
     app: AppHandle,
     engine: State<'_, EngineHandle>,
     model_id: String,
+    projector_source: Option<String>,
 ) -> Result<EngineStatus, String> {
-    load_registered_model_inner(&app, &engine, model_id)
+    load_registered_model_inner(&app, &engine, model_id, projector_source)
 }
 
 #[tauri::command]

@@ -10,8 +10,9 @@
     "preview": "vite preview --host 127.0.0.1",
     "lint": "eslint src",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build",
-    "tauri:build:macos": "tauri build --target aarch64-apple-darwin --bundles app dmg"
+    "provision:media": "bash scripts/provision-ffmpeg-sidecars.sh",
+    "tauri:build": "npm run provision:media && tauri build",
+    "tauri:build:macos": "MEDIA_SIDECAR_TARGET=aarch64-apple-darwin npm run provision:media && tauri build --target aarch64-apple-darwin --bundles app dmg"
   },
   "dependencies": {
     "@sceneworks/ui": "0.2.0",

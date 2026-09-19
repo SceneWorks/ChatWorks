@@ -1,12 +1,18 @@
-use std::path::Path;
-use std::sync::{mpsc, Arc, Mutex};
+use std::ffi::OsString;
+use std::fs;
+use std::io::{Read, Write};
+use std::net::{IpAddr, ToSocketAddrs};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::core_llm::{
-    CancelFlag, Channel, Constraint, Content, FinishReason, GenerationTimings, ImageRef, LoadSpec, Message,
-    MtpCapabilities, MtpMode, MtpStats, Quantize, ReasoningEffort, Role, Sampling, StreamEvent, TextLlm,
-    TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest, ThinkingMode, ToolCall, ToolSpec,
-    Usage, VideoRef,
+    CancelFlag, Channel, Constraint, Content, FinishReason, GenerationTimings, ImageRef, LoadSpec,
+    Message, MtpCapabilities, MtpMode, MtpStats, Quantize, ReasoningEffort, Role, Sampling,
+    StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest, ThinkingMode,
+    ToolCall, ToolSpec, Usage, VideoRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -181,6 +187,7 @@ impl EngineActor {
         }
         let spec = LoadSpec {
             source: request.source.clone(),
+            projector_source: request.projector_source.clone(),
             quantize: request.quantize.map(Into::into),
         };
         let provider = (self.loader)(&spec).map_err(|error| error.to_string())?;
@@ -189,6 +196,7 @@ impl EngineActor {
             source: request.source,
             display_name: request.display_name,
             quantize: request.quantize,
+            projector_source: request.projector_source,
             provider,
             descriptor,
         });
@@ -204,21 +212,23 @@ impl EngineActor {
             .loaded
             .as_ref()
             .ok_or_else(|| "no model loaded".to_string())?;
-        let core_request = request.into_core()?;
-        // Publish the request's cancel flag into the shared slot so an out-of-band `cancel()` can
-        // trip it mid-generation (the actor loop is blocked here, so cancel can't be a command).
-        // Cleared in the guard below so a stale flag never cancels a later generation (F-004).
+        // Register the cancel flag before media staging. A direct video URL can spend time
+        // downloading or sampling frames before a provider emits its first token, and it must be
+        // cancellable through the same lifecycle as generation.
+        let cancel = CancelFlag::new();
         if let Ok(mut slot) = self.cancel.lock() {
-            *slot = Some(core_request.cancel.clone());
+            *slot = Some(cancel.clone());
         }
-        let result = loaded
-            .provider
-            .generate(&core_request, &mut |event| {
-                let _ = event_tx.send(StreamPayload::from(event));
-            })
-            .map_err(|error| error.to_string());
-        // Always clear the in-flight flag, whether the generation finished, errored, or was
-        // cancelled — the next generation installs a fresh flag.
+        let result = request.into_core(cancel).and_then(|core_request| {
+            loaded
+                .provider
+                .generate(&core_request, &mut |event| {
+                    let _ = event_tx.send(StreamPayload::from(event));
+                })
+                .map_err(|error| error.to_string())
+        });
+        // Always clear the in-flight flag, whether media preparation, generation, or cancellation
+        // ended the request — a stale flag must never cancel a later generation.
         if let Ok(mut slot) = self.cancel.lock() {
             *slot = None;
         }
@@ -256,6 +266,7 @@ struct LoadedModel {
     source: String,
     display_name: Option<String>,
     quantize: Option<QuantizeRequest>,
+    projector_source: Option<String>,
     provider: Box<dyn TextLlm>,
     descriptor: TextLlmDescriptor,
 }
@@ -269,6 +280,7 @@ impl LoadedModel {
                 .clone()
                 .unwrap_or_else(|| model_name(&self.source)),
             quantize: self.quantize,
+            projector_source: self.projector_source.clone(),
             provider: ProviderSummary::from(self.descriptor.clone()),
         }
     }
@@ -281,6 +293,10 @@ pub struct LoadModelRequest {
     pub display_name: Option<String>,
     #[serde(default)]
     pub quantize: Option<QuantizeRequest>,
+    /// An explicit multimodal projector paired with a GGUF language model. Providers validate the
+    /// artifact; an omitted value deliberately keeps a packed GGUF text-only.
+    #[serde(default)]
+    pub projector_source: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -338,7 +354,7 @@ pub struct GenerateRequest {
 }
 
 impl GenerateRequest {
-    fn into_core(self) -> EngineResult<TextLlmRequest> {
+    fn into_core(self, cancel: CancelFlag) -> EngineResult<TextLlmRequest> {
         if self.messages.is_empty() {
             return Err("messages must not be empty".to_string());
         }
@@ -346,7 +362,7 @@ impl GenerateRequest {
             messages: self
                 .messages
                 .into_iter()
-                .map(GenerateMessage::into_core)
+                .map(|message| message.into_core(&cancel))
                 .collect::<EngineResult<Vec<_>>>()?,
             sampling: self.sampling.into_core(),
             // `max_new_tokens` is intentionally not clamped against the loaded provider's
@@ -366,7 +382,7 @@ impl GenerateRequest {
                 .map(GenerateTool::into_core)
                 .collect(),
             stop: self.stop,
-            cancel: CancelFlag::new(),
+            cancel,
         })
     }
 }
@@ -538,6 +554,10 @@ pub struct GenerateMessage {
     /// vision providers see visuals before text, matching the Qwen3-VL convention.
     #[serde(default)]
     pub videos: Vec<GenerateVideo>,
+    /// Ordered visual inputs. New requests use this to retain image/video ordering; `images` and
+    /// `videos` above remain readable for persisted conversations written before sc-23941.
+    #[serde(default)]
+    pub media: Vec<GenerateMedia>,
     /// An assistant turn's tool / function calls, re-rendered by the chat template to continue a
     /// multi-step tool exchange (paired with the following `tool`-role result turn). Empty for
     /// non-tool turns.
@@ -556,6 +576,43 @@ pub struct GenerateVideo {
     pub frames: Vec<String>,
     /// Per-frame timestamp in seconds (one per frame), driving Text–Timestamp Alignment.
     pub timestamps: Vec<f32>,
+}
+
+/// A visual attachment in its original user/API order. Video frames are already decoded/sampled by
+/// the host and retain their timestamp order through to [`VideoRef`].
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GenerateMedia {
+    Image {
+        url: String,
+    },
+    /// A local image file or HTTP(S) URL, staged with the same public-network and size rules as
+    /// video sources before decoding into RGB8.
+    ImageSource {
+        url: String,
+    },
+    Video {
+        frames: Vec<String>,
+        timestamps: Vec<f32>,
+    },
+    /// A file path, `file://` URI, or HTTPS URL. It is staged under strict byte/network bounds and
+    /// decoded into the same timestamped frame representation as pre-sampled video.
+    VideoSource {
+        url: String,
+    },
+}
+
+impl GenerateMedia {
+    fn into_core(self, cancel: &CancelFlag) -> EngineResult<Content> {
+        match self {
+            Self::Image { url } => Ok(Content::Image(decode_image(&url)?)),
+            Self::ImageSource { url } => Ok(Content::Image(decode_image_source(&url, cancel)?)),
+            Self::Video { frames, timestamps } => Ok(Content::Video(
+                GenerateVideo { frames, timestamps }.into_core()?,
+            )),
+            Self::VideoSource { url } => Ok(Content::Video(decode_video_source(&url, cancel)?)),
+        }
+    }
 }
 
 impl GenerateVideo {
@@ -580,15 +637,22 @@ impl GenerateVideo {
 }
 
 impl GenerateMessage {
-    fn into_core(self) -> EngineResult<Message> {
-        // Visuals first (images then videos), then text — the order the chat templates / vision
-        // providers expect (Qwen3-VL: visual placeholder before the question text).
-        let mut content = Vec::with_capacity(self.images.len() + self.videos.len() + 1);
-        for image in &self.images {
-            content.push(Content::Image(decode_image(image)?));
-        }
-        for video in self.videos {
-            content.push(Content::Video(video.into_core()?));
+    fn into_core(self, cancel: &CancelFlag) -> EngineResult<Message> {
+        // Ordered `media` preserves the composer/API's image-video sequence. Legacy persisted
+        // messages have no `media`, so retain their historical images-then-videos behavior.
+        let mut content =
+            Vec::with_capacity(self.media.len() + self.images.len() + self.videos.len() + 1);
+        if self.media.is_empty() {
+            for image in &self.images {
+                content.push(Content::Image(decode_image(image)?));
+            }
+            for video in self.videos {
+                content.push(Content::Video(video.into_core()?));
+            }
+        } else {
+            for media in self.media {
+                content.push(media.into_core(cancel)?);
+            }
         }
         if !self.content.is_empty() || content.is_empty() {
             content.push(Content::Text(self.content));
@@ -626,6 +690,404 @@ const MAX_IMAGE_AXIS: u32 = 4096;
 /// cumulative across the re-sent transcript — a cumulative cap would brick conversations once enough
 /// video turns accumulate, since the frontend re-sends full history each turn (PR #30 review).
 const MAX_FRAMES_PER_VIDEO: usize = 64;
+const MAX_IMAGE_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_VIDEO_SOURCE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_VIDEO_SOURCE_SECONDS: f64 = 10.0 * 60.0;
+const VIDEO_SOURCE_FRAMES: usize = 8;
+const VIDEO_SOURCE_MAX_AXIS: u32 = 768;
+
+fn decode_video_source(source: &str, cancel: &CancelFlag) -> EngineResult<VideoRef> {
+    let staged = stage_video_source(source, cancel)?;
+    let result = decode_staged_video(&staged.path, cancel);
+    if let Some(path) = staged.cleanup {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+fn decode_image_source(source: &str, cancel: &CancelFlag) -> EngineResult<ImageRef> {
+    let staged = stage_media_source(source, MAX_IMAGE_SOURCE_BYTES, "image", cancel)?;
+    let result = fs::read(&staged.path)
+        .map_err(|error| format!("could not read staged image: {error}"))
+        .and_then(|bytes| decode_image_bytes(&bytes));
+    if let Some(path) = staged.cleanup {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+struct StagedVideo {
+    path: PathBuf,
+    cleanup: Option<PathBuf>,
+}
+
+fn stage_video_source(source: &str, cancel: &CancelFlag) -> EngineResult<StagedVideo> {
+    stage_media_source(source, MAX_VIDEO_SOURCE_BYTES, "video", cancel)
+}
+
+fn stage_media_source(
+    source: &str,
+    max_bytes: u64,
+    label: &str,
+    cancel: &CancelFlag,
+) -> EngineResult<StagedVideo> {
+    let value = source.trim();
+    if value.is_empty() {
+        return Err("video_url.url must not be empty".to_string());
+    }
+    if let Some(raw) = value.strip_prefix("file://") {
+        let path = PathBuf::from(raw);
+        validate_media_file(&path, max_bytes, label)?;
+        return Ok(StagedVideo {
+            path,
+            cleanup: None,
+        });
+    }
+    if value.starts_with("http://") || value.starts_with("https://") {
+        return download_media_url(value, max_bytes, label, cancel);
+    }
+    let path = PathBuf::from(value);
+    validate_media_file(&path, max_bytes, label)?;
+    Ok(StagedVideo {
+        path,
+        cleanup: None,
+    })
+}
+
+fn validate_media_file(path: &Path, max_bytes: u64, label: &str) -> EngineResult<()> {
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("could not read {label} file: {error}"))?;
+    if !metadata.is_file() {
+        return Err(format!("{label} source must be a regular file"));
+    }
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let allowed = match label {
+        "image" => matches!(extension.as_deref(), Some("jpg" | "jpeg" | "png" | "webp")),
+        "video" => matches!(
+            extension.as_deref(),
+            Some("avi" | "m4v" | "mkv" | "mov" | "mp4" | "mpeg" | "mpg" | "ts" | "webm")
+        ),
+        _ => false,
+    };
+    if !allowed {
+        return Err(format!(
+            "{label} file must use a supported media filename extension"
+        ));
+    }
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "{label} file exceeds the {} MiB limit",
+            max_bytes / 1024 / 1024
+        ));
+    }
+    Ok(())
+}
+
+fn download_media_url(
+    value: &str,
+    max_bytes: u64,
+    label: &str,
+    cancel: &CancelFlag,
+) -> EngineResult<StagedVideo> {
+    let url =
+        reqwest::Url::parse(value).map_err(|error| format!("invalid {label} URL: {error}"))?;
+    if url.scheme() != "https" && url.scheme() != "http" {
+        return Err(format!("{label} URL must use http or https"));
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| format!("{label} URL is missing a host"))?;
+    let port = url.port_or_known_default().unwrap_or(443);
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("could not resolve {label} URL host: {error}"))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(format!("could not resolve {label} URL host"));
+    }
+    if addresses
+        .iter()
+        .any(|address| disallowed_video_host(address.ip()))
+    {
+        return Err(format!(
+            "{label} URL resolves to a loopback, private, or reserved address"
+        ));
+    }
+    // Pin the connection to the addresses just checked. Without this resolver override, a hostile
+    // hostname could answer public DNS here and a private address when reqwest resolves it again.
+    let mut builder = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30));
+    for address in addresses {
+        builder = builder.resolve(host, address);
+    }
+    let client = builder
+        .build()
+        .map_err(|error| format!("could not prepare {label} download: {error}"))?;
+    let mut response = client
+        .get(url)
+        .send()
+        .map_err(|error| format!("could not download {label} URL: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("{label} URL returned HTTP {}", response.status()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|size| size > max_bytes)
+    {
+        return Err(format!(
+            "{label} URL exceeds the {} MiB limit",
+            max_bytes / 1024 / 1024
+        ));
+    }
+    let path = std::env::temp_dir().join(format!(
+        "chatworks-{label}-{}-{}.bin",
+        std::process::id(),
+        crate::fsutil::now_nanos()
+    ));
+    let mut file =
+        fs::File::create(&path).map_err(|error| format!("could not stage {label} URL: {error}"))?;
+    let mut downloaded = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        if cancel.is_cancelled() {
+            let _ = fs::remove_file(&path);
+            return Err("request cancelled while downloading media".to_string());
+        }
+        let read = match response.read(&mut buffer) {
+            Ok(read) => read,
+            Err(error) => {
+                let _ = fs::remove_file(&path);
+                return Err(format!("could not read {label} URL: {error}"));
+            }
+        };
+        if read == 0 {
+            break;
+        }
+        downloaded = downloaded.saturating_add(read as u64);
+        if downloaded > max_bytes {
+            let _ = fs::remove_file(&path);
+            return Err(format!(
+                "{label} URL exceeds the {} MiB limit",
+                max_bytes / 1024 / 1024
+            ));
+        }
+        if let Err(error) = file.write_all(&buffer[..read]) {
+            let _ = fs::remove_file(&path);
+            return Err(format!("could not stage {label} URL: {error}"));
+        }
+    }
+    Ok(StagedVideo {
+        path: path.clone(),
+        cleanup: Some(path),
+    })
+}
+
+fn disallowed_video_host(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, c, d] = ip.octets();
+            a == 0
+                || a == 10
+                || a == 127
+                || a >= 224
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 0 && (c == 0 || c == 2))
+                || (a == 192 && b == 168)
+                || (a == 198 && (b == 18 || b == 19))
+                || (a == 198 && b == 51 && c == 100)
+                || (a == 203 && b == 0 && c == 113)
+                || (a == 255 && b == 255 && c == 255 && d == 255)
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            if segments[..5] == [0, 0, 0, 0, 0] && segments[5] == 0xffff {
+                let v4 = std::net::Ipv4Addr::new(
+                    (segments[6] >> 8) as u8,
+                    segments[6] as u8,
+                    (segments[7] >> 8) as u8,
+                    segments[7] as u8,
+                );
+                return disallowed_video_host(IpAddr::V4(v4));
+            }
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn configured_media_binary(name: &str) -> EngineResult<OsString> {
+    // Development and test runs do not have a Tauri application bundle. Their explicit
+    // override/PATH route is deliberately compiled out of release binaries, which always use the
+    // checksum-verified sidecar bundled by `scripts/provision-ffmpeg-sidecars.sh`.
+    #[cfg(debug_assertions)]
+    {
+        let variable = if name == "ffmpeg" {
+            "CHATWORKS_FFMPEG"
+        } else {
+            "CHATWORKS_FFPROBE"
+        };
+        Ok(std::env::var_os(variable).unwrap_or_else(|| OsString::from(name)))
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let extension = if cfg!(target_os = "windows") {
+            ".exe"
+        } else {
+            ""
+        };
+        let binary = format!("{name}{extension}");
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("could not locate the bundled {name} sidecar: {error}"))?;
+        let parent = executable.parent().ok_or_else(|| {
+            format!("could not locate the bundled {name} sidecar beside the application")
+        })?;
+        // Tauri's `externalBin` places sidecars alongside the app executable. Resources is kept
+        // as a compatibility candidate for older platform bundle layouts.
+        let candidates = [
+            parent.join(&binary),
+            parent.join("..").join("Resources").join(&binary),
+        ];
+        candidates
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .map(|candidate| candidate.into_os_string())
+            .ok_or_else(|| {
+                format!(
+                    "the bundled {name} media component is missing; reinstall this ChatWorks release"
+                )
+            })
+    }
+}
+
+const MEDIA_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn run_media_command(
+    command: &mut Command,
+    cancel: &CancelFlag,
+    operation: &str,
+) -> EngineResult<(std::process::ExitStatus, Vec<u8>)> {
+    if cancel.is_cancelled() {
+        return Err("request cancelled before media decoding".to_string());
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("FFmpeg could not {operation} the video: {error}"))?;
+    let deadline = Instant::now() + MEDIA_COMMAND_TIMEOUT;
+    loop {
+        if cancel.is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("request cancelled while decoding media".to_string());
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "FFmpeg timed out while attempting to {operation} the video"
+            ));
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("could not wait for FFmpeg: {error}"))?
+        {
+            let mut stdout = Vec::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                pipe.read_to_end(&mut stdout)
+                    .map_err(|error| format!("could not read FFmpeg output: {error}"))?;
+            }
+            return Ok((status, stdout));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn decode_staged_video(path: &Path, cancel: &CancelFlag) -> EngineResult<VideoRef> {
+    let ffprobe = configured_media_binary("ffprobe")?;
+    let mut probe_command = Command::new(&ffprobe);
+    probe_command
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path);
+    let (probe_status, probe_stdout) = run_media_command(&mut probe_command, cancel, "inspect")?;
+    if !probe_status.success() {
+        return Err("FFmpeg could not inspect the video file or URL".to_string());
+    }
+    let duration = String::from_utf8_lossy(&probe_stdout)
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| "FFmpeg did not report a finite video duration".to_string())?;
+    if !duration.is_finite() || duration <= 0.0 || duration > MAX_VIDEO_SOURCE_SECONDS {
+        return Err(format!(
+            "video duration must be between 0 and {} seconds",
+            MAX_VIDEO_SOURCE_SECONDS as u64
+        ));
+    }
+    let count = VIDEO_SOURCE_FRAMES.min(MAX_FRAMES_PER_VIDEO);
+    let timestamps = (0..count)
+        .map(|index| ((index + 1) as f64 * duration / (count + 1) as f64) as f32)
+        .collect::<Vec<_>>();
+    let ffmpeg = configured_media_binary("ffmpeg")?;
+    let mut frames = Vec::with_capacity(count);
+    for (index, timestamp) in timestamps.iter().enumerate() {
+        let output = std::env::temp_dir().join(format!(
+            "chatworks-video-frame-{}-{}-{index}.jpg",
+            std::process::id(),
+            crate::fsutil::now_nanos()
+        ));
+        let mut command = Command::new(&ffmpeg);
+        command
+            .args(["-v", "error", "-ss", &format!("{timestamp:.3}"), "-i"])
+            .arg(path)
+            .args([
+                "-frames:v",
+                "1",
+                "-vf",
+                &format!("scale={VIDEO_SOURCE_MAX_AXIS}:{VIDEO_SOURCE_MAX_AXIS}:force_original_aspect_ratio=decrease"),
+                "-q:v",
+                "4",
+                "-y",
+            ])
+            .arg(&output);
+        let (status, _) = match run_media_command(&mut command, cancel, "sample") {
+            Ok(result) => result,
+            Err(error) => {
+                let _ = fs::remove_file(&output);
+                return Err(error);
+            }
+        };
+        if !status.success() {
+            let _ = fs::remove_file(&output);
+            return Err("FFmpeg could not sample a frame from the video file or URL".to_string());
+        }
+        let bytes = fs::read(&output);
+        let _ = fs::remove_file(&output);
+        let bytes =
+            bytes.map_err(|error| format!("could not read sampled video frame: {error}"))?;
+        use base64::Engine as _;
+        frames.push(format!(
+            "data:image/jpeg;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        ));
+    }
+    GenerateVideo { frames, timestamps }.into_core()
+}
 
 /// Decode an image attachment (`data:<mime>;base64,<data>` URL or bare base64) to an RGB8
 /// [`ImageRef`], rejecting images whose decoded dimensions exceed [`MAX_IMAGE_PIXELS`]
@@ -634,7 +1096,6 @@ const MAX_FRAMES_PER_VIDEO: usize = 64;
 /// non-square images under budget are accepted.
 fn decode_image(data: &str) -> EngineResult<ImageRef> {
     use base64::Engine as _;
-    use image::GenericImageView;
     // Strip the optional `data:<mime>;base64,` prefix.
     let b64 = data
         .rsplit_once(',')
@@ -644,9 +1105,14 @@ fn decode_image(data: &str) -> EngineResult<ImageRef> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|error| format!("invalid base64 image attachment: {error}"))?;
+    decode_image_bytes(&bytes)
+}
+
+fn decode_image_bytes(bytes: &[u8]) -> EngineResult<ImageRef> {
+    use image::GenericImageView;
     let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes));
     reader.set_format(
-        image::guess_format(&bytes)
+        image::guess_format(bytes)
             .map_err(|error| format!("could not determine image attachment format: {error}"))?,
     );
     // Bomb guard: reject absurd per-axis dimensions before decoding the full buffer. Set generously
@@ -689,6 +1155,8 @@ pub struct SamplingRequest {
     #[serde(default)]
     pub top_k: Option<usize>,
     #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
     pub repetition_penalty: Option<f32>,
     #[serde(default)]
     pub repetition_context: Option<usize>,
@@ -705,6 +1173,9 @@ impl SamplingRequest {
         }
         if let Some(value) = self.top_k {
             sampling.top_k = value;
+        }
+        if let Some(value) = self.presence_penalty {
+            sampling.presence_penalty = value;
         }
         if let Some(value) = self.repetition_penalty {
             sampling.repetition_penalty = value;
@@ -727,6 +1198,8 @@ pub struct LoadedModelStatus {
     pub source: String,
     pub name: String,
     pub quantize: Option<QuantizeRequest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub projector_source: Option<String>,
     pub provider: ProviderSummary,
 }
 
@@ -760,6 +1233,10 @@ pub struct CapabilitySummary {
     pub supports_video: bool,
     pub supports_thinking: bool,
     pub supports_reasoning_effort: bool,
+    /// The effort levels this specific loaded template exposes as distinct UI choices. The request
+    /// parser may retain compatibility aliases outside this list.
+    pub reasoning_efforts: Vec<String>,
+    pub model_sampling_defaults: Option<ModelSamplingDefaultsPayload>,
     pub supports_preserve_thinking: bool,
     pub supports_tools: bool,
     pub mtp: Option<MtpCapabilitiesPayload>,
@@ -776,6 +1253,14 @@ impl From<TextLlmCapabilities> for CapabilitySummary {
             supports_video: value.supports_video,
             supports_thinking: value.supports_thinking,
             supports_reasoning_effort: value.supports_reasoning_effort,
+            reasoning_efforts: value
+                .reasoning_efforts
+                .into_iter()
+                .map(|effort| effort.as_str().to_string())
+                .collect(),
+            model_sampling_defaults: value
+                .model_sampling_defaults
+                .map(ModelSamplingDefaultsPayload::from),
             supports_preserve_thinking: value.supports_preserve_thinking,
             supports_tools: value.supports_tools,
             mtp: value.mtp.map(MtpCapabilitiesPayload::from),
@@ -803,6 +1288,44 @@ impl From<MtpCapabilities> for MtpCapabilitiesPayload {
 }
 
 #[derive(Clone, Debug, Serialize)]
+pub struct SamplingDefaultsPayload {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: usize,
+    pub presence_penalty: f32,
+    pub repetition_penalty: f32,
+    pub repetition_context: usize,
+}
+
+impl From<Sampling> for SamplingDefaultsPayload {
+    fn from(value: Sampling) -> Self {
+        Self {
+            temperature: value.temperature,
+            top_p: value.top_p,
+            top_k: value.top_k,
+            presence_penalty: value.presence_penalty,
+            repetition_penalty: value.repetition_penalty,
+            repetition_context: value.repetition_context,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ModelSamplingDefaultsPayload {
+    pub thinking: SamplingDefaultsPayload,
+    pub non_thinking: SamplingDefaultsPayload,
+}
+
+impl From<crate::core_llm::ModelSamplingDefaults> for ModelSamplingDefaultsPayload {
+    fn from(value: crate::core_llm::ModelSamplingDefaults) -> Self {
+        Self {
+            thinking: SamplingDefaultsPayload::from(value.thinking),
+            non_thinking: SamplingDefaultsPayload::from(value.non_thinking),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct MtpStatsPayload {
     pub proposed_tokens: u32,
     pub accepted_tokens: u32,
@@ -825,7 +1348,10 @@ pub struct GenerationTimingsPayload {
 }
 impl From<GenerationTimings> for GenerationTimingsPayload {
     fn from(value: GenerationTimings) -> Self {
-        Self { prefill_ms: value.prefill.as_millis(), decode_ms: value.decode.as_millis() }
+        Self {
+            prefill_ms: value.prefill.as_millis(),
+            decode_ms: value.decode.as_millis(),
+        }
     }
 }
 
@@ -949,6 +1475,7 @@ mod tests {
                 source: "/tmp/fake-model".to_string(),
                 display_name: None,
                 quantize: None,
+                projector_source: None,
             })
             .unwrap();
         assert_eq!(status.loaded.unwrap().name, "fake-model");
@@ -962,6 +1489,7 @@ mod tests {
                         content: "hello".to_string(),
                         images: Vec::new(),
                         videos: Vec::new(),
+                        media: Vec::new(),
                         tool_calls: Vec::new(),
                         thinking: None,
                     }],
@@ -1001,6 +1529,7 @@ mod tests {
                     content: "hello".to_string(),
                     images: Vec::new(),
                     videos: Vec::new(),
+                    media: Vec::new(),
                     tool_calls: Vec::new(),
                     thinking: None,
                 }],
@@ -1038,6 +1567,7 @@ mod tests {
                 content: "describe".to_string(),
                 images: Vec::new(),
                 videos: vec![GenerateVideo { frames, timestamps }],
+                media: Vec::new(),
                 tool_calls: Vec::new(),
                 thinking: None,
             }],
@@ -1060,6 +1590,7 @@ mod tests {
                 source: "/tmp/fake-model".to_string(),
                 display_name: None,
                 quantize: None,
+                projector_source: None,
             })
             .unwrap();
         let err = engine.generate(request, |_| {}).unwrap_err();
@@ -1085,6 +1616,35 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn cancelled_media_command_never_spawns_a_decoder() {
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let mut command = Command::new("chatworks-no-such-media-command");
+        let err = run_media_command(&mut command, &cancel, "inspect").unwrap_err();
+        assert!(err.contains("cancelled before media decoding"));
+    }
+
+    #[test]
+    fn rejects_private_network_video_urls_before_download() {
+        assert!(disallowed_video_host("127.0.0.1".parse().unwrap()));
+        assert!(disallowed_video_host("10.0.0.1".parse().unwrap()));
+        assert!(disallowed_video_host("100.64.0.1".parse().unwrap()));
+        assert!(disallowed_video_host("198.18.0.1".parse().unwrap()));
+        assert!(disallowed_video_host("::1".parse().unwrap()));
+        assert!(disallowed_video_host("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!disallowed_video_host("8.8.8.8".parse().unwrap()));
+        assert!(
+            download_media_url(
+                "http://127.0.0.1/example.mp4",
+                MAX_VIDEO_SOURCE_BYTES,
+                "video",
+                &CancelFlag::new()
+            )
+            .is_err()
+        );
+    }
+
     /// cancel() returns false when nothing is in flight and true once a generation's flag is
     /// installed. Because FakeProvider.generate runs synchronously to completion, we can't observe
     /// a mid-stream cancel end-to-end here, but we can confirm the handle exposes the cancel path
@@ -1099,6 +1659,7 @@ mod tests {
                 source: "/tmp/fake-model".to_string(),
                 display_name: None,
                 quantize: None,
+                projector_source: None,
             })
             .unwrap();
         engine
@@ -1109,6 +1670,7 @@ mod tests {
                         content: "hello".to_string(),
                         images: Vec::new(),
                         videos: Vec::new(),
+                        media: Vec::new(),
                         tool_calls: Vec::new(),
                         thinking: None,
                     }],

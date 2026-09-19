@@ -10,6 +10,7 @@ and explicitly lists every available provider.
 
 - Running on Windows/Linux (Candle): see [WINDOWS.md](WINDOWS.md).
 - Sending video over the OpenAI-compatible API: see [docs/VIDEO_API.md](docs/VIDEO_API.md).
+- Release packaging provisions pinned FFmpeg/ffprobe sidecars with `npm run provision:media`; see [the FFmpeg notice](third_party/ffmpeg/NOTICE.md).
 
 ## Quick start (development)
 
@@ -53,7 +54,8 @@ by the real-weights tests under `src-tauri/tests/qwen3vl_*.rs` (gated on `MLX_LL
   - Single image and **multi-image** (image ordering is preserved across content parts).
   - **Video**, sent as pre-sampled frames with optional per-frame timestamps for Qwen3-VL's
     **Text–Timestamp Alignment** (temporal questions). See [docs/VIDEO_API.md](docs/VIDEO_API.md).
-    Note: frames are sampled client-side; the server does not decode video files (see Limitations).
+    The client can send pre-sampled frames or a bounded `video_url.url` file/URL source; see
+    [the video API](docs/VIDEO_API.md).
   - 32-language OCR, spatial / 2D grounding, and long context (the checkpoint advertises a
     262 K-token window).
   - **Tool calling**, including in the same turn as an image (the model emits parseable
@@ -95,8 +97,6 @@ by the dequantize-from-bf16 working set at load, so q4 and q8 land in the same ~
 
 - **Cross-platform (Candle) Qwen3-VL** — Qwen3-VL is macOS/MLX-only today. Bringing the VLM to the
   Candle backend (Windows/Linux) is tracked under epic **sc-8084**.
-- **Server-side video-file decode** — the OpenAI-compatible server accepts *pre-sampled frames*; it
-  does not decode a video file/URL itself. Server-side decode is tracked in **sc-8128**.
 - **Fully-quantized ViT tower** — q4/q8 quantize the language decoder but keep the ViT vision tower
   dense (mixed precision). Quantizing the vision tower is tracked in **sc-8118**.
 

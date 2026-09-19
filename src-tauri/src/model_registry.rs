@@ -22,6 +22,10 @@ pub struct ImportHfModelRequest {
     pub source_url: String,
     #[serde(default)]
     pub quantize: Option<QuantizeRequest>,
+    /// Optional exact companion projector source. A Prism GGUF stays text-only until the user
+    /// chooses one; no sibling is ever inferred by filename.
+    #[serde(default)]
+    pub projector_source: Option<String>,
     #[serde(default)]
     pub job_id: Option<String>,
 }
@@ -71,6 +75,14 @@ pub struct ModelEntry {
     /// Weightless loader route selected by `can_load` for this exact snapshot.
     #[serde(default)]
     pub provider_id: Option<String>,
+    /// User-selected, persisted companion projector for a GGUF language file. This is never
+    /// populated implicitly from a directory containing several projector variants.
+    #[serde(default)]
+    pub projector_source: Option<String>,
+    /// Valid companion projector choices observed in the same snapshot. Kept for an explicit UI
+    /// selection only; `projector_source` remains the one actually loaded.
+    #[serde(default)]
+    pub projector_sources: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -100,6 +112,10 @@ pub struct CachedModelCandidate {
     pub pack: Option<String>,
     pub file_count: usize,
     pub size_bytes: Option<u64>,
+    /// Explicit projector artifacts found beside this GGUF. The UI requires the user to choose;
+    /// an empty selection means text-only loading.
+    #[serde(default)]
+    pub projector_sources: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -108,6 +124,8 @@ pub struct AdoptCachedModelRequest {
     pub local_path: String,
     #[serde(default)]
     pub quantize: Option<QuantizeRequest>,
+    #[serde(default)]
+    pub projector_source: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -171,6 +189,10 @@ pub fn adopt_cached_hf_model(
         revision: candidate.revision.clone(),
         file_name: source_file_name(Path::new(&candidate.local_path)),
     };
+    let projector_source = validate_projector_source(
+        Path::new(&candidate.local_path),
+        request.projector_source.as_deref(),
+    )?;
     let entry = ModelEntry {
         id: model_id(&model_ref, request.quantize),
         name: model_name(&model_ref, request.quantize),
@@ -185,6 +207,8 @@ pub fn adopt_cached_hf_model(
         format: candidate.format,
         pack: candidate.pack,
         provider_id: Some(candidate.provider_id),
+        projector_source: projector_source.clone(),
+        projector_sources: candidate.projector_sources,
     };
     let manifest = registry_path(app)?;
     let mut registry = read_registry(&manifest)?;
@@ -221,26 +245,43 @@ pub fn load_registered_model(
     app: &AppHandle,
     engine: &EngineHandle,
     model_id: String,
+    projector_source: Option<String>,
 ) -> Result<EngineStatus, String> {
     let manifest = registry_path(app)?;
     let mut registry = read_registry(&manifest)?;
-    let entry = registry
+    let entry_index = registry
         .models
         .iter()
-        .find(|model| model.id == model_id)
-        .cloned()
+        .position(|model| model.id == model_id)
         .ok_or_else(|| format!("model {model_id:?} is not in the registry"))?;
+    let requested_projector = projector_source.clone();
+    let entry = registry.models[entry_index].clone();
     let snapshot = Path::new(&entry.local_path);
     validate_model_source(snapshot)?;
     recognized_model_format(snapshot)?;
     if matching_provider(snapshot)?.is_none() {
-        return Err(unsupported_model_source_error(snapshot, "registered model is no longer supported"));
+        return Err(unsupported_model_source_error(
+            snapshot,
+            "registered model is no longer supported",
+        ));
     }
+    let projector_source = validate_projector_source(
+        snapshot,
+        requested_projector
+            .as_deref()
+            .or(entry.projector_source.as_deref()),
+    )?;
     let status = engine.load_model(LoadModelRequest {
         source: entry.local_path.clone(),
         display_name: Some(entry.name.clone()),
         quantize: entry.quantize,
+        projector_source: projector_source.clone(),
     })?;
+    // A present empty string from the picker is an intentional "Text only" selection. Keep it
+    // distinct from an omitted command argument, which preserves an existing association.
+    if requested_projector.is_some() {
+        registry.models[entry_index].projector_source = projector_source;
+    }
     registry.selected_id = Some(entry.id);
     write_registry(&manifest, &registry)?;
     Ok(status)
@@ -353,8 +394,9 @@ async fn import_hf_model_inner(
     );
     let source = imported_model_source(&snapshot_dir, &model_ref)?;
     validate_model_source(&source)?;
-    let provider = matching_provider(&source)?
-        .ok_or_else(|| unsupported_model_source_error(&source, "downloaded model is not supported"))?;
+    let provider = matching_provider(&source)?.ok_or_else(|| {
+        unsupported_model_source_error(&source, "downloaded model is not supported")
+    })?;
     let (format, pack) = recognized_model_format(&source)?;
 
     let mut registry = read_registry(&manifest)?;
@@ -372,6 +414,12 @@ async fn import_hf_model_inner(
         format,
         pack,
         provider_id: Some(provider.id),
+        projector_source: validate_projector_source(&source, request.projector_source.as_deref())?,
+        projector_sources: if source.is_file() {
+            sibling_projector_sources(&source)?
+        } else {
+            Vec::new()
+        },
     };
     upsert_model(&mut registry, entry);
     write_registry(&manifest, &registry)?;
@@ -430,10 +478,16 @@ async fn fetch_hf_files(
 
 /// Import one direct GGUF at a time. This prevents a repo that publishes PQ2, PTQ1, and projector
 /// files from silently downloading every variant or loading an arbitrary one.
-fn select_import_files(files: Vec<HfSibling>, model_ref: &HfModelRef) -> Result<Vec<HfSibling>, String> {
+fn select_import_files(
+    files: Vec<HfSibling>,
+    model_ref: &HfModelRef,
+) -> Result<Vec<HfSibling>, String> {
     if let Some(file_name) = &model_ref.file_name {
         if !is_gguf_model_file(file_name) {
-            return Err("file-specific HuggingFace imports require a non-projector .gguf model file".to_string());
+            return Err(
+                "file-specific HuggingFace imports require a non-projector .gguf model file"
+                    .to_string(),
+            );
         }
         return files
             .into_iter()
@@ -442,7 +496,9 @@ fn select_import_files(files: Vec<HfSibling>, model_ref: &HfModelRef) -> Result<
             .ok_or_else(|| format!("HuggingFace revision does not contain {file_name:?}"));
     }
 
-    let has_safetensors = files.iter().any(|file| file.rfilename.ends_with(".safetensors"));
+    let has_safetensors = files
+        .iter()
+        .any(|file| file.rfilename.ends_with(".safetensors"));
     if has_safetensors {
         return Ok(files
             .into_iter()
@@ -628,13 +684,70 @@ fn is_gguf_model_file(name: &str) -> bool {
     name.ends_with(".gguf") && !name.to_ascii_lowercase().contains("mmproj")
 }
 
+fn is_projector_file(name: &str) -> bool {
+    name.ends_with(".gguf") && name.to_ascii_lowercase().contains("mmproj")
+}
+
+/// Projectors are a user choice: accept only an explicit GGUF `mmproj` artifact from the same
+/// snapshot directory as a direct language GGUF. This rejects arbitrary path injection while
+/// retaining both published BF16 and Q8 variants for an intentional selection.
+fn validate_projector_source(
+    model: &Path,
+    requested: Option<&str>,
+) -> Result<Option<String>, String> {
+    let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if !model.is_file() {
+        return Err("a projector can only be paired with a direct GGUF language file".to_string());
+    }
+    let projector = Path::new(requested);
+    if !projector.is_file() || !is_projector_file(&projector.to_string_lossy()) {
+        return Err("projector must be an existing mmproj .gguf file".to_string());
+    }
+    if projector.parent() != model.parent() {
+        return Err(
+            "projector must come from the same snapshot directory as its GGUF language model"
+                .to_string(),
+        );
+    }
+    let mut header = [0_u8; 4];
+    std::io::Read::read_exact(
+        &mut fs::File::open(projector).map_err(|error| error.to_string())?,
+        &mut header,
+    )
+    .map_err(|error| error.to_string())?;
+    if header != *b"GGUF" {
+        return Err("projector GGUF has an invalid header or is corrupt".to_string());
+    }
+    Ok(Some(projector.to_string_lossy().to_string()))
+}
+
+fn sibling_projector_sources(model: &Path) -> Result<Vec<String>, String> {
+    let Some(directory) = model.parent() else {
+        return Ok(Vec::new());
+    };
+    let mut sources = fs::read_dir(directory)
+        .map_err(|error| error.to_string())?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && is_projector_file(&path.to_string_lossy()))
+        .filter_map(|path| validate_projector_source(model, path.to_str()).ok())
+        .flatten()
+        .collect::<Vec<_>>();
+    sources.sort();
+    Ok(sources)
+}
+
 fn source_file_name(path: &Path) -> Option<String> {
     path.is_file()
         .then(|| path.file_name()?.to_str().map(str::to_string))
         .flatten()
 }
 
-fn default_model_format() -> String { "hf-safetensors".to_string() }
+fn default_model_format() -> String {
+    "hf-safetensors".to_string()
+}
 
 /// Labels a Prism/Bonsai pack only when its immutable pack sidecars are present. Model config
 /// strings remain insufficient: the linked loader's `can_load` decides support separately.
@@ -643,7 +756,10 @@ fn recognized_model_format(path: &Path) -> Result<(String, Option<String>), Stri
         if !is_gguf_model_file(&path.to_string_lossy()) {
             return Err("direct model source must be a non-projector .gguf file".to_string());
         }
-        return Ok(("gguf-prism-packed".to_string(), Some("bonsai2-packed".to_string())));
+        return Ok((
+            "gguf-prism-packed".to_string(),
+            Some("bonsai2-packed".to_string()),
+        ));
     }
     let hadamard = path.join("hadamard.json").is_file();
     let runtime = path.join("PACK-RUNTIME").is_file();
@@ -674,7 +790,9 @@ fn imported_model_source(snapshot_dir: &Path, model_ref: &HfModelRef) -> Result<
         [] => Ok(snapshot_dir.to_path_buf()),
         // `select_import_files` rejects this before any download. Keep this guard so a partially
         // populated cache cannot pick an arbitrary quantization variant on retry.
-        _ => Err("downloaded snapshot has multiple GGUF model files; use an exact blob URL".to_string()),
+        _ => Err(
+            "downloaded snapshot has multiple GGUF model files; use an exact blob URL".to_string(),
+        ),
     }
 }
 
@@ -832,6 +950,11 @@ fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, S
         pack,
         file_count,
         size_bytes,
+        projector_sources: if path.is_file() {
+            sibling_projector_sources(path)?
+        } else {
+            Vec::new()
+        },
     }))
 }
 
@@ -839,6 +962,7 @@ fn matching_provider(path: &Path) -> Result<Option<crate::core_llm::TextLlmDescr
     let source = path.to_string_lossy().to_string();
     let spec = LoadSpec {
         source,
+        projector_source: None,
         quantize: None,
     };
     Ok(crate::inference_runtime::textllms()
@@ -1193,7 +1317,10 @@ mod tests {
         assert!(validate_model_source(&source).is_ok());
         assert_eq!(
             recognized_model_format(&source).unwrap(),
-            ("gguf-prism-packed".to_string(), Some("bonsai2-packed".to_string()))
+            (
+                "gguf-prism-packed".to_string(),
+                Some("bonsai2-packed".to_string())
+            )
         );
     }
 
@@ -1218,15 +1345,26 @@ mod tests {
         assert!(model.source_url().ends_with("/blob/6ed5e12/PQ2_0.gguf"));
 
         let files = vec![
-            HfSibling { rfilename: "PQ2_0.gguf".to_string(), size: Some(1) },
-            HfSibling { rfilename: "PTQ1_0.gguf".to_string(), size: Some(1) },
-            HfSibling { rfilename: "mmproj-F16.gguf".to_string(), size: Some(1) },
+            HfSibling {
+                rfilename: "PQ2_0.gguf".to_string(),
+                size: Some(1),
+            },
+            HfSibling {
+                rfilename: "PTQ1_0.gguf".to_string(),
+                size: Some(1),
+            },
+            HfSibling {
+                rfilename: "mmproj-F16.gguf".to_string(),
+                size: Some(1),
+            },
         ];
         let selected = select_import_files(files.clone(), &model).unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].rfilename, "PQ2_0.gguf");
         let repo = HfModelRef::parse("prism-ml/Ternary-Bonsai-2-27B-gguf").unwrap();
-        assert!(select_import_files(files, &repo).unwrap_err().contains("multiple GGUF"));
+        assert!(select_import_files(files, &repo)
+            .unwrap_err()
+            .contains("multiple GGUF"));
     }
 
     #[test]
@@ -1249,23 +1387,48 @@ mod tests {
         let pq2 = snapshot.join("PQ2_0.gguf");
         write_minimal_prism_gguf(&pq2);
         write_minimal_prism_gguf(&snapshot.join("mmproj-F16.gguf"));
+        write_minimal_prism_gguf(&snapshot.join("mmproj-Q8.gguf"));
         let sources = cached_model_sources(&snapshot).unwrap();
         assert_eq!(sources, vec![pq2.clone()]);
-        let candidate = cached_model_candidate(&pq2).unwrap().expect("native GGUF provider");
+        let candidate = cached_model_candidate(&pq2)
+            .unwrap()
+            .expect("native GGUF provider");
         assert_eq!(candidate.format, "gguf-prism-packed");
         assert_eq!(candidate.pack.as_deref(), Some("bonsai2-packed"));
         assert_eq!(candidate.file_count, 1);
         assert_eq!(candidate.local_path, pq2.to_string_lossy());
+        assert_eq!(candidate.projector_sources.len(), 2);
+    }
+
+    #[test]
+    fn projector_must_be_an_explicit_same_snapshot_gguf() {
+        let dir = snapshot_dir("projector-association");
+        let model = dir.path().join("PQ2_0.gguf");
+        let projector = dir.path().join("mmproj-F16.gguf");
+        write_minimal_prism_gguf(&model);
+        write_minimal_prism_gguf(&projector);
+        assert_eq!(validate_projector_source(&model, None).unwrap(), None);
+        assert_eq!(
+            validate_projector_source(&model, projector.to_str()).unwrap(),
+            Some(projector.to_string_lossy().to_string())
+        );
+        assert!(validate_projector_source(&model, Some("/tmp/not-a-projector.gguf")).is_err());
     }
 
     #[test]
     fn recognizes_only_complete_bonsai_packing_sidecars() {
         let dir = snapshot_dir("bonsai-sidecars");
-        assert_eq!(recognized_model_format(dir.path()).unwrap(), ("hf-safetensors".to_string(), None));
+        assert_eq!(
+            recognized_model_format(dir.path()).unwrap(),
+            ("hf-safetensors".to_string(), None)
+        );
         write_snapshot_file(&dir, "hadamard.json", "{}");
         assert!(recognized_model_format(dir.path()).is_err());
         write_snapshot_file(&dir, "PACK-RUNTIME", "ptq1");
-        assert_eq!(recognized_model_format(dir.path()).unwrap().1.as_deref(), Some("bonsai2-packed"));
+        assert_eq!(
+            recognized_model_format(dir.path()).unwrap().1.as_deref(),
+            Some("bonsai2-packed")
+        );
         assert!(is_loadable_model_file("hadamard.json"));
         assert!(is_loadable_model_file("PACK-RUNTIME"));
     }
@@ -1537,6 +1700,8 @@ mod tests {
                 format: default_model_format(),
                 pack: None,
                 provider_id: None,
+                projector_source: None,
+                projector_sources: Vec::new(),
             },
         );
         upsert_model(
@@ -1555,6 +1720,8 @@ mod tests {
                 format: default_model_format(),
                 pack: None,
                 provider_id: None,
+                projector_source: None,
+                projector_sources: Vec::new(),
             },
         );
         assert_eq!(registry.models.len(), 1);

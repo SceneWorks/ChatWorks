@@ -30,7 +30,7 @@ test("model defaults remain omitted and MTP defaults off", () => {
 test("explicit native controls survive conversation persistence and request mapping", () => {
   const selected = { systemPrompt: "", temperature: "0.7", topP: "0.9", maxTokens: "16",
     disableThinking: false, reasoningEffort: "low", preserveThinking: "false",
-    mtpMode: "enabled", mtpDraftTokens: "5", topK: "20", repetitionPenalty: "1.1",
+    mtpMode: "enabled", mtpDraftTokens: "5", topK: "20", presencePenalty: "1.5", repetitionPenalty: "1.1",
     repetitionContext: "64", seed: "42" };
   const restored = paramsFromConversation(paramsToConversation(selected));
   assert.deepEqual(restored, selected);
@@ -39,6 +39,7 @@ test("explicit native controls survive conversation persistence and request mapp
   assert.equal(body.preserve_thinking, false);
   assert.deepEqual(body.mtp, { mode: "enabled", draft_tokens: 5 });
   assert.equal(body.top_k, 20);
+  assert.equal(body.presence_penalty, 1.5);
   assert.equal(body.repetition_penalty, 1.1);
   assert.equal(body.repetition_context, 64);
   assert.equal(body.seed, 42);
@@ -63,6 +64,21 @@ test("assistant reasoning survives ordinary and tool-call history", () => {
   assert.equal(message.tool_calls[0].function.arguments, '{"query":"test"}');
   assert.equal(Object.hasOwn(toOpenAiMessage({ role: "user", content: "Hi", thinking: "Ignore" }),
     "reasoning_content"), false);
+});
+
+test("mixed media preserves its attachment order on the OpenAI wire", () => {
+  const message = toOpenAiMessage({
+    role: "user",
+    content: "Describe the sequence",
+    media: [
+      { type: "video", frames: ["data:image/jpeg;base64,AA=="], timestamps: [0], fps: 1 },
+      { type: "image", url: "data:image/jpeg;base64,BB==" },
+      { type: "video", frames: ["data:image/jpeg;base64,CC=="], timestamps: [2], fps: 1 },
+    ],
+  });
+  assert.deepEqual(message.content.map((part) => part.type), ["video_url", "image_url", "video_url", "text"]);
+  assert.deepEqual(message.content[0].video_url.timestamps, [0]);
+  assert.equal(message.content[1].image_url.url, "data:image/jpeg;base64,BB==");
 });
 
 test("a seed beyond JavaScript precision cannot silently change the requested run", () => {

@@ -587,6 +587,18 @@
   cursor: pointer;
 }
 
+.composer-url-input {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: var(--gap-2);
+  align-items: center;
+}
+
+.composer-url-input input,
+.composer-url-input select {
+  min-width: 0;
+}
+
 .message-images {
   display: flex;
   flex-wrap: wrap;

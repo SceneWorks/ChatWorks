@@ -52,6 +52,11 @@ impl AppSettings {
                 return Err("repetition penalty must be finite and greater than 0".to_string());
             }
         }
+        if let Some(penalty) = self.sampling.presence_penalty {
+            if !penalty.is_finite() {
+                return Err("presence penalty must be finite".to_string());
+            }
+        }
         Ok(self)
     }
 }
@@ -104,6 +109,8 @@ pub struct SamplingDefaults {
     #[serde(default)]
     pub top_k: Option<usize>,
     #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
     pub repetition_penalty: Option<f32>,
     #[serde(default)]
     pub repetition_context: Option<usize>,
@@ -124,6 +131,7 @@ impl Default for SamplingDefaults {
             mtp_mode: default_mtp_mode(),
             mtp_draft_tokens: default_mtp_draft_tokens(),
             top_k: None,
+            presence_penalty: None,
             repetition_penalty: None,
             repetition_context: None,
             seed: None,

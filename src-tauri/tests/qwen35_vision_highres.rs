@@ -42,6 +42,7 @@ fn qwen35_vision_high_resolution_prefill_does_not_crash() {
             source: model,
             display_name: None,
             quantize: None,
+            projector_source: None,
         })
         .expect("load 27B");
 
@@ -54,6 +55,7 @@ fn qwen35_vision_high_resolution_prefill_does_not_crash() {
                 content: "What is in this image? One word.".into(),
                 images: vec![gradient_png_data_url(w, h)],
                 videos: vec![],
+                media: vec![],
                 tool_calls: vec![],
                 thinking: None,
             }],

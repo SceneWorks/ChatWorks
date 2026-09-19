@@ -43,6 +43,7 @@ export function ModelsScreen() {
   const [cacheBusy, setCacheBusy] = useState(false);
   const [cachedModels, setCachedModels] = useState([]);
   const [adoptingPath, setAdoptingPath] = useState("");
+  const [projectorSelections, setProjectorSelections] = useState({});
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null);
   const [loadingId, setLoadingId] = useState("");
@@ -124,7 +125,11 @@ export function ModelsScreen() {
     const option = QUANTIZE_OPTIONS.find((item) => item.id === quantizeId) ?? QUANTIZE_OPTIONS[0];
     try {
       const next = await invoke("adopt_cached_hf_model", {
-        request: { localPath: candidate.localPath, quantize: option.value },
+        request: {
+          localPath: candidate.localPath,
+          quantize: option.value,
+          projectorSource: candidate.projectorSource,
+        },
       });
       setRegistry(next);
       setNotice(`${candidate.name} added from the HuggingFace cache.`);
@@ -141,7 +146,10 @@ export function ModelsScreen() {
     setError(null);
     setNotice(null);
     try {
-      await invoke("load_registered_model", { modelId: model.id });
+      await invoke("load_registered_model", {
+        modelId: model.id,
+        projectorSource: projectorSelections[model.id] ?? model.projectorSource ?? null,
+      });
       await refreshRegistry();
       await refreshEngineStatus();
       setNotice(`${model.name} is now the served model.`);
@@ -259,6 +267,7 @@ export function ModelsScreen() {
           <ul className="model-list">
             {cachedModels.map((model) => {
               const alreadyRegistered = registry.models.some((entry) => entry.localPath === model.localPath);
+              const selectedProjector = projectorSelections[model.localPath] ?? "";
               return (
                 <li className="model-row" key={model.localPath}>
                   <div className="model-row-main">
@@ -268,10 +277,21 @@ export function ModelsScreen() {
                     </span>
                   </div>
                   <span className="model-row-meta">{formatBytes(model.sizeBytes)}</span>
+                  {model.projectorSources?.length ? (
+                    <select
+                      aria-label={`Projector for ${model.name}`}
+                      disabled={Boolean(adoptingPath) || alreadyRegistered}
+                      onChange={(event) => setProjectorSelections((current) => ({ ...current, [model.localPath]: event.target.value }))}
+                      value={selectedProjector}
+                    >
+                      <option value="">Text only (no projector)</option>
+                      {model.projectorSources.map((source) => <option key={source} value={source}>{source.split("/").at(-1)}</option>)}
+                    </select>
+                  ) : null}
                   <button
                     className="ghost-btn"
                     disabled={Boolean(adoptingPath) || alreadyRegistered}
-                    onClick={() => handleAdoptCached(model)}
+                    onClick={() => handleAdoptCached({ ...model, projectorSource: selectedProjector || null })}
                     type="button"
                   >
                     {alreadyRegistered ? "Registered" : adoptingPath === model.localPath ? "Adding…" : "Add"}
@@ -302,10 +322,12 @@ export function ModelsScreen() {
         {registry.models.length ? (
           <ul className="model-list">
             {registry.models.map((model) => {
+              const selectedProjector = projectorSelections[model.id] ?? model.projectorSource ?? "";
               const isServed =
                 loadedSource &&
                 model.localPath === loadedSource &&
-                (model.quantize ?? null) === (engineStatus?.loaded?.quantize ?? null);
+                (model.quantize ?? null) === (engineStatus?.loaded?.quantize ?? null) &&
+                (selectedProjector || null) === (engineStatus?.loaded?.projector_source ?? null);
               return (
                 <li className={isServed ? "model-row served" : "model-row"} key={model.id}>
                   <div className="model-row-main">
@@ -316,6 +338,17 @@ export function ModelsScreen() {
                     <span className="model-row-meta">{model.repo}</span>
                   </div>
                   <span className="model-row-meta">{modelSubtitle(model)}</span>
+                  {model.projectorSources?.length ? (
+                    <select
+                      aria-label={`Projector for ${model.name}`}
+                      disabled={Boolean(loadingId)}
+                      onChange={(event) => setProjectorSelections((current) => ({ ...current, [model.id]: event.target.value }))}
+                      value={selectedProjector}
+                    >
+                      <option value="">Text only (no projector)</option>
+                      {model.projectorSources.map((source) => <option key={source} value={source}>{source.split("/").at(-1)}</option>)}
+                    </select>
+                  ) : null}
                   <button
                     className="ghost-btn"
                     disabled={Boolean(loadingId) || isServed}

@@ -60,7 +60,7 @@ export function readSseMessages(buffer, onData) {
 /// `tool_calls` (content `null`), a vision turn with `image_url` / `video_url` parts, or a plain text
 /// turn. Video parts (sc-8081) carry pre-sampled `frames` + per-frame `timestamps` (Text–Timestamp
 /// Alignment); visuals come before text, matching the Qwen3-VL convention.
-export function toOpenAiMessage({ role, content, thinking, images, videos, tool_calls: toolCalls }) {
+export function toOpenAiMessage({ role, content, thinking, media, images, videos, tool_calls: toolCalls }) {
   const reasoning = role === "assistant" && thinking != null ? { reasoning_content: thinking } : {};
   if (role === "tool") {
     return { role: "tool", content: content ?? "" };
@@ -83,14 +83,23 @@ export function toOpenAiMessage({ role, content, thinking, images, videos, tool_
       })),
     };
   }
-  if ((images && images.length) || (videos && videos.length)) {
+  const orderedMedia = Array.isArray(media)
+    ? media
+    : [
+        ...(images ?? []).map((url) => ({ type: "image", url })),
+        ...(videos ?? []).map((video) => ({ type: "video", ...video })),
+      ];
+  if (orderedMedia.length) {
     const parts = [];
-    for (const url of images ?? []) parts.push({ type: "image_url", image_url: { url } });
-    for (const video of videos ?? []) {
-      parts.push({
-        type: "video_url",
-        video_url: { frames: video.frames, timestamps: video.timestamps, fps: video.fps },
-      });
+    for (const item of orderedMedia) {
+      if (item.type === "video") {
+        parts.push({
+          type: "video_url",
+          video_url: { frames: item.frames, timestamps: item.timestamps, fps: item.fps },
+        });
+      } else {
+        parts.push({ type: "image_url", image_url: { url: item.url } });
+      }
     }
     if (content) parts.push({ type: "text", text: content });
     return { role, content: parts, ...reasoning };

@@ -8,23 +8,26 @@ export const VIDEO_ATTACHMENT_MAX_FRAMES = 8;
 export const VIDEO_FRAME_MAX_DIMENSION = 768;
 export const VIDEO_FRAME_QUALITY = 0.7;
 
-/// Sample up to `VIDEO_ATTACHMENT_MAX_FRAMES` evenly-spaced frames from a video file, client-side,
+/// Sample up to `VIDEO_ATTACHMENT_MAX_FRAMES` evenly-spaced frames from a video file or HTTPS URL,
 /// using a hidden `<video>` element + canvas (no native decoder). Returns `{ frames, timestamps, fps
 /// }` where `frames` are downscaled JPEG data URLs in temporal order and `timestamps` are the
 /// wall-clock seconds of each sampled frame — exactly the `video_url` shape the local server expects
 /// (sc-8081). `fps` is the *sampled* rate (frames per second over the captured span), forwarded so
 /// the server can derive timestamps if needed.
-export async function sampleVideoAttachment(file) {
-  const url = URL.createObjectURL(file);
+export async function sampleVideoAttachment(source) {
+  const remote = typeof source === "string";
+  const url = remote ? source : URL.createObjectURL(source);
+  const name = remote ? source : source.name || "video attachment";
   const video = document.createElement("video");
   video.preload = "auto";
   video.muted = true;
   video.playsInline = true;
+  if (remote) video.crossOrigin = "anonymous";
   video.src = url;
 
   const ready = new Promise((resolve, reject) => {
     video.onloadedmetadata = () => resolve();
-    video.onerror = () => reject(new Error(`Could not decode ${file.name || "video attachment"}.`));
+    video.onerror = () => reject(new Error(`Could not decode ${name}. Remote video URLs must allow CORS for frame sampling.`));
   });
 
   try {
@@ -72,6 +75,6 @@ export async function sampleVideoAttachment(file) {
     const fps = span > 0 ? (timestamps.length - 1) / span : 1;
     return { frames, timestamps, fps };
   } finally {
-    URL.revokeObjectURL(url);
+    if (!remote) URL.revokeObjectURL(url);
   }
 }

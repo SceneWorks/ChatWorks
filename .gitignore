@@ -26,3 +26,6 @@ dist
 src-tauri/target
 src-tauri/gen
 .DS_Store
+# Generated, pinned FFmpeg/ffprobe Tauri sidecars.
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep
