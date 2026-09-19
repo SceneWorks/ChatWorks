@@ -111,7 +111,7 @@ jobs:
         run: bash scripts/provision-ffmpeg-sidecars.sh
 
       - name: Build the native Tauri package
-        run: npm exec tauri -- build --ci --no-sign --bundles ${{ matrix.bundle }}
+        run: npm exec tauri -- build --ci --no-sign --bundles ${{ matrix.bundle }} -- --locked
 
       - name: Verify packaged sidecars
         if: runner.os != 'Windows'
@@ -156,6 +156,9 @@ jobs:
       - name: Select isolated CUDA build directory
         shell: pwsh
         run: '"CARGO_TARGET_DIR=$env:RUNNER_TEMP/chatworks-cuda-${{ github.run_id }}-${{ github.run_attempt }}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+      - name: Preserve committed LF bytes on Windows
+        shell: pwsh
+        run: git config --global core.autocrlf input
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
@@ -189,7 +192,7 @@ jobs:
           call "%VCVARS%"
           if errorlevel 1 exit /b 1
           set "PATH=%CUDA_PATH%\bin;%PATH%"
-          npm exec tauri -- build --ci --no-sign --features cuda --bundles nsis --config "%RUNNER_TEMP%\chatworks-cuda-runtime\tauri.cuda.json" -- --no-default-features
+          npm exec tauri -- build --ci --no-sign --features cuda --bundles nsis --config "%RUNNER_TEMP%\chatworks-cuda-runtime\tauri.cuda.json" -- --locked --no-default-features
       - name: Verify packaged FFmpeg and CUDA runtime
         shell: msys2 {0}
         env:

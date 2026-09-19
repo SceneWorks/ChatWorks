@@ -14,6 +14,9 @@ function fixture(t) {
     fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
     fs.writeFileSync(path.join(root, file), file);
   }
+  execFileSync('git', ['init', '-q', root]);
+  execFileSync('git', ['-C', root, 'add', '.']);
+  execFileSync('git', ['-C', root, '-c', 'user.name=Package Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture']);
   return root;
 }
 
@@ -21,13 +24,17 @@ test('retained installer hashes bind exact bytes, source and backend; ambiguous 
   const root = fixture(t), build = path.join(root, 'build'), out = path.join(root, 'evidence');
   const packages = path.join(build, 'release/bundle/nsis'); fs.mkdirSync(packages, { recursive: true });
   fs.writeFileSync(path.join(packages, 'ChatWorks-setup.exe'), 'installer bytes');
-  const result = collect(root, build, out, 'x86_64-pc-windows-msvc', 'cpu', 'a'.repeat(40));
+  const result = collect(root, build, out, 'x86_64-pc-windows-msvc', 'cpu', execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
   assert.equal(result.backend, 'cpu'); assert.equal(result.installed_app_acceptance, false);
   assert.equal(result.package.sha256, crypto.createHash('sha256').update('installer bytes').digest('hex'));
   assert.match(result.package.file, /-cpu-/);
   assert.ok(fs.existsSync(path.join(out, 'Cargo.lock')));
+  assert.throws(() => collect(root, build, out, 'x86_64-pc-windows-msvc', 'cpu', 'c'.repeat(40)), /checked-out HEAD/);
+  fs.appendFileSync(path.join(root, 'Cargo.lock'), 'uncommitted drift');
+  assert.throws(() => collect(root, build, out, 'x86_64-pc-windows-msvc', 'cpu', result.source_sha), /committed identity/);
+  execFileSync('git', ['-C', root, 'restore', 'Cargo.lock']);
   fs.writeFileSync(path.join(packages, 'stale-setup.exe'), 'stale');
-  assert.throws(() => collect(root, build, out, 'x86_64-pc-windows-msvc', 'cpu', 'a'.repeat(40)), /exactly one/);
+  assert.throws(() => collect(root, build, out, 'x86_64-pc-windows-msvc', 'cpu', execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()), /exactly one/);
 });
 
 test('CUDA staging and installer verification reject missing, corrupted and misplaced runtime DLLs', t => {
@@ -42,6 +49,17 @@ test('CUDA staging and installer verification reject missing, corrupted and misp
   const receipt = JSON.parse(fs.readFileSync(path.join(stage, 'cuda-runtime.json'), 'utf8'));
   fs.writeFileSync(path.join(stage, 'chatworks.exe'), 'app');
   verifyCudaExtracted(stage, receipt);
+  const receiptPath = path.join(stage, 'cuda-runtime.json');
+  const originalReceipt = fs.readFileSync(receiptPath);
+  fs.rmSync(receiptPath);
+  assert.throws(() => verifyCudaExtracted(stage, receipt), /ENOENT/);
+  fs.writeFileSync(receiptPath, JSON.stringify({ ...receipt, toolkit: 'altered' }));
+  assert.throws(() => verifyCudaExtracted(stage, receipt), /receipt mismatch/);
+  fs.writeFileSync(receiptPath, originalReceipt);
+  const notice = path.join(stage, 'CUDA-NOTICE.txt'), originalNotice = fs.readFileSync(notice);
+  fs.writeFileSync(notice, 'replaced notice');
+  assert.throws(() => verifyCudaExtracted(stage, receipt), /notice mismatch/);
+  fs.writeFileSync(notice, originalNotice);
   fs.writeFileSync(path.join(stage, cudaLibraries[0]), 'corrupt');
   assert.throws(() => verifyCudaExtracted(stage, receipt), /runtime mismatch/);
   fs.copyFileSync(path.join(toolkit, 'bin', cudaLibraries[0]), path.join(stage, cudaLibraries[0]));
@@ -57,7 +75,7 @@ test('macOS evidence archives preserve app permissions and symlinks', { skip: pr
   const app = path.join(build, 'release/bundle/macos/ChatWorks.app/Contents/MacOS');
   fs.mkdirSync(app, { recursive: true }); fs.writeFileSync(path.join(app, 'chatworks'), 'binary', { mode: 0o755 });
   fs.symlinkSync('chatworks', path.join(app, 'alias'));
-  const receipt = collect(root, build, out, 'aarch64-apple-darwin', 'mlx', 'b'.repeat(40));
+  const receipt = collect(root, build, out, 'aarch64-apple-darwin', 'mlx', execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
   assert.match(receipt.package.file, /\.app\.tar\.gz$/);
   assert.ok(receipt.package.bytes > 0);
   const extracted = path.join(root, 'extracted'); fs.mkdirSync(extracted);

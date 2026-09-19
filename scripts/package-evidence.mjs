@@ -34,7 +34,8 @@ export function stageCuda(root, toolkit, output) {
   fs.copyFileSync(path.join(root, 'scripts/CUDA-NOTICE.txt'), path.join(output, 'CUDA-NOTICE.txt'));
   fs.writeFileSync(path.join(output, 'cuda-runtime.json'), JSON.stringify({ toolkit: version.cuda.version,
     files: cudaLibraries.map(name => row(path.join(output, name))),
-    license: row(path.join(output, 'CUDA-EULA.txt')) }, null, 2));
+    license: row(path.join(output, 'CUDA-EULA.txt')),
+    notice: row(path.join(output, 'CUDA-NOTICE.txt')) }, null, 2));
   const resources = Object.fromEntries([...cudaLibraries, 'CUDA-NOTICE.txt', 'CUDA-EULA.txt', 'cuda-runtime.json']
     .map(name => [path.join(output, name).replaceAll('\\', '/'), name]));
   const config = path.join(output, 'tauri.cuda.json');
@@ -56,7 +57,11 @@ export function verifyCudaExtracted(directory, receipt) {
       throw new Error(`CUDA installer runtime mismatch: ${name}`);
     }
   }
-  if (!fs.existsSync(path.join(installRoot, 'CUDA-NOTICE.txt'))) throw new Error('Missing CUDA notice');
+  if (!receipt.notice || hash(path.join(installRoot, 'CUDA-NOTICE.txt')) !== receipt.notice.sha256) {
+    throw new Error('CUDA installer notice mismatch');
+  }
+  const packagedReceipt = JSON.parse(fs.readFileSync(path.join(installRoot, 'cuda-runtime.json'), 'utf8'));
+  if (JSON.stringify(packagedReceipt) !== JSON.stringify(receipt)) throw new Error('CUDA installer receipt mismatch');
   if (!receipt.license || hash(path.join(installRoot, 'CUDA-EULA.txt')) !== receipt.license.sha256) {
     throw new Error('CUDA installer license mismatch');
   }
@@ -73,6 +78,13 @@ export function verifyCudaPackage(installer, stage) {
 
 export function collect(root, targetDir, output, target, backend, sha, cudaStage) {
   if (!/^[a-f0-9]{40}$/.test(sha)) throw new Error('Exact source SHA required');
+  const git = args => execFileSync('git', ['-C', root, ...args], { encoding: 'utf8' }).trim();
+  if (git(['rev-parse', 'HEAD']) !== sha) throw new Error('Source SHA differs from checked-out HEAD');
+  if (git(['status', '--porcelain', '--untracked-files=no'])) throw new Error('Tracked source differs from committed identity');
+  for (const relative of ['Cargo.lock', 'src-tauri/Cargo.toml', 'scripts/git-deps-pinned.csv']) {
+    const committed = execFileSync('git', ['-C', root, 'show', `${sha}:${relative}`]);
+    if (!committed.equals(fs.readFileSync(path.join(root, relative)))) throw new Error(`Uncommitted pin file: ${relative}`);
+  }
   if (!['cpu', 'cuda', 'mlx'].includes(backend)) throw new Error('Explicit backend required');
   fs.mkdirSync(output, { recursive: true });
   const kind = target.includes('apple') ? 'macos' : target.includes('windows') ? 'nsis' : 'deb';
