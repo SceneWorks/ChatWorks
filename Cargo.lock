@@ -549,6 +549,7 @@ dependencies = [
  "runtime-macos",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tokio",

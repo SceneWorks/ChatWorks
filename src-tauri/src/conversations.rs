@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 use crate::fsutil::{now_secs, write_json_atomic};
 
@@ -129,7 +129,7 @@ fn conversations_dir(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path().app_data_dir().map_err(|error| error.to_string())
+    crate::profile::data_dir(app)
 }
 
 fn conversation_file_path(dir: &Path, id: &str) -> PathBuf {

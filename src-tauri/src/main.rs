@@ -295,6 +295,8 @@ fn start_server_from_settings(
 }
 
 fn main() {
+    let mut context = tauri::generate_context!();
+    chatworks::profile::isolate_webviews(context.config_mut()).expect("invalid acceptance profile");
     tauri::Builder::default()
         .manage(MediaPreparations::default())
         .setup(|app| {
@@ -344,6 +346,6 @@ fn main() {
             rename_conversation,
             delete_conversation,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running the ChatWorks desktop shell");
 }

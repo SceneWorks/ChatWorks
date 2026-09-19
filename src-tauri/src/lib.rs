@@ -21,6 +21,7 @@ pub mod engine;
 pub mod fsutil;
 mod inference_runtime;
 pub mod model_registry;
+pub mod profile;
 pub mod server;
 pub mod tools;
 

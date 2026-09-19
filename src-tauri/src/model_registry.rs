@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use crate::core_llm::LoadSpec;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter};
 
 use crate::engine::{EngineHandle, EngineStatus, LoadModelRequest, QuantizeRequest};
 use crate::fsutil::{now_secs, write_json_atomic};
@@ -303,7 +303,7 @@ pub fn set_hf_token(request: SetHfTokenRequest) -> Result<HfTokenStatus, String>
     if token.is_empty() {
         return Err("HuggingFace token is required".to_string());
     }
-    let entry = keyring::Entry::new(HF_KEYCHAIN_SERVICE, HF_KEYCHAIN_USER)
+    let entry = crate::profile::credential(HF_KEYCHAIN_SERVICE, HF_KEYCHAIN_USER)
         .map_err(|error| error.to_string())?;
     entry
         .set_password(token)
@@ -312,7 +312,7 @@ pub fn set_hf_token(request: SetHfTokenRequest) -> Result<HfTokenStatus, String>
 }
 
 pub fn clear_hf_token() -> Result<HfTokenStatus, String> {
-    let entry = keyring::Entry::new(HF_KEYCHAIN_SERVICE, HF_KEYCHAIN_USER)
+    let entry = crate::profile::credential(HF_KEYCHAIN_SERVICE, HF_KEYCHAIN_USER)
         .map_err(|error| error.to_string())?;
     match entry.delete_credential() {
         Ok(()) => Ok(hf_token_status()),
@@ -1211,7 +1211,7 @@ fn snapshot_size_bytes(path: &Path) -> Option<u64> {
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path().app_data_dir().map_err(|error| error.to_string())
+    crate::profile::data_dir(app)
 }
 
 fn registry_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -1270,7 +1270,7 @@ fn progress(downloaded: u64, total: Option<u64>) -> f32 {
 }
 
 fn read_hf_token() -> Result<Option<String>, keyring::Error> {
-    let entry = keyring::Entry::new(HF_KEYCHAIN_SERVICE, HF_KEYCHAIN_USER)?;
+    let entry = crate::profile::credential(HF_KEYCHAIN_SERVICE, HF_KEYCHAIN_USER)?;
     match entry.get_password() {
         Ok(token) if token.trim().is_empty() => Ok(None),
         Ok(token) => Ok(Some(token)),

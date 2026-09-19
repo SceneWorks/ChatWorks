@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 use crate::fsutil::write_json_atomic;
 use crate::server::{DEFAULT_OPENAI_HOST, DEFAULT_OPENAI_PORT};
@@ -170,7 +170,7 @@ pub fn api_auth_token_present() -> bool {
 }
 
 pub fn read_api_auth_token() -> Result<Option<String>, keyring::Error> {
-    let entry = keyring::Entry::new(API_AUTH_KEYCHAIN_SERVICE, API_AUTH_KEYCHAIN_USER)?;
+    let entry = crate::profile::credential(API_AUTH_KEYCHAIN_SERVICE, API_AUTH_KEYCHAIN_USER)?;
     match entry.get_password() {
         Ok(token) if token.trim().is_empty() => Ok(None),
         Ok(token) => Ok(Some(token)),
@@ -184,13 +184,13 @@ pub fn save_api_auth_token(token: &str) -> Result<(), String> {
     if token.is_empty() {
         return Err("API auth token is required".to_string());
     }
-    let entry = keyring::Entry::new(API_AUTH_KEYCHAIN_SERVICE, API_AUTH_KEYCHAIN_USER)
+    let entry = crate::profile::credential(API_AUTH_KEYCHAIN_SERVICE, API_AUTH_KEYCHAIN_USER)
         .map_err(|error| error.to_string())?;
     entry.set_password(token).map_err(|error| error.to_string())
 }
 
 pub fn clear_api_auth_token() -> Result<(), String> {
-    let entry = keyring::Entry::new(API_AUTH_KEYCHAIN_SERVICE, API_AUTH_KEYCHAIN_USER)
+    let entry = crate::profile::credential(API_AUTH_KEYCHAIN_SERVICE, API_AUTH_KEYCHAIN_USER)
         .map_err(|error| error.to_string())?;
     match entry.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -199,10 +199,7 @@ pub fn clear_api_auth_token() -> Result<(), String> {
 }
 
 fn settings_path(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path()
-        .app_data_dir()
-        .map(|path| path.join("settings.json"))
-        .map_err(|error| error.to_string())
+    crate::profile::data_dir(app).map(|path| path.join("settings.json"))
 }
 
 fn write_settings(path: &std::path::Path, settings: &AppSettings) -> Result<(), String> {
