@@ -332,7 +332,7 @@ async fn import_hf_model_inner(
     let snapshots_dir = data_dir.join("models").join("snapshots");
     let snapshot_dir = snapshots_dir.join(snapshot_dir_name(&model_ref));
     let manifest = registry_path(app)?;
-    let token = read_hf_token().ok().flatten().or_else(env_hf_token);
+    let token = import_token(crate::profile::root()?.is_some(), read_hf_token(), env_hf_token)?;
     let client = reqwest::Client::new();
 
     emit_progress(
@@ -1279,10 +1279,33 @@ fn read_hf_token() -> Result<Option<String>, keyring::Error> {
     }
 }
 
+fn import_token(
+    isolated: bool,
+    scoped: Result<Option<String>, keyring::Error>,
+    environment: impl FnOnce() -> Option<String>,
+) -> Result<Option<String>, String> {
+    if isolated {
+        // The profile must never inherit a shell's production credential, including after a
+        // Keychain error. A missing profile credential means an anonymous request.
+        scoped.map_err(|error| {
+            format!("could not read acceptance-profile HuggingFace credential: {error}")
+        })
+    } else {
+        // Preserve the ordinary profile's existing Keychain/environment precedence.
+        Ok(scoped.ok().flatten().or_else(environment))
+    }
+}
+
 fn env_hf_token() -> Option<String> {
-    std::env::var("HF_TOKEN")
-        .ok()
-        .or_else(|| std::env::var("HUGGINGFACE_TOKEN").ok())
+    env_hf_token_values(
+        std::env::var("HF_TOKEN").ok(),
+        std::env::var("HUGGINGFACE_TOKEN").ok(),
+    )
+}
+
+fn env_hf_token_values(primary: Option<String>, legacy: Option<String>) -> Option<String> {
+    primary
+        .or(legacy)
         .map(|token| token.trim().to_string())
         .filter(|token| !token.is_empty())
 }
@@ -1901,5 +1924,72 @@ mod tests {
         body.extend_from_slice(&4_u32.to_le_bytes()); // GGUF u32
         body.extend_from_slice(&1_u32.to_le_bytes());
         fs::write(path, body).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod profile_import_tests {
+    use super::*;
+
+    #[test]
+    fn isolated_import_never_inherits_either_environment_credential() {
+        for (primary, legacy) in [
+            (Some("primary".to_string()), None),
+            (None, Some("legacy".to_string())),
+            (Some("primary".to_string()), Some("legacy".to_string())),
+        ] {
+            assert_eq!(
+                import_token(true, Ok(None), || env_hf_token_values(primary, legacy)).unwrap(),
+                None
+            );
+        }
+        assert_eq!(
+            import_token(true, Ok(Some("scoped".into())), || panic!(
+                "environment must not be read"
+            ))
+            .unwrap(),
+            Some("scoped".into())
+        );
+        assert!(import_token(true, Err(keyring::Error::NoEntry), || panic!(
+            "no fallback after scoped credential error"
+        ))
+        .unwrap_err()
+        .contains("acceptance-profile HuggingFace credential"));
+    }
+
+    #[test]
+    fn ordinary_import_preserves_keychain_and_environment_precedence() {
+        assert_eq!(
+            import_token(false, Ok(Some("keychain".into())), || panic!(
+                "keychain wins"
+            ))
+            .unwrap(),
+            Some("keychain".into())
+        );
+        for (primary, legacy, expected) in [
+            (
+                Some(" primary ".to_string()),
+                Some("legacy".to_string()),
+                Some("primary".to_string()),
+            ),
+            (
+                None,
+                Some(" legacy ".to_string()),
+                Some("legacy".to_string()),
+            ),
+            (Some(" ".to_string()), Some("legacy".to_string()), None),
+        ] {
+            assert_eq!(
+                import_token(false, Ok(None), || env_hf_token_values(primary, legacy)).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            import_token(false, Err(keyring::Error::NoEntry), || Some(
+                "environment".into()
+            ))
+            .unwrap(),
+            Some("environment".into())
+        );
     }
 }

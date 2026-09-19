@@ -138,7 +138,8 @@ Create an empty absolute directory, then launch the packaged executable with
 `CHATWORKS_PROFILE_DIR=/absolute/path/to/profile`. The directory must already exist; invalid
 values fail startup instead of using the ordinary profile. Settings, registry, and conversations
 use that canonical directory. API and HuggingFace credentials use a SHA-256-derived Keychain
-namespace with no fallback to ordinary credentials. WebView state is isolated too: a profile data
+namespace with no fallback to ordinary credentials or inherited `HF_TOKEN`/`HUGGINGFACE_TOKEN`.
+Profile credential errors are reported by imports instead of falling back. WebView state is isolated too: a profile data
 directory on supported platforms, and a distinct persistent WKWebView store UUID on macOS.
 Omitting the variable preserves all existing paths, credentials, and WebView behavior. This is
 an acceptance/testing launch option, not an in-app profile selector. Cached model paths can be
