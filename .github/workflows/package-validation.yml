@@ -89,19 +89,6 @@ jobs:
             make
             xz
 
-      - name: Configure private inference access
-        shell: bash
-        env:
-          INFERENCE_TOKEN: ${{ secrets.SCENEWORKS_INFERENCE_TOKEN }}
-        run: |
-          if [[ -z "$INFERENCE_TOKEN" ]]; then
-            echo 'SCENEWORKS_INFERENCE_TOKEN is required to resolve the private inference runtime.' >&2
-            exit 1
-          fi
-          git config --global \
-            url."https://x-access-token:${INFERENCE_TOKEN}@github.com/SceneWorks/inference".insteadOf \
-            "https://github.com/SceneWorks/inference"
-
       - name: Install frontend dependencies
         run: npm ci
 

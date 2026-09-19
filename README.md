@@ -21,17 +21,16 @@ runners for Apple Silicon macOS (`aarch64-apple-darwin`), Intel macOS
 checksum-pinned FFmpeg 9.0 source on each native runner, build an unsigned `.app`, `.deb`,
 or NSIS package, then inspect that package for both FFmpeg and ffprobe.
 
-The repository must define an Actions secret named `SCENEWORKS_INFERENCE_TOKEN` with read access to
-the private `SceneWorks/inference` repository. Packaging does not publish artifacts, create a
-release, or require production signing credentials.
+All Git-sourced runtime dependencies are public, so package validation requires no repository
+credential or custom Actions secret. The workflow's built-in token retains read-only contents
+permission; packaging does not publish artifacts, create a release, or require production signing
+credentials.
 
 ## Quick start (development)
 
-The Rust backend requires read access to the private
-[`SceneWorks/inference`](https://github.com/SceneWorks/inference) repository. Authenticate the
-system Git client (for example with `gh auth login` followed by `gh auth setup-git`) before running
-the development command. Unauthenticated clones cannot fetch the runtime while that repository
-remains private.
+The Rust backend resolves its runtime from the public
+[`SceneWorks/inference`](https://github.com/SceneWorks/inference) repository, so a normal Git client
+can fetch it without extra credentials.
 
 ```sh
 npm install
