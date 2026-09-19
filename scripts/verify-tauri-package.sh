@@ -64,6 +64,9 @@ case "$target" in
     listing="$(7z l -ba "$package")"
     require_listing_entry "$listing" 'ffmpeg\.exe'
     require_listing_entry "$listing" 'ffprobe\.exe'
+    if [[ "${CHATWORKS_PACKAGE_BACKEND:-cpu}" == cuda ]]; then
+      node "$root/scripts/package-evidence.mjs" verify-cuda "$package" "$RUNNER_TEMP/chatworks-cuda-runtime"
+    fi
     ;;
   *)
     echo "No package verification recipe for target: $target" >&2
