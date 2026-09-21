@@ -749,6 +749,7 @@ fn is_loadable_model_file(name: &str) -> bool {
     name == "config.json"
         || name == "tokenizer.json"
         || name == "tokenizer_config.json"
+        || name == "chat_template.jinja"
         || name == "special_tokens_map.json"
         || name == "generation_config.json"
         || name == "hadamard.json"
@@ -1400,6 +1401,7 @@ mod tests {
     #[test]
     fn filters_loadable_files() {
         assert!(is_loadable_model_file("config.json"));
+        assert!(is_loadable_model_file("chat_template.jinja"));
         assert!(is_loadable_model_file("model-00001-of-00002.safetensors"));
         assert!(is_loadable_model_file("model.safetensors.index.json"));
         assert!(is_loadable_model_file("model.gguf"));
