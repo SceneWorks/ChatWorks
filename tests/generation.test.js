@@ -124,6 +124,7 @@ test("attachment placeholders preserve enqueue order when preparation resolves i
 test("packed GGUF imports are identified and labeled by their real format", () => {
   assert.equal(isExactGgufUrl("https://huggingface.co/prism/repo/blob/rev/PQ2_0.gguf"), true);
   assert.equal(modelSubtitle({ format: "gguf-prism-packed", pack: "bonsai2-packed", quantize: null }), "Bonsai 2 packed");
+  assert.equal(modelSubtitle({ format: "gguf", pack: null, quantize: null }), "GGUF");
 });
 
 test("Windows sidecar output paths include the executable extension", () => {

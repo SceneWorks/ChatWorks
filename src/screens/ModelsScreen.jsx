@@ -113,12 +113,12 @@ export function ModelsScreen() {
     setError(null);
     setNotice(null);
     const option = QUANTIZE_OPTIONS.find((item) => item.id === quantizeId) ?? QUANTIZE_OPTIONS[0];
-    const packed = candidate.pack === "bonsai2-packed" || candidate.format === "gguf-prism-packed";
+    const storedEncoding = candidate.pack === "bonsai2-packed" || candidate.format?.startsWith("gguf");
     try {
       const next = await invoke("adopt_cached_hf_model", {
         request: {
           localPath: candidate.localPath,
-          quantize: packed ? null : option.value,
+          quantize: storedEncoding ? null : option.value,
           projectorSource: candidate.projectorSource,
         },
       });
@@ -301,7 +301,7 @@ export function ModelsScreen() {
                   <div className="model-row-main">
                     <span className="model-row-name">{model.name}</span>
                     <span className="model-row-meta">
-                      {model.repo} · {model.providerFamily} · {model.pack === "bonsai2-packed" ? "Bonsai 2 packed" : "Dense"} · {model.supportsVision ? "Vision" : "Text"}
+                      {model.repo} · {model.providerFamily} · {model.pack === "bonsai2-packed" ? "Bonsai 2 packed" : model.format === "gguf" ? "GGUF" : "Dense"} · {model.supportsVision ? "Vision" : "Text"}
                     </span>
                     {model.unavailableReason ? <span className="model-row-meta">{model.unavailableReason}</span> : null}
                   </div>

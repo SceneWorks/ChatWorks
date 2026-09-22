@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::core_llm::LoadSpec;
@@ -598,9 +598,9 @@ fn validate_quantize_request(
     pack: Option<&str>,
     quantize: Option<QuantizeRequest>,
 ) -> Result<(), String> {
-    if quantize.is_some() && (format == "gguf-prism-packed" || pack == Some("bonsai2-packed")) {
+    if quantize.is_some() && (format.starts_with("gguf") || pack == Some("bonsai2-packed")) {
         return Err(
-            "packed Bonsai/Prism artifacts cannot be quantized again; choose Native packed"
+            "GGUF and packed Bonsai artifacts cannot be quantized on import; use their stored encoding"
                 .to_string(),
         );
     }
@@ -840,10 +840,14 @@ fn recognized_model_format(path: &Path) -> Result<(String, Option<String>), Stri
         if !is_gguf_model_file(&path.to_string_lossy()) {
             return Err("direct model source must be a non-projector .gguf file".to_string());
         }
-        return Ok((
-            "gguf-prism-packed".to_string(),
-            Some("bonsai2-packed".to_string()),
-        ));
+        return if is_packed_prism_gguf(path) {
+            Ok((
+                "gguf-prism-packed".to_string(),
+                Some("bonsai2-packed".to_string()),
+            ))
+        } else {
+            Ok(("gguf".to_string(), None))
+        };
     }
     let hadamard = path.join("hadamard.json").is_file();
     let runtime = path.join("PACK-RUNTIME").is_file();
@@ -949,10 +953,6 @@ fn validate_config_file_if_available(snapshot_dir: &Path, file_name: &str) -> Re
 
 /// A frozen Qwen3.8 parent has the published VLM wrapper, decoder geometry, and native MTP
 /// layout. A compatible text-only `qwen3_5_text` fine-tune does not match this identity.
-#[cfg(any(
-    test,
-    all(not(target_os = "macos"), feature = "cpu", not(feature = "cuda"))
-))]
 fn is_qwen38_parent_config(config: &serde_json::Value) -> bool {
     let text = &config["text_config"];
     config["model_type"] == "qwen3_5"
@@ -969,18 +969,14 @@ fn is_qwen38_parent_config(config: &serde_json::Value) -> bool {
         && text["vocab_size"] == 248320
 }
 
-#[cfg(any(
-    test,
-    all(not(target_os = "macos"), feature = "cpu", not(feature = "cuda"))
-))]
 fn is_accelerator_only_model(path: &Path) -> Result<bool, String> {
     if !path.exists() {
         return Ok(false);
     }
     if path.is_file() {
-        // Candle also accepts ordinary GGUF. The inference loader probes the packed tensor
-        // types and rejects Bonsai on CPU; the registry must not classify every GGUF as Bonsai.
-        return Ok(false);
+        // Candle accepts ordinary GGUF too. Match the inference loader's weightless Prism
+        // identity: Qwen35 architecture plus a PQ2_0/PTQ1_0 tensor type.
+        return Ok(is_gguf_model_file(&path.to_string_lossy()) && is_packed_prism_gguf(path));
     }
     let body = fs::read_to_string(path.join("config.json")).map_err(|error| error.to_string())?;
     let config: serde_json::Value =
@@ -991,16 +987,136 @@ fn is_accelerator_only_model(path: &Path) -> Result<bool, String> {
             && config["model_type"] == "prism_hadamard_qwen35"))
 }
 
-#[cfg(all(not(target_os = "macos"), feature = "cpu", not(feature = "cuda")))]
+/// Reads only GGUF metadata and tensor directory; no weight bytes are touched. A malformed
+/// header is left to the provider's ordinary validation path rather than labeled Bonsai.
+fn is_packed_prism_gguf(path: &Path) -> bool {
+    fn read_u32(file: &mut fs::File) -> std::io::Result<u32> {
+        let mut bytes = [0; 4];
+        file.read_exact(&mut bytes)?;
+        Ok(u32::from_le_bytes(bytes))
+    }
+    fn read_u64(file: &mut fs::File) -> std::io::Result<u64> {
+        let mut bytes = [0; 8];
+        file.read_exact(&mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+    fn skip(file: &mut fs::File, bytes: u64, file_len: u64) -> std::io::Result<()> {
+        let end = file
+            .stream_position()?
+            .checked_add(bytes)
+            .filter(|end| *end <= file_len)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        file.seek(SeekFrom::Start(end))?;
+        Ok(())
+    }
+    fn read_string(file: &mut fs::File, file_len: u64) -> std::io::Result<String> {
+        let len = read_u64(file)?;
+        if len > 1024 || len > file_len.saturating_sub(file.stream_position()?) {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        let mut bytes = vec![0; len as usize];
+        file.read_exact(&mut bytes)?;
+        String::from_utf8(bytes).map_err(|_| std::io::ErrorKind::InvalidData.into())
+    }
+    fn skip_value(file: &mut fs::File, ty: u32, file_len: u64) -> std::io::Result<()> {
+        let width = match ty {
+            0 | 1 | 7 => 1,
+            2 | 3 => 2,
+            4 | 5 | 6 => 4,
+            10..=12 => 8,
+            8 => {
+                let len = read_u64(file)?;
+                return skip(file, len, file_len);
+            }
+            9 => {
+                let element_type = read_u32(file)?;
+                let count = read_u64(file)?;
+                if count > 1_000_000 || element_type == 9 {
+                    return Err(std::io::ErrorKind::InvalidData.into());
+                }
+                let fixed_width: Option<u64> = match element_type {
+                    0 | 1 | 7 => Some(1),
+                    2 | 3 => Some(2),
+                    4 | 5 | 6 => Some(4),
+                    10..=12 => Some(8),
+                    _ => None,
+                };
+                if let Some(width) = fixed_width {
+                    return skip(file, count * width, file_len);
+                }
+                if element_type != 8 {
+                    return Err(std::io::ErrorKind::InvalidData.into());
+                }
+                for _ in 0..count {
+                    skip_value(file, element_type, file_len)?;
+                }
+                return Ok(());
+            }
+            _ => return Err(std::io::ErrorKind::InvalidData.into()),
+        };
+        skip(file, width, file_len)
+    }
+    fn probe(path: &Path) -> std::io::Result<bool> {
+        let mut file = fs::File::open(path)?;
+        let file_len = file.metadata()?.len();
+        if read_u32(&mut file)? != u32::from_le_bytes(*b"GGUF")
+            || !matches!(read_u32(&mut file)?, 2 | 3)
+        {
+            return Ok(false);
+        }
+        let tensors = read_u64(&mut file)?;
+        let metadata = read_u64(&mut file)?;
+        if tensors > 1_000_000 || metadata > 1_000_000 {
+            return Ok(false);
+        }
+        let mut qwen35 = false;
+        for _ in 0..metadata {
+            let key = read_string(&mut file, file_len)?;
+            let ty = read_u32(&mut file)?;
+            if key == "general.architecture" && ty == 8 {
+                qwen35 = read_string(&mut file, file_len)? == "qwen35";
+            } else {
+                skip_value(&mut file, ty, file_len)?;
+            }
+        }
+        if !qwen35 {
+            return Ok(false);
+        }
+        let mut packed = false;
+        for _ in 0..tensors {
+            let _name = read_string(&mut file, file_len)?;
+            let rank = read_u32(&mut file)?;
+            if !(1..=4).contains(&rank) {
+                return Ok(false);
+            }
+            skip(&mut file, u64::from(rank) * 8, file_len)?;
+            let ty = read_u32(&mut file)?;
+            skip(&mut file, 8, file_len)?; // tensor data offset
+            packed |= matches!(ty, 142 | 143);
+        }
+        Ok(packed)
+    }
+    probe(path).unwrap_or(false)
+}
+
 const CPU_MODEL_UNAVAILABLE: &str = "Qwen3.8-27B and Bonsai 2 inference require Apple MLX or Candle CUDA; this ChatWorks build uses Candle CPU";
 
 fn cpu_model_unavailable_reason(path: &Path) -> Result<Option<&'static str>, String> {
-    #[cfg(all(not(target_os = "macos"), feature = "cpu", not(feature = "cuda")))]
-    if is_accelerator_only_model(path)? {
+    let cpu = cfg!(all(
+        not(target_os = "macos"),
+        feature = "cpu",
+        not(feature = "cuda")
+    ));
+    cpu_model_unavailable_reason_for(path, cpu)
+}
+
+fn cpu_model_unavailable_reason_for(
+    path: &Path,
+    cpu: bool,
+) -> Result<Option<&'static str>, String> {
+    if cpu && is_accelerator_only_model(path)? {
         return Ok(Some(CPU_MODEL_UNAVAILABLE));
     }
-    #[cfg(not(all(not(target_os = "macos"), feature = "cpu", not(feature = "cuda"))))]
-    let _ = path;
     Ok(None)
 }
 
@@ -1593,6 +1709,8 @@ mod tests {
         assert!(
             validate_quantize_request("gguf-prism-packed", Some("bonsai2-packed"), None).is_ok()
         );
+        assert!(validate_quantize_request("gguf", None, Some(QuantizeRequest::Q4)).is_err());
+        assert!(validate_quantize_request("gguf", None, None).is_ok());
     }
 
     #[test]
@@ -1685,6 +1803,43 @@ mod tests {
         write_snapshot_file(&root, "hadamard.json", "{}");
         write_snapshot_file(&root, "PACK-RUNTIME", "ptq1");
         assert!(is_accelerator_only_model(root.path()).unwrap());
+    }
+
+    #[test]
+    fn packed_prism_gguf_is_unavailable_on_cpu_but_ordinary_gguf_is_not() {
+        let root = snapshot_dir("gguf-cpu-support");
+        let prism = root.path().join("packed.gguf");
+        write_gguf_with_tensor_type(&prism, "qwen35", 142);
+        assert!(is_accelerator_only_model(&prism).unwrap());
+        assert!(cpu_model_unavailable_reason_for(&prism, true)
+            .unwrap()
+            .is_some());
+        assert!(cpu_model_unavailable_reason_for(&prism, false)
+            .unwrap()
+            .is_none());
+
+        let ptq = root.path().join("packed-ptq.gguf");
+        write_gguf_with_tensor_type(&ptq, "qwen35", 143);
+        assert!(is_accelerator_only_model(&ptq).unwrap());
+
+        let other = root.path().join("ordinary.gguf");
+        write_gguf_with_tensor_type(&other, "qwen35", 0);
+        assert!(!is_accelerator_only_model(&other).unwrap());
+        assert!(cpu_model_unavailable_reason_for(&other, true)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            recognized_model_format(&other).unwrap(),
+            ("gguf".to_string(), None)
+        );
+
+        let other_arch = root.path().join("other-arch.gguf");
+        write_gguf_with_tensor_type(&other_arch, "llama", 143);
+        assert!(!is_accelerator_only_model(&other_arch).unwrap());
+
+        let truncated = root.path().join("truncated.gguf");
+        fs::write(&truncated, b"GGUF\x03\0\0\0").unwrap();
+        assert!(!is_accelerator_only_model(&truncated).unwrap());
     }
 
     #[test]
@@ -2004,9 +2159,13 @@ mod tests {
         fs::write(dir.join(name), body).unwrap();
     }
 
-    /// A metadata-only GGUF accepted by the weightless Prism route. It has no tensors and is used
-    /// solely to verify registry discovery without loading real weights.
+    /// A GGUF with one packed tensor descriptor and no weight bytes, used only for weightless
+    /// registry discovery.
     fn write_minimal_prism_gguf(path: &Path) {
+        write_gguf_with_tensor_type(path, "qwen35", 142);
+    }
+
+    fn write_gguf_with_tensor_type(path: &Path, architecture: &str, tensor_type: u32) {
         fn string(out: &mut Vec<u8>, value: &str) {
             out.extend_from_slice(&(value.len() as u64).to_le_bytes());
             out.extend_from_slice(value.as_bytes());
@@ -2014,14 +2173,26 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(b"GGUF");
         body.extend_from_slice(&3_u32.to_le_bytes());
-        body.extend_from_slice(&0_u64.to_le_bytes());
-        body.extend_from_slice(&2_u64.to_le_bytes());
+        body.extend_from_slice(&1_u64.to_le_bytes()); // one tensor
+        body.extend_from_slice(&3_u64.to_le_bytes()); // three metadata entries
         string(&mut body, "general.architecture");
-        body.extend_from_slice(&8_u32.to_le_bytes()); // GGUF string
-        string(&mut body, "qwen35");
+        body.extend_from_slice(&8_u32.to_le_bytes()); // string value
+        string(&mut body, architecture);
+        string(&mut body, "tokenizer.ggml.tokens");
+        body.extend_from_slice(&9_u32.to_le_bytes()); // array value
+        body.extend_from_slice(&8_u32.to_le_bytes()); // strings
+        body.extend_from_slice(&1_u64.to_le_bytes());
+        string(&mut body, "token");
         string(&mut body, "prism.hadamard.version");
-        body.extend_from_slice(&4_u32.to_le_bytes()); // GGUF u32
+        body.extend_from_slice(&4_u32.to_le_bytes()); // u32
         body.extend_from_slice(&1_u32.to_le_bytes());
+        string(&mut body, "model.layers.0.mlp.down_proj.weight");
+        body.extend_from_slice(&2_u32.to_le_bytes()); // rank
+        body.extend_from_slice(&8_u64.to_le_bytes());
+        body.extend_from_slice(&8_u64.to_le_bytes());
+        body.extend_from_slice(&tensor_type.to_le_bytes());
+        body.extend_from_slice(&0_u64.to_le_bytes()); // data offset; no weights needed
+        body.resize(body.len().div_ceil(32) * 32, 0); // GGUF data section alignment
         fs::write(path, body).unwrap();
     }
 }
