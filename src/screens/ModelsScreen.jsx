@@ -99,7 +99,7 @@ export function ModelsScreen() {
     try {
       const models = await invoke("list_cached_hf_models");
       setCachedModels(models);
-      setNotice(models.length ? `Found ${models.length} supported cached model${models.length === 1 ? "" : "s"}.` : "No supported cached HuggingFace models found.");
+      setNotice(models.length ? `Found ${models.length} cached model${models.length === 1 ? "" : "s"}.` : "No supported cached HuggingFace models found.");
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -201,6 +201,11 @@ export function ModelsScreen() {
             Paste a HuggingFace model URL or <code>owner/repo</code>. ChatWorks downloads the snapshot,
             prepares it for local inference, and adds it to your local registry.
           </p>
+          {engineStatus?.execution_backend === "candle-cpu" ? (
+            <p className="view-copy">
+              This build uses Candle CPU. Qwen3.8-27B and Bonsai 2 require Apple MLX or Candle CUDA; other supported models can still use CPU.
+            </p>
+          ) : null}
         </div>
         <div className="field">
           <label htmlFor="hf-url">HuggingFace URL or repo</label>
@@ -298,12 +303,13 @@ export function ModelsScreen() {
                     <span className="model-row-meta">
                       {model.repo} · {model.providerFamily} · {model.pack === "bonsai2-packed" ? "Bonsai 2 packed" : "Dense"} · {model.supportsVision ? "Vision" : "Text"}
                     </span>
+                    {model.unavailableReason ? <span className="model-row-meta">{model.unavailableReason}</span> : null}
                   </div>
                   <span className="model-row-meta">{formatBytes(model.sizeBytes)}</span>
                   {model.projectorSources?.length ? (
                     <select
                       aria-label={`Projector for ${model.name}`}
-                      disabled={Boolean(adoptingPath) || alreadyRegistered}
+                      disabled={Boolean(adoptingPath) || alreadyRegistered || Boolean(model.unavailableReason)}
                       onChange={(event) => setProjectorSelections((current) => ({ ...current, [model.localPath]: event.target.value }))}
                       value={selectedProjector}
                     >
@@ -313,11 +319,11 @@ export function ModelsScreen() {
                   ) : null}
                   <button
                     className="ghost-btn"
-                    disabled={Boolean(adoptingPath) || alreadyRegistered}
+                    disabled={Boolean(adoptingPath) || alreadyRegistered || Boolean(model.unavailableReason)}
                     onClick={() => handleAdoptCached({ ...model, projectorSource: selectedProjector || null })}
                     type="button"
                   >
-                    {alreadyRegistered ? "Registered" : adoptingPath === model.localPath ? "Adding…" : "Add"}
+                    {alreadyRegistered ? "Registered" : model.unavailableReason ? "Unavailable" : adoptingPath === model.localPath ? "Adding…" : "Add"}
                   </button>
                 </li>
               );

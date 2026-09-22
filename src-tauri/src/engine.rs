@@ -185,6 +185,7 @@ impl EngineActor {
         if request.source.trim().is_empty() {
             return Err("model source is required".to_string());
         }
+        crate::model_registry::ensure_cpu_model_supported(Path::new(&request.source))?;
         let spec = LoadSpec {
             source: request.source.clone(),
             projector_source: request.projector_source.clone(),
@@ -255,6 +256,7 @@ impl EngineActor {
     fn status(&self) -> EngineStatus {
         EngineStatus {
             loaded: self.loaded.as_ref().map(LoadedModel::status),
+            execution_backend: crate::inference_runtime::execution_backend(),
             providers: crate::inference_runtime::textllms()
                 .map(|registration| ProviderSummary::from((registration.descriptor)()))
                 .collect(),
@@ -1413,6 +1415,7 @@ impl SamplingRequest {
 #[derive(Clone, Debug, Serialize)]
 pub struct EngineStatus {
     pub loaded: Option<LoadedModelStatus>,
+    pub execution_backend: &'static str,
     pub providers: Vec<ProviderSummary>,
 }
 

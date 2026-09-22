@@ -32,6 +32,21 @@ pub(crate) fn textllms() -> impl ExactSizeIterator<Item = &'static TextLlmRegist
     text().registrations()
 }
 
+pub(crate) const fn execution_backend() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "mlx"
+    }
+    #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+    {
+        "candle-cuda"
+    }
+    #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
+    {
+        "candle-cpu"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

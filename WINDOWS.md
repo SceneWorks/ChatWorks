@@ -41,8 +41,10 @@ This produces MSI and NSIS installers under
 
 ## GPU acceleration (optional)
 
-The default Windows build runs Candle on the **CPU**, which works everywhere but is slow
-for larger models. Build the CUDA runtime profile without the default CPU profile:
+The default Windows build runs Candle on the **CPU** for supported models. Qwen3.8-27B and
+Bonsai 2 packed variants require Apple MLX or Candle CUDA and report an explicit load error in
+the CPU build; ordinary compatible models retain CPU support. Build the CUDA runtime profile
+without the default CPU profile to serve Qwen3.8 and Bonsai 2:
 
 ```powershell
 npm run tauri:build -- --no-default-features --features cuda

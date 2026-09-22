@@ -112,6 +112,8 @@ pub struct CachedModelCandidate {
     pub pack: Option<String>,
     pub file_count: usize,
     pub size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
     /// Explicit projector artifacts found beside this GGUF. The UI requires the user to choose;
     /// an empty selection means text-only loading.
     #[serde(default)]
@@ -184,6 +186,7 @@ pub fn adopt_cached_hf_model(
     let candidate = cached_model_candidate(&path)?.ok_or_else(|| {
         "cached snapshot is not supported by the linked inference providers".to_string()
     })?;
+    ensure_cpu_model_supported(&path)?;
     validate_quantize_request(
         &candidate.format,
         candidate.pack.as_deref(),
@@ -264,6 +267,7 @@ pub fn load_registered_model(
     let snapshot = Path::new(&entry.local_path);
     validate_model_source(snapshot)?;
     recognized_model_format(snapshot)?;
+    ensure_cpu_model_supported(snapshot)?;
     if matching_provider(snapshot)?.is_none() {
         return Err(unsupported_model_source_error(
             snapshot,
@@ -406,6 +410,7 @@ async fn import_hf_model_inner(
     );
     let source = imported_model_source(&snapshot_dir, &model_ref)?;
     validate_model_source(&source)?;
+    ensure_cpu_model_supported(&source)?;
     let provider = matching_provider(&source)?.ok_or_else(|| {
         unsupported_model_source_error(&source, "downloaded model is not supported")
     })?;
@@ -937,6 +942,71 @@ fn validate_snapshot(path: &Path) -> Result<(), String> {
 fn validate_config_file_if_available(snapshot_dir: &Path, file_name: &str) -> Result<(), String> {
     if file_name == "config.json" {
         validate_text_snapshot_config(snapshot_dir)?;
+        ensure_cpu_model_supported(snapshot_dir)?;
+    }
+    Ok(())
+}
+
+/// A frozen Qwen3.8 parent has the published VLM wrapper, decoder geometry, and native MTP
+/// layout. A compatible text-only `qwen3_5_text` fine-tune does not match this identity.
+#[cfg(any(
+    test,
+    all(not(target_os = "macos"), feature = "cpu", not(feature = "cuda"))
+))]
+fn is_qwen38_parent_config(config: &serde_json::Value) -> bool {
+    let text = &config["text_config"];
+    config["model_type"] == "qwen3_5"
+        && config["architectures"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item == "Qwen3_5ForConditionalGeneration")
+        })
+        && config.get("vision_config").is_some()
+        && text["model_type"] == "qwen3_5_text"
+        && text["hidden_size"] == 5120
+        && text["num_hidden_layers"] == 64
+        && text["mtp_num_hidden_layers"] == 1
+        && text["vocab_size"] == 248320
+}
+
+#[cfg(any(
+    test,
+    all(not(target_os = "macos"), feature = "cpu", not(feature = "cuda"))
+))]
+fn is_accelerator_only_model(path: &Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    if path.is_file() {
+        // Candle also accepts ordinary GGUF. The inference loader probes the packed tensor
+        // types and rejects Bonsai on CPU; the registry must not classify every GGUF as Bonsai.
+        return Ok(false);
+    }
+    let body = fs::read_to_string(path.join("config.json")).map_err(|error| error.to_string())?;
+    let config: serde_json::Value =
+        serde_json::from_str(&body).map_err(|error| error.to_string())?;
+    Ok(is_qwen38_parent_config(&config)
+        || (path.join("hadamard.json").is_file()
+            && path.join("PACK-RUNTIME").is_file()
+            && config["model_type"] == "prism_hadamard_qwen35"))
+}
+
+#[cfg(all(not(target_os = "macos"), feature = "cpu", not(feature = "cuda")))]
+const CPU_MODEL_UNAVAILABLE: &str = "Qwen3.8-27B and Bonsai 2 inference require Apple MLX or Candle CUDA; this ChatWorks build uses Candle CPU";
+
+fn cpu_model_unavailable_reason(path: &Path) -> Result<Option<&'static str>, String> {
+    #[cfg(all(not(target_os = "macos"), feature = "cpu", not(feature = "cuda")))]
+    if is_accelerator_only_model(path)? {
+        return Ok(Some(CPU_MODEL_UNAVAILABLE));
+    }
+    #[cfg(not(all(not(target_os = "macos"), feature = "cpu", not(feature = "cuda"))))]
+    let _ = path;
+    Ok(None)
+}
+
+pub(crate) fn ensure_cpu_model_supported(path: &Path) -> Result<(), String> {
+    if let Some(reason) = cpu_model_unavailable_reason(path)? {
+        return Err(reason.to_string());
     }
     Ok(())
 }
@@ -1029,6 +1099,7 @@ fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, S
         pack,
         file_count,
         size_bytes,
+        unavailable_reason: cpu_model_unavailable_reason(path)?.map(str::to_string),
         projector_sources: if path.is_file() {
             sibling_projector_sources(path)?
         } else {
@@ -1588,6 +1659,32 @@ mod tests {
         );
         assert!(is_loadable_model_file("hadamard.json"));
         assert!(is_loadable_model_file("PACK-RUNTIME"));
+    }
+
+    #[test]
+    fn accelerator_only_selector_uses_checkpoint_content() {
+        let root = snapshot_dir("accelerator-only-selector");
+        let config = serde_json::json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "vision_config": {"model_type": "qwen3_5"},
+            "text_config": {"model_type": "qwen3_5_text", "hidden_size": 5120,
+                            "num_hidden_layers": 64, "vocab_size": 248320,
+                            "mtp_num_hidden_layers": 1}
+        });
+        write_snapshot_file(&root, "config.json", &config.to_string());
+        assert!(is_accelerator_only_model(root.path()).unwrap());
+
+        // A flat compatible fine-tune such as Hemmingway uses qwen3_5_text but has no
+        // frozen parent VLM wrapper. It remains eligible for Candle CPU.
+        write_snapshot_file(&root, "config.json", &config["text_config"].to_string());
+        assert!(!is_accelerator_only_model(root.path()).unwrap());
+
+        let bonsai = serde_json::json!({"model_type": "prism_hadamard_qwen35"});
+        write_snapshot_file(&root, "config.json", &bonsai.to_string());
+        write_snapshot_file(&root, "hadamard.json", "{}");
+        write_snapshot_file(&root, "PACK-RUNTIME", "ptq1");
+        assert!(is_accelerator_only_model(root.path()).unwrap());
     }
 
     #[test]

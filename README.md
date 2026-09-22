@@ -52,7 +52,13 @@ their `model_type` plus a `vision_config`.
 | ----- | --------------------- | ------------------ | ---------- | ------------ |
 | **Qwen3-VL-8B-Instruct** | `qwen3_vl` | macOS / Apple Silicon (MLX) | Text, image, multi-image, **video** | Yes |
 | Qwen3.6 (e.g. 27B) | `qwen3_5` | macOS / Apple Silicon (MLX) | Text, image, multi-image | Yes |
+| Qwen3.8-27B and Bonsai 2 packed variants | `qwen3_5` / `prism_hadamard_qwen35` | macOS (MLX) · Windows/Linux with Candle CUDA | Text, image, video | Yes |
 | Text-only Qwen / LLaMA-family checkpoints | various | macOS (MLX) · Windows/Linux (Candle) | Text | Model-dependent |
+
+Qwen3.8-27B and Bonsai 2 inference is unavailable in Candle CPU builds. Loading these
+checkpoints returns an explicit error before weights are loaded; other compatible models,
+including flat `qwen3_5_text` fine-tunes, retain CPU support. CUDA builds require an NVIDIA
+device; selecting the CUDA build does not silently fall back to CPU for these checkpoints.
 
 ### Qwen3-VL-8B-Instruct
 
