@@ -4,11 +4,15 @@ use std::sync::OnceLock;
 
 use crate::core_llm::{LoadSpec, TextLlm, TextLlmRegistration, TextLlmRegistry};
 
-#[cfg(all(not(target_os = "macos"), feature = "cpu", not(feature = "cuda")))]
+#[cfg(all(
+    not(all(target_os = "macos", target_arch = "aarch64")),
+    feature = "cpu",
+    not(feature = "cuda")
+))]
 use runtime_cpu as platform_runtime;
 #[cfg(all(not(target_os = "macos"), feature = "cuda", not(feature = "cpu")))]
 use runtime_cuda as platform_runtime;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use runtime_macos as platform_runtime;
 
 fn catalog() -> &'static platform_runtime::RuntimeCatalog {
@@ -33,7 +37,7 @@ pub(crate) fn textllms() -> impl ExactSizeIterator<Item = &'static TextLlmRegist
 }
 
 pub(crate) const fn execution_backend() -> &'static str {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         "mlx"
     }
@@ -41,7 +45,10 @@ pub(crate) const fn execution_backend() -> &'static str {
     {
         "candle-cuda"
     }
-    #[cfg(all(not(target_os = "macos"), not(feature = "cuda")))]
+    #[cfg(all(
+        not(all(target_os = "macos", target_arch = "aarch64")),
+        not(feature = "cuda")
+    ))]
     {
         "candle-cpu"
     }
@@ -55,7 +62,9 @@ mod tests {
             .map(|registration| (registration.descriptor)().id)
             .collect();
 
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert_eq!(super::execution_backend(), "mlx");
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         assert_eq!(
             ids,
             [
@@ -66,7 +75,17 @@ mod tests {
             ]
         );
 
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(ids, ["candle-llama", "candle-llava"]);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        assert_eq!(
+            ids,
+            ["candle-llama", "candle-llava", "candle-starvector-1b"]
+        );
+        #[cfg(all(
+            not(all(target_os = "macos", target_arch = "aarch64")),
+            feature = "cpu"
+        ))]
+        assert_eq!(super::execution_backend(), "candle-cpu");
+        #[cfg(all(not(target_os = "macos"), feature = "cuda", not(feature = "cpu")))]
+        assert_eq!(super::execution_backend(), "candle-cuda");
     }
 }

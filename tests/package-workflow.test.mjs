@@ -20,6 +20,14 @@ test('self-hosted Windows uses installed PowerShell and bootstraps Git Bash befo
   assert.match(hosted, /shell: pwsh/);
 });
 
+test('six package lanes label Intel macOS CPU and Apple Silicon MLX', () => {
+  const hosted = workflow.split('  windows-cuda-package:')[0];
+  assert.equal((hosted.match(/^          - runner:/gm) ?? []).length, 5);
+  assert.match(hosted, /runner: macos-26\n            target: aarch64-apple-darwin\n            bundle: app\n            backend: mlx/);
+  assert.match(hosted, /runner: macos-26-intel\n            target: x86_64-apple-darwin\n            bundle: app\n            backend: cpu/);
+  assert.match(workflow, /  windows-cuda-package:\n/);
+});
+
 test('workflow guards reject missing defaults, pwsh and missing Git Bash bootstrap', () => {
   for (const [before, after] of [
     ['defaults:\n      run:\n        shell: powershell', 'defaults:\n      run:\n        shell: pwsh'],

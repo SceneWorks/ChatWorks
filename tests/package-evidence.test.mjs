@@ -83,4 +83,10 @@ test('macOS evidence archives preserve app permissions and symlinks', { skip: pr
   const binary = path.join(extracted, 'ChatWorks.app/Contents/MacOS/chatworks');
   assert.equal(fs.statSync(binary).mode & 0o777, 0o755);
   assert.equal(fs.readlinkSync(path.join(path.dirname(binary), 'alias')), 'chatworks');
+  const sha = receipt.source_sha;
+  const intel = collect(root, build, path.join(root, 'intel-evidence'), 'x86_64-apple-darwin', 'cpu', sha);
+  assert.equal(intel.backend, 'cpu');
+  assert.match(intel.package.file, /x86_64-apple-darwin-cpu/);
+  assert.throws(() => collect(root, build, path.join(root, 'wrong-intel'), 'x86_64-apple-darwin', 'mlx', sha), /not valid/);
+  assert.throws(() => collect(root, build, path.join(root, 'wrong-arm'), 'aarch64-apple-darwin', 'cpu', sha), /not valid/);
 });

@@ -5,7 +5,8 @@ inference backend, which is selected automatically at build time:
 
 | Platform        | Backend     | Provider id     | Default compute |
 | --------------- | ----------- | --------------- | --------------- |
-| macOS (Apple)   | MLX         | `mlx-llama`     | Apple Metal     |
+| Apple Silicon macOS | MLX    | `mlx-llama`     | Apple Metal     |
+| Intel macOS     | Candle      | `candle-llama`  | CPU             |
 | Windows / Linux | Candle      | `candle-llama`  | CPU             |
 
 Both backends implement the same neutral `core-llm` contract and ship through one immutable

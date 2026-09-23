@@ -86,6 +86,14 @@ export function collect(root, targetDir, output, target, backend, sha, cudaStage
     if (!committed.equals(fs.readFileSync(path.join(root, relative)))) throw new Error(`Uncommitted pin file: ${relative}`);
   }
   if (!['cpu', 'cuda', 'mlx'].includes(backend)) throw new Error('Explicit backend required');
+  const expected = {
+    'aarch64-apple-darwin': ['mlx'],
+    'x86_64-apple-darwin': ['cpu'],
+    'x86_64-unknown-linux-gnu': ['cpu'],
+    'aarch64-unknown-linux-gnu': ['cpu'],
+    'x86_64-pc-windows-msvc': ['cpu', 'cuda'],
+  }[target];
+  if (!expected?.includes(backend)) throw new Error(`Backend ${backend} is not valid for ${target}`);
   fs.mkdirSync(output, { recursive: true });
   const kind = target.includes('apple') ? 'macos' : target.includes('windows') ? 'nsis' : 'deb';
   const bundle = path.join(targetDir, 'release/bundle', kind);

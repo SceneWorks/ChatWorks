@@ -3,7 +3,8 @@
 A SceneWorks-styled desktop app for serving local LLMs. ChatWorks is a [Tauri](https://tauri.app/)
 application: a Rust backend that loads models and runs inference, fronted by an
 OpenAI-compatible HTTP server and a web chat UI. The inference backend is selected per-platform
-at build time — Apple **MLX** on macOS, cross-platform **Candle** on Windows/Linux — through one
+at build time — Apple **MLX** on Apple Silicon macOS and **Candle CPU** on Intel macOS,
+Windows, and Linux (with an optional Candle CUDA profile on Windows/Linux) — through one
 immutable [`SceneWorks/inference`](https://github.com/SceneWorks/inference) runtime release. The
 current cutover pin is `runtime-2026.09.0`; the bundle re-exports the neutral `core-llm` contract
 and explicitly lists every available provider.
@@ -15,9 +16,10 @@ and explicitly lists every available provider.
 ## Package validation
 
 `.github/workflows/package-validation.yml` builds native packages on standard GitHub-hosted
-runners for Apple Silicon macOS (`aarch64-apple-darwin`), Intel macOS
-(`x86_64-apple-darwin`), x64 Linux (`x86_64-unknown-linux-gnu`), arm64 Linux
-(`aarch64-unknown-linux-gnu`), and x64 Windows (`x86_64-pc-windows-msvc`). The jobs build the
+runners for Apple Silicon macOS (`aarch64-apple-darwin`, MLX), Intel macOS
+(`x86_64-apple-darwin`, CPU), x64 Linux (`x86_64-unknown-linux-gnu`, CPU), arm64 Linux
+(`aarch64-unknown-linux-gnu`, CPU), and x64 Windows (`x86_64-pc-windows-msvc`, CPU), plus a
+separate x64 Windows CUDA lane. The six jobs build the
 checksum-pinned FFmpeg 9.0 source on each native runner, build an unsigned `.app`, `.deb`,
 or NSIS package, then inspect that package for both FFmpeg and ffprobe.
 
@@ -45,15 +47,15 @@ models through the app.
 
 Model support is detected from a snapshot's `config.json` at load time (see
 `src-tauri/src/model_registry.rs`), then served by the platform's inference provider
-(`mlx-llama` on macOS, `candle-llama` elsewhere). Vision-capable checkpoints are recognized by
+(`mlx-llama` on Apple Silicon macOS, `candle-llama` elsewhere). Vision-capable checkpoints are recognized by
 their `model_type` plus a `vision_config`.
 
 | Model | Family (`model_type`) | Platform / backend | Modalities | Tool calling |
 | ----- | --------------------- | ------------------ | ---------- | ------------ |
 | **Qwen3-VL-8B-Instruct** | `qwen3_vl` | macOS / Apple Silicon (MLX) | Text, image, multi-image, **video** | Yes |
 | Qwen3.6 (e.g. 27B) | `qwen3_5` | macOS / Apple Silicon (MLX) | Text, image, multi-image | Yes |
-| Qwen3.8-27B and Bonsai 2 packed variants | `qwen3_5` / `prism_hadamard_qwen35` | macOS (MLX) · Windows/Linux with Candle CUDA | Text, image, video | Yes |
-| Text-only Qwen / LLaMA-family checkpoints | various | macOS (MLX) · Windows/Linux (Candle) | Text | Model-dependent |
+| Qwen3.8-27B and Bonsai 2 packed variants | `qwen3_5` / `prism_hadamard_qwen35` | Apple Silicon macOS (MLX) · Windows/Linux with Candle CUDA | Text, image, video | Yes |
+| Text-only Qwen / LLaMA-family checkpoints | various | Apple Silicon macOS (MLX) · Intel macOS/Windows/Linux (Candle) | Text | Model-dependent |
 
 Qwen3.8-27B and Bonsai 2 inference is unavailable in Candle CPU builds. Loading these
 checkpoints returns an explicit error before weights are loaded; other compatible models,

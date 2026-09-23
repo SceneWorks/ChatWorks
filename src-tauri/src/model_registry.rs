@@ -1107,7 +1107,7 @@ const CPU_MODEL_UNAVAILABLE: &str = "Qwen3.8-27B and Bonsai 2 inference require 
 
 fn cpu_model_unavailable_reason(path: &Path) -> Result<Option<&'static str>, String> {
     let cpu = cfg!(all(
-        not(target_os = "macos"),
+        not(all(target_os = "macos", target_arch = "aarch64")),
         feature = "cpu",
         not(feature = "cuda")
     ));
@@ -2002,9 +2002,9 @@ mod tests {
         assert_eq!(candidate.repo, "Qwen/Qwen3-0.6B");
         assert_eq!(candidate.revision, "rev1");
         // The matched provider id depends on the platform's linked backend.
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         assert_eq!(candidate.provider_id, "mlx-llama");
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         assert_eq!(candidate.provider_id, "candle-llama");
         assert!(!candidate.supports_vision);
     }
@@ -2054,9 +2054,9 @@ mod tests {
 
         let candidate = cached_model_candidate(&snapshot).unwrap().unwrap();
         assert_eq!(candidate.repo, "Qwen/Qwen3.6-27B");
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         assert_eq!(candidate.provider_id, "mlx-llama");
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         assert_eq!(candidate.provider_id, "candle-llama");
         assert!(candidate.supports_vision);
     }
@@ -2085,9 +2085,9 @@ mod tests {
 
         let candidate = cached_model_candidate(&snapshot).unwrap().unwrap();
         assert_eq!(candidate.repo, "Qwen/Qwen3-VL-8B-Instruct");
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         assert_eq!(candidate.provider_id, "mlx-llama");
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         assert_eq!(candidate.provider_id, "candle-llama");
         assert!(candidate.supports_vision);
     }
