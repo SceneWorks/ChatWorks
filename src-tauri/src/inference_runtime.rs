@@ -86,10 +86,24 @@ mod tests {
             ]
         );
 
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        #[cfg(all(
+            not(all(target_os = "macos", target_arch = "aarch64")),
+            not(feature = "cuda")
+        ))]
         assert_eq!(
             ids,
             ["candle-llama", "candle-llava", "candle-starvector-1b"]
+        );
+        // The CUDA bundle composes the StarVector-8B provider as well (`cuda_text_registry`).
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        assert_eq!(
+            ids,
+            [
+                "candle-llama",
+                "candle-llava",
+                "candle-starvector-1b",
+                "candle-starvector-8b"
+            ]
         );
         #[cfg(all(
             not(all(target_os = "macos", target_arch = "aarch64")),
@@ -106,6 +120,14 @@ mod tests {
     fn backend_capabilities_come_from_the_linked_runtime() {
         let caps = super::backend_capabilities();
         assert_eq!(caps.backend, super::execution_backend());
+        // On the CUDA build with a CUDA device, the switch is offered and the device's compute
+        // capability is reported (NVFP4 then follows the sm_120 floor, with the gate's reason).
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        if caps.device.starts_with("cuda:") {
+            assert!(caps.cuda_graphs.supported, "{:?}", caps.cuda_graphs);
+            let (major, _) = caps.compute_capability.expect("a CUDA device reports it");
+            assert_eq!(caps.nvfp4.supported, major >= 12, "{:?}", caps.nvfp4);
+        }
         #[cfg(not(all(not(target_os = "macos"), feature = "cuda")))]
         {
             assert!(!caps.nvfp4.supported);
