@@ -132,6 +132,33 @@ fn load_app_settings(app: AppHandle) -> Result<AppSettings, String> {
     load_app_settings_inner(&app)
 }
 
+fn save_with_credential_change(
+    settings: &mut AppSettings,
+    provided_token: &str,
+    auth: &ApiAuthState,
+    stop_server: impl FnOnce() -> Result<(), String>,
+    clear_token: impl FnOnce() -> Result<(), String>,
+    save_token: impl FnOnce(&str) -> Result<(), String>,
+    write_settings: impl FnOnce(&AppSettings) -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    // A failed settings write must never leave the previous bearer token live after Keychain
+    // deletion or rotation. Stop first so even a failed credential operation cannot race it.
+    stop_server()?;
+    let trimmed = provided_token.trim();
+    let token = if trimmed.is_empty() {
+        clear_token()?;
+        settings.server.auth_enabled = false;
+        None
+    } else {
+        save_token(trimmed)?;
+        Some(trimmed.to_string())
+    };
+    // The Keychain mutation has completed even if the following settings write fails.
+    *auth.lock().map_err(|error| error.to_string())? = Ok(token.clone());
+    write_settings(settings)?;
+    Ok(token)
+}
+
 #[tauri::command]
 fn save_app_settings(
     app: AppHandle,
@@ -142,16 +169,17 @@ fn save_app_settings(
     api_auth_token: Option<String>,
 ) -> Result<(AppSettings, OpenAiServerStatus, Option<String>), String> {
     let mut settings = settings.normalized()?;
+    let credential_change = api_auth_token.is_some();
     let token = if let Some(token) = api_auth_token {
-        let trimmed = token.trim();
-        if trimmed.is_empty() {
-            clear_api_auth_token()?;
-            settings.server.auth_enabled = false;
-            None
-        } else {
-            save_api_auth_token(trimmed)?;
-            Some(trimmed.to_string())
-        }
+        save_with_credential_change(
+            &mut settings,
+            &token,
+            auth.inner(),
+            || server.stop().map(|_| ()),
+            clear_api_auth_token,
+            save_api_auth_token,
+            |settings| save_app_settings_inner(&app, settings),
+        )?
     } else if settings.server.auth_enabled {
         let cached = auth.lock().map_err(|error| error.to_string())?.clone();
         match cached {
@@ -173,7 +201,9 @@ fn save_app_settings(
         None
     };
 
-    save_app_settings_inner(&app, &settings)?;
+    if !credential_change {
+        save_app_settings_inner(&app, &settings)?;
+    }
     *auth.lock().map_err(|error| error.to_string())? = Ok(token.clone());
     let status = start_server_from_settings(&settings, token.clone(), &engine, &server)?;
     Ok((settings, status, token))
@@ -372,6 +402,7 @@ fn main() {
 #[cfg(test)]
 mod credential_tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
 
     #[test]
     fn enabled_auth_cannot_build_an_unauthenticated_server() {
@@ -383,5 +414,66 @@ mod credential_tests {
             let config = server_config_from_settings(&settings, Some("secret".into())).unwrap();
             assert_eq!(config.auth_token.as_deref(), Some("secret"));
         }
+    }
+
+    #[test]
+    fn failed_settings_write_after_clear_or_rotation_leaves_server_stopped() {
+        for (provided, expected) in [("", None), ("new", Some("new"))] {
+            let running = Cell::new(true);
+            let stored = RefCell::new(Some("old".to_string()));
+            let auth = ApiAuthState::new(Ok(Some("old".to_string())));
+            let mut settings = AppSettings::default();
+            settings.server.auth_enabled = true;
+
+            let result = save_with_credential_change(
+                &mut settings,
+                provided,
+                &auth,
+                || {
+                    running.set(false);
+                    Ok(())
+                },
+                || {
+                    assert!(!running.get());
+                    *stored.borrow_mut() = None;
+                    Ok(())
+                },
+                |token| {
+                    assert!(!running.get());
+                    *stored.borrow_mut() = Some(token.to_string());
+                    Ok(())
+                },
+                |_| {
+                    assert!(!running.get());
+                    assert_eq!(stored.borrow().as_deref(), expected);
+                    Err("settings write failed".to_string())
+                },
+            );
+
+            assert_eq!(result.unwrap_err(), "settings write failed");
+            assert!(!running.get());
+            assert_eq!(stored.borrow().as_deref(), expected);
+            assert_eq!(auth.lock().unwrap().as_ref().unwrap().as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn failed_server_stop_prevents_credential_mutation() {
+        let auth = ApiAuthState::new(Ok(Some("old".to_string())));
+        let mut settings = AppSettings::default();
+        let result = save_with_credential_change(
+            &mut settings,
+            "new",
+            &auth,
+            || Err("server stop failed".to_string()),
+            || panic!("credential must not be cleared"),
+            |_| panic!("credential must not be replaced"),
+            |_| panic!("settings must not be written"),
+        );
+        assert_eq!(result.unwrap_err(), "server stop failed");
+        assert_eq!(
+            auth.lock().unwrap().as_ref().unwrap().as_deref(),
+            Some("old")
+        );
     }
 }

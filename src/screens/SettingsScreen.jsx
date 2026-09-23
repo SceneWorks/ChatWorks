@@ -82,6 +82,13 @@ export function SettingsScreen() {
       return nextSettings;
     } catch (cause) {
       setError(String(cause));
+      try {
+        setApiAuthToken(await invoke("api_auth_token"));
+        setApiAuthError(null);
+      } catch (authCause) {
+        setApiAuthToken(null);
+        setApiAuthError(String(authCause));
+      }
       invoke("openai_server_status").then(setServerStatus).catch(() => setServerStatus(null));
       return null;
     } finally {
