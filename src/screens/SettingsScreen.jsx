@@ -4,6 +4,7 @@ import { StatusDot } from "@sceneworks/ui";
 import { useApp } from "../state/AppContext";
 import { GenerationControls } from "../components/GenerationControls";
 import { generationParams, generationSettings } from "../state/generation.js";
+import { saveAppCredentialState } from "../state/credentials.js";
 
 export function settingsToForm(settings) {
   return {
@@ -22,7 +23,7 @@ export function settingsToForm(settings) {
 }
 
 export function SettingsScreen() {
-  const { appSettings, setAppSettings, apiAuthToken, setApiAuthToken, refreshAppSettings } = useApp();
+  const { appSettings, setAppSettings, apiAuthToken, setApiAuthToken, apiAuthError, setApiAuthError, refreshAppSettings } = useApp();
   const [form, setForm] = useState(() => settingsToForm(appSettings));
   const [serverStatus, setServerStatus] = useState(null);
   const [tokenInput, setTokenInput] = useState("");
@@ -70,19 +71,18 @@ export function SettingsScreen() {
     setNotice(null);
     try {
       const tokenValue = tokenOverride ?? (tokenInput.trim() ? tokenInput.trim() : null);
-      const [nextSettings, nextStatus] = await invoke("save_app_settings", {
-        settings: buildSettings(nextForm),
-        apiAuthToken: tokenValue,
-      });
+      const { settings: nextSettings, status: nextStatus, token: nextToken } =
+        await saveAppCredentialState(invoke, buildSettings(nextForm), tokenValue);
       setAppSettings(nextSettings);
       setServerStatus(nextStatus);
       setTokenInput("");
-      const nextToken = await invoke("api_auth_token").catch(() => null);
       setApiAuthToken(nextToken);
+      setApiAuthError(null);
       setNotice("Settings saved and the API server was reconfigured.");
       return nextSettings;
     } catch (cause) {
       setError(String(cause));
+      invoke("openai_server_status").then(setServerStatus).catch(() => setServerStatus(null));
       return null;
     } finally {
       setBusy(false);
@@ -187,7 +187,7 @@ export function SettingsScreen() {
           />
           <span>
             Require bearer token
-            <small>{apiAuthPresent ? "A token is saved in the OS keychain." : "Save a token before enabling auth."}</small>
+            <small>{apiAuthError ?? (apiAuthPresent ? "A token is saved in the OS keychain." : "Save a token before enabling auth.")}</small>
           </span>
         </label>
 
@@ -286,7 +286,7 @@ export function SettingsScreen() {
         </span>
         <span className={serverStatus?.auth_required ? "status-pill" : "status-pill warning"}>
           <StatusDot ok={Boolean(serverStatus?.auth_required)} />
-          {serverStatus?.auth_required ? "Auth required" : "Auth off"}
+          {!serverStatus?.running ? "Server stopped" : serverStatus.auth_required ? "Auth required" : "Auth off"}
         </span>
         {serverStatus?.last_error ? <p className="form-error">{serverStatus.last_error}</p> : null}
       </aside>

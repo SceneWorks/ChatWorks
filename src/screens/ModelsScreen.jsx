@@ -5,6 +5,7 @@ import { CompactSelector, StatusDot } from "@sceneworks/ui";
 import { useApp } from "../state/AppContext";
 import { useConversations } from "../state/ConversationsContext";
 import { formatBytes, isExactGgufUrl, modelSubtitle, modelWeightLabel, unloadServedModel } from "../state/models.js";
+import { checkHfCredentialStatus } from "../state/credentials.js";
 
 export const QUANTIZE_OPTIONS = [
   { id: "dense", label: "Dense (full precision)", value: null },
@@ -20,7 +21,7 @@ export function ModelsScreen() {
   const [sourceUrl, setSourceUrl] = useState("");
   const [projectorUrl, setProjectorUrl] = useState("");
   const [quantizeId, setQuantizeId] = useState("dense");
-  const [tokenStatus, setTokenStatus] = useState({ present: false });
+  const [tokenStatus, setTokenStatus] = useState(null);
   const [tokenInput, setTokenInput] = useState("");
   const [progress, setProgress] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -50,10 +51,17 @@ export function ModelsScreen() {
 
   useEffect(() => {
     refreshRegistry();
-    invoke("hf_token_status")
-      .then(setTokenStatus)
-      .catch(() => setTokenStatus({ present: false }));
   }, [refreshRegistry]);
+
+  async function checkTokenStatus() {
+    try {
+      setTokenStatus(await checkHfCredentialStatus(invoke));
+      setError(null);
+    } catch (cause) {
+      setTokenStatus(null);
+      setError(`Could not read HuggingFace credential: ${String(cause)}`);
+    }
+  }
 
   useEffect(() => {
     const unlistenPromise = listen("models://import-progress", (event) => {
@@ -171,6 +179,7 @@ export function ModelsScreen() {
     try {
       const status = await invoke("set_hf_token", { request: { token: tokenInput.trim() } });
       setTokenStatus(status);
+      setError(null);
       setTokenInput("");
       setNotice("HuggingFace token saved to the keychain.");
     } catch (cause) {
@@ -182,6 +191,7 @@ export function ModelsScreen() {
     try {
       const status = await invoke("clear_hf_token");
       setTokenStatus(status);
+      setError(null);
       setNotice("HuggingFace token removed.");
     } catch (cause) {
       setError(String(cause));
@@ -409,7 +419,7 @@ export function ModelsScreen() {
           <h2>HuggingFace token</h2>
           <p className="view-copy">
             Optional. Stored in the OS keychain and used for gated or private repositories.
-            {tokenStatus.present ? " A token is currently saved." : " No token saved."}
+            {tokenStatus === null ? " Check its status when needed." : tokenStatus.present ? " A token is currently saved." : " No token saved."}
           </p>
         </div>
         <div className="field-inline">
@@ -425,7 +435,8 @@ export function ModelsScreen() {
           <button className="ghost-btn" disabled={!tokenInput.trim()} onClick={handleSaveToken} type="button">
             Save
           </button>
-          {tokenStatus.present ? (
+          <button className="ghost-btn" onClick={checkTokenStatus} type="button">Check saved token</button>
+          {tokenStatus?.present ? (
             <button className="ghost-btn danger" onClick={handleClearToken} type="button">
               Remove
             </button>
