@@ -20,12 +20,11 @@ export function modelSubtitle(model) {
 export function modelWeightLabel(model) {
   if (model.pack === "bonsai2-packed" || model.format === "gguf-prism-packed") return "Bonsai 2 packed";
   if (model.format === "gguf") return "GGUF";
-  if (model.quantize === "q4") return "Q4";
-  if (model.quantize === "q8") return "Q8";
-  if (Number.isInteger(model.sourceBits) && model.sourceBits >= 1 && model.sourceBits <= 8) {
-    return `${model.sourceBits}-bit`;
-  }
-  return "Safetensors";
+  const sourceBits = Number.isInteger(model.sourceBits) && model.sourceBits >= 1 && model.sourceBits <= 8
+    ? model.sourceBits : null;
+  const loadQuantization = model.quantize === "q4" ? "Q4 load" : model.quantize === "q8" ? "Q8 load" : null;
+  if (loadQuantization) return `${sourceBits ? `${sourceBits}-bit source` : "Safetensors"} · ${loadQuantization}`;
+  return sourceBits ? `${sourceBits}-bit` : "Safetensors";
 }
 
 export function isExactGgufUrl(value) {

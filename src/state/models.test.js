@@ -11,5 +11,6 @@ test("cached source labels follow the detected format and quantization", () => {
 
 test("adopted source bits remain visible in the registered model subtitle", () => {
   assert.equal(modelSubtitle({ format: "hf-safetensors", sourceBits: 4, sizeBytes: 4096 }), "4-bit · 4.0 KB");
-  assert.equal(modelSubtitle({ format: "hf-safetensors", quantize: "q8", sourceBits: 4 }), "Q8");
+  assert.equal(modelSubtitle({ format: "hf-safetensors", quantize: "q8", sourceBits: 4 }), "4-bit source · Q8 load");
+  assert.equal(modelSubtitle({ format: "hf-safetensors", quantize: "q8" }), "Safetensors · Q8 load");
 });

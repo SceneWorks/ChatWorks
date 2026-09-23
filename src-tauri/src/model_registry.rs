@@ -432,7 +432,7 @@ async fn import_hf_model_inner(
         unsupported_model_source_error(&source, "downloaded model is not supported")
     })?;
     let (format, pack) = recognized_model_format(&source)?;
-    let (_, source_bits) = source_model_metadata(&source, &provider.family)?;
+    let (_, source_bits) = source_model_metadata(&source)?;
     validate_quantize_request(&format, pack.as_deref(), request.quantize)?;
     let projector_source = projector_ref
         .as_ref()
@@ -881,18 +881,17 @@ fn has_prism_runtime_marker(path: &Path) -> bool {
     path.join("PACK-RUNTIME.md").is_file() || path.join("PACK-RUNTIME").is_file()
 }
 
-fn source_model_metadata(
-    path: &Path,
-    provider_family: &str,
-) -> Result<(String, Option<u8>), String> {
+fn source_model_metadata(path: &Path) -> Result<(String, Option<u8>), String> {
     if path.is_file() {
+        let gguf = gguf_identity(path);
         return Ok((
-            if is_packed_prism_gguf(path) {
-                "prism_hadamard_qwen35"
-            } else {
-                provider_family
-            }
-            .to_string(),
+            match gguf {
+                Some((ref architecture, true)) if architecture == "qwen35" => {
+                    "prism_hadamard_qwen35".to_string()
+                }
+                Some((architecture, _)) => architecture,
+                None => "unknown".to_string(),
+            },
             None,
         ));
     }
@@ -902,7 +901,7 @@ fn source_model_metadata(
     let family = config["model_type"]
         .as_str()
         .filter(|value| !value.is_empty())
-        .unwrap_or(provider_family)
+        .unwrap_or("unknown")
         .to_string();
     let bits = config["quantization_config"]["bits"]
         .as_u64()
@@ -1040,9 +1039,9 @@ fn is_accelerator_only_model(path: &Path) -> Result<bool, String> {
     Ok(is_qwen38_parent_config(&config) || config["model_type"] == "prism_hadamard_qwen35")
 }
 
-/// Reads only GGUF metadata and tensor directory; no weight bytes are touched. A malformed
-/// header is left to the provider's ordinary validation path rather than labeled Bonsai.
-fn is_packed_prism_gguf(path: &Path) -> bool {
+/// Reads only GGUF metadata and, for Qwen35, its tensor directory. Weight bytes are never read.
+/// A malformed header is left to the provider's ordinary validation path.
+fn gguf_identity(path: &Path) -> Option<(String, bool)> {
     fn read_u32(file: &mut fs::File) -> std::io::Result<u32> {
         let mut bytes = [0; 4];
         file.read_exact(&mut bytes)?;
@@ -1109,47 +1108,52 @@ fn is_packed_prism_gguf(path: &Path) -> bool {
         };
         skip(file, width, file_len)
     }
-    fn probe(path: &Path) -> std::io::Result<bool> {
+    fn probe(path: &Path) -> std::io::Result<(String, bool)> {
         let mut file = fs::File::open(path)?;
         let file_len = file.metadata()?.len();
         if read_u32(&mut file)? != u32::from_le_bytes(*b"GGUF")
             || !matches!(read_u32(&mut file)?, 2 | 3)
         {
-            return Ok(false);
+            return Err(std::io::ErrorKind::InvalidData.into());
         }
         let tensors = read_u64(&mut file)?;
         let metadata = read_u64(&mut file)?;
         if tensors > 1_000_000 || metadata > 1_000_000 {
-            return Ok(false);
+            return Err(std::io::ErrorKind::InvalidData.into());
         }
-        let mut qwen35 = false;
+        let mut architecture = None;
         for _ in 0..metadata {
             let key = read_string(&mut file, file_len)?;
             let ty = read_u32(&mut file)?;
             if key == "general.architecture" && ty == 8 {
-                qwen35 = read_string(&mut file, file_len)? == "qwen35";
+                architecture = Some(read_string(&mut file, file_len)?);
             } else {
                 skip_value(&mut file, ty, file_len)?;
             }
         }
-        if !qwen35 {
-            return Ok(false);
+        let architecture = architecture.ok_or(std::io::ErrorKind::InvalidData)?;
+        if architecture != "qwen35" {
+            return Ok((architecture, false));
         }
         let mut packed = false;
         for _ in 0..tensors {
             let _name = read_string(&mut file, file_len)?;
             let rank = read_u32(&mut file)?;
             if !(1..=4).contains(&rank) {
-                return Ok(false);
+                return Err(std::io::ErrorKind::InvalidData.into());
             }
             skip(&mut file, u64::from(rank) * 8, file_len)?;
             let ty = read_u32(&mut file)?;
             skip(&mut file, 8, file_len)?; // tensor data offset
             packed |= matches!(ty, 142 | 143);
         }
-        Ok(packed)
+        Ok((architecture, packed))
     }
-    probe(path).unwrap_or(false)
+    probe(path).ok()
+}
+
+fn is_packed_prism_gguf(path: &Path) -> bool {
+    gguf_identity(path).is_some_and(|(architecture, packed)| architecture == "qwen35" && packed)
 }
 
 const CPU_MODEL_UNAVAILABLE: &str = "Qwen3.8-27B and Bonsai 2 inference require Apple MLX or Candle CUDA; this ChatWorks build uses Candle CPU";
@@ -1250,7 +1254,7 @@ fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, S
     let file_count = snapshot_file_count(path)?;
     let size_bytes = snapshot_size_bytes(path);
     let (format, pack) = recognized_model_format(path)?;
-    let (model_family, source_bits) = source_model_metadata(path, &provider.family)?;
+    let (model_family, source_bits) = source_model_metadata(path)?;
     Ok(Some(CachedModelCandidate {
         id: model_id(&model_ref, None),
         name: model_name(&model_ref, None),
@@ -1482,7 +1486,18 @@ fn read_registry(path: &Path) -> Result<ModelRegistry, String> {
         return Ok(ModelRegistry::default());
     }
     let body = fs::read_to_string(path).map_err(|error| error.to_string())?;
-    serde_json::from_str(&body).map_err(|error| error.to_string())
+    let mut registry: ModelRegistry =
+        serde_json::from_str(&body).map_err(|error| error.to_string())?;
+    for model in &mut registry.models {
+        if model.source_bits.is_none() && model.format == "hf-safetensors" {
+            // Older manifests lack this field. Refresh it from a local config for display,
+            // without rewriting the manifest or changing the selected load quantization.
+            if let Ok((_, bits)) = source_model_metadata(Path::new(&model.local_path)) {
+                model.source_bits = bits;
+            }
+        }
+    }
+    Ok(registry)
 }
 
 fn write_registry(path: &Path, registry: &ModelRegistry) -> Result<(), String> {
@@ -1818,6 +1833,21 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_gguf_family_comes_from_bounded_header_metadata() {
+        let dir = snapshot_dir("gguf-family");
+        let source = dir.path().join("ordinary.gguf");
+        write_gguf_with_tensor_type(&source, "qwen2", 0);
+        assert_eq!(
+            source_model_metadata(&source).unwrap(),
+            ("qwen2".to_string(), None)
+        );
+        assert!(!is_packed_prism_gguf(&source));
+        let malformed = dir.path().join("malformed.gguf");
+        fs::write(&malformed, b"GGUF").unwrap();
+        assert_eq!(source_model_metadata(&malformed).unwrap().0, "unknown");
+    }
+
+    #[test]
     fn projector_must_be_an_explicit_same_snapshot_gguf() {
         let dir = snapshot_dir("projector-association");
         let model = dir.path().join("PQ2_0.gguf");
@@ -2130,7 +2160,7 @@ mod tests {
         write_snapshot_file(
             &snapshot,
             "config.json",
-            r#"{"schema_version":2,"model_type":"prism_hadamard_qwen35","base_model_type":"qwen3_5","quantization":{"bits":2,"group_size":128,"mode":"affine"},"vision_config":{"model_type":"qwen3_5"},"text_config":{"model_type":"qwen3_5_text"}}"#,
+            r#"{"schema_version":2,"model_type":"prism_hadamard_qwen35","base_model_type":"qwen3_5","components":{"text":true,"vision":true,"mtp":false},"quantization":{"bits":2,"group_size":128,"mode":"affine"},"vision_config":{"model_type":"qwen3_5"},"text_config":{"model_type":"qwen3_5_text"}}"#,
         );
         write_snapshot_file(&snapshot, "tokenizer.json", "{}");
         write_snapshot_file(&snapshot, "model.safetensors", "weights");
@@ -2349,6 +2379,63 @@ mod tests {
         assert_eq!(
             restored.models[0].projector_sources,
             vec!["/tmp/mmproj-F16.gguf"]
+        );
+    }
+
+    #[test]
+    fn legacy_registry_enriches_source_bits_without_changing_load_settings_or_manifest() {
+        let dir = snapshot_dir("legacy-source-bits");
+        let snapshot = dir.path().join("snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        write_snapshot_file(
+            &snapshot,
+            "config.json",
+            r#"{"model_type":"qwen3","quantization_config":{"bits":4,"group_size":64}}"#,
+        );
+        let manifest = dir.path().join("manifest.json");
+        let entry = ModelEntry {
+            id: "legacy".to_string(),
+            name: "Qwen 4-bit".to_string(),
+            repo: "mlx-community/Qwen3-1.7B-4bit".to_string(),
+            revision: "rev1".to_string(),
+            source_url: "https://huggingface.co/mlx-community/Qwen3-1.7B-4bit".to_string(),
+            local_path: snapshot.to_string_lossy().to_string(),
+            quantize: Some(QuantizeRequest::Q8),
+            imported_at: 42,
+            file_count: 3,
+            size_bytes: Some(4096),
+            format: "hf-safetensors".to_string(),
+            pack: None,
+            provider_id: Some("mlx-llama".to_string()),
+            source_bits: None,
+            projector_source: None,
+            projector_sources: Vec::new(),
+        };
+        let mut value = serde_json::to_value(ModelRegistry {
+            models: vec![entry],
+            selected_id: Some("legacy".to_string()),
+        })
+        .unwrap();
+        value["models"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("sourceBits");
+        let original = serde_json::to_string(&value).unwrap();
+        fs::write(&manifest, &original).unwrap();
+
+        let loaded = read_registry(&manifest).unwrap();
+        assert_eq!(loaded.models[0].source_bits, Some(4));
+        assert!(matches!(
+            loaded.models[0].quantize,
+            Some(QuantizeRequest::Q8)
+        ));
+        assert_eq!(loaded.selected_id.as_deref(), Some("legacy"));
+        assert_eq!(fs::read_to_string(&manifest).unwrap(), original);
+
+        fs::remove_file(snapshot.join("config.json")).unwrap();
+        assert_eq!(
+            read_registry(&manifest).unwrap().models[0].source_bits,
+            None
         );
     }
 
