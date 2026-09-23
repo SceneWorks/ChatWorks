@@ -32,6 +32,7 @@ fn qwen3vl_tool_loop_over_openai_server() {
             source: model,
             display_name: None,
             quantize: None,
+            projector_source: None,
         })
         .expect("load Qwen3-VL");
 
@@ -67,13 +68,25 @@ fn qwen3vl_tool_loop_over_openai_server() {
         .expect("send round 1")
         .json()
         .expect("json round 1");
-    println!("\n=== round 1 (expect tool_calls) ===\n{}\n", serde_json::to_string_pretty(&first).unwrap_or_default());
+    println!(
+        "\n=== round 1 (expect tool_calls) ===\n{}\n",
+        serde_json::to_string_pretty(&first).unwrap_or_default()
+    );
 
     let choice = &first["choices"][0];
-    assert_eq!(choice["finish_reason"], "tool_calls", "round 1 must request a tool call");
+    assert_eq!(
+        choice["finish_reason"], "tool_calls",
+        "round 1 must request a tool call"
+    );
     let call = &choice["message"]["tool_calls"][0];
-    assert_eq!(call["function"]["name"], "calculator", "must call the calculator");
-    let raw_arguments = call["function"]["arguments"].as_str().expect("arguments string").to_string();
+    assert_eq!(
+        call["function"]["name"], "calculator",
+        "must call the calculator"
+    );
+    let raw_arguments = call["function"]["arguments"]
+        .as_str()
+        .expect("arguments string")
+        .to_string();
 
     // Execute the call with the REAL built-in executor (what the `execute_tool` command runs).
     let parsed_arguments: serde_json::Value =
@@ -105,9 +118,14 @@ fn qwen3vl_tool_loop_over_openai_server() {
         .expect("send round 2")
         .json()
         .expect("json round 2");
-    println!("\n=== round 2 (expect final answer) ===\n{}\n", serde_json::to_string_pretty(&second).unwrap_or_default());
+    println!(
+        "\n=== round 2 (expect final answer) ===\n{}\n",
+        serde_json::to_string_pretty(&second).unwrap_or_default()
+    );
 
-    let answer = second["choices"][0]["message"]["content"].as_str().unwrap_or("");
+    let answer = second["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("");
     assert!(
         answer.contains("100"),
         "the model must report the tool result (100) in its final answer, got: {answer:?}"

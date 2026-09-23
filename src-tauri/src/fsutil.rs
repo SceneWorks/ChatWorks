@@ -76,8 +76,7 @@ pub struct TempDir {
 impl TempDir {
     /// Create (and clear) a fresh namespaced temp directory.
     pub fn new(label: &str) -> Self {
-        let path =
-            std::env::temp_dir().join(format!("chatworks-{label}-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("chatworks-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         Self { path }

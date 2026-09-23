@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { CompactSelector, StatusDot } from "@sceneworks/ui";
 import { useApp } from "../state/AppContext";
+import { useConversations } from "../state/ConversationsContext";
+import { formatBytes, isExactGgufUrl, modelSubtitle, unloadServedModel } from "../state/models.js";
 
 export const QUANTIZE_OPTIONS = [
   { id: "dense", label: "Dense (full precision)", value: null },
@@ -10,31 +12,13 @@ export const QUANTIZE_OPTIONS = [
   { id: "q8", label: "Quantize Q8", value: "q8" },
 ];
 
-export function formatBytes(bytes) {
-  if (!bytes && bytes !== 0) return "";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value.toFixed(value >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
-}
-
-export function modelSubtitle(model) {
-  const parts = [];
-  if (model.quantize === "q4") parts.push("Q4");
-  else if (model.quantize === "q8") parts.push("Q8");
-  else parts.push("Dense");
-  if (model.sizeBytes) parts.push(formatBytes(model.sizeBytes));
-  return parts.join(" · ");
-}
-
 export function ModelsScreen() {
   const { engineStatus, refreshEngineStatus } = useApp();
+  const { busy: generationBusy } = useConversations();
+  const [unloading, setUnloading] = useState(false);
   const [registry, setRegistry] = useState({ models: [], selectedId: null });
   const [sourceUrl, setSourceUrl] = useState("");
+  const [projectorUrl, setProjectorUrl] = useState("");
   const [quantizeId, setQuantizeId] = useState("dense");
   const [tokenStatus, setTokenStatus] = useState({ present: false });
   const [tokenInput, setTokenInput] = useState("");
@@ -43,12 +27,14 @@ export function ModelsScreen() {
   const [cacheBusy, setCacheBusy] = useState(false);
   const [cachedModels, setCachedModels] = useState([]);
   const [adoptingPath, setAdoptingPath] = useState("");
+  const [projectorSelections, setProjectorSelections] = useState({});
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null);
   const [loadingId, setLoadingId] = useState("");
 
   const loadedSource = engineStatus?.loaded?.source ?? null;
   const selectedModel = registry.models.find((model) => model.id === registry.selectedId) ?? null;
+  const exactGgufImport = isExactGgufUrl(sourceUrl);
 
   const refreshRegistry = useCallback(() => {
     return invoke("list_registered_models")
@@ -88,11 +74,16 @@ export function ModelsScreen() {
     const option = QUANTIZE_OPTIONS.find((item) => item.id === quantizeId) ?? QUANTIZE_OPTIONS[0];
     try {
       const next = await invoke("import_hf_model", {
-        request: { sourceUrl: sourceUrl.trim(), quantize: option.value },
+        request: {
+          sourceUrl: sourceUrl.trim(),
+          quantize: exactGgufImport ? null : option.value,
+          projectorSource: projectorUrl.trim() || null,
+        },
       });
       setRegistry(next);
       setNotice("Model imported and added to the registry.");
       setSourceUrl("");
+      setProjectorUrl("");
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -108,7 +99,7 @@ export function ModelsScreen() {
     try {
       const models = await invoke("list_cached_hf_models");
       setCachedModels(models);
-      setNotice(models.length ? `Found ${models.length} supported cached model${models.length === 1 ? "" : "s"}.` : "No supported cached HuggingFace models found.");
+      setNotice(models.length ? `Found ${models.length} cached model${models.length === 1 ? "" : "s"}.` : "No supported cached HuggingFace models found.");
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -122,9 +113,14 @@ export function ModelsScreen() {
     setError(null);
     setNotice(null);
     const option = QUANTIZE_OPTIONS.find((item) => item.id === quantizeId) ?? QUANTIZE_OPTIONS[0];
+    const storedEncoding = candidate.pack === "bonsai2-packed" || candidate.format?.startsWith("gguf");
     try {
       const next = await invoke("adopt_cached_hf_model", {
-        request: { localPath: candidate.localPath, quantize: option.value },
+        request: {
+          localPath: candidate.localPath,
+          quantize: storedEncoding ? null : option.value,
+          projectorSource: candidate.projectorSource,
+        },
       });
       setRegistry(next);
       setNotice(`${candidate.name} added from the HuggingFace cache.`);
@@ -136,12 +132,15 @@ export function ModelsScreen() {
   }
 
   async function handleSelect(model) {
-    if (loadingId) return;
+    if (loadingId || unloading || generationBusy) return;
     setLoadingId(model.id);
     setError(null);
     setNotice(null);
     try {
-      await invoke("load_registered_model", { modelId: model.id });
+      await invoke("load_registered_model", {
+        modelId: model.id,
+        projectorSource: projectorSelections[model.id] ?? model.projectorSource ?? null,
+      });
       await refreshRegistry();
       await refreshEngineStatus();
       setNotice(`${model.name} is now the served model.`);
@@ -149,6 +148,21 @@ export function ModelsScreen() {
       setError(String(cause));
     } finally {
       setLoadingId("");
+    }
+  }
+
+  async function handleUnload() {
+    if (unloading || loadingId || generationBusy) return;
+    setUnloading(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await unloadServedModel({ invoke, busy: generationBusy, refreshStatus: refreshEngineStatus });
+      setNotice("Model unloaded. Select a registered model to load it again.");
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setUnloading(false);
     }
   }
 
@@ -187,6 +201,11 @@ export function ModelsScreen() {
             Paste a HuggingFace model URL or <code>owner/repo</code>. ChatWorks downloads the snapshot,
             prepares it for local inference, and adds it to your local registry.
           </p>
+          {engineStatus?.execution_backend === "candle-cpu" ? (
+            <p className="view-copy">
+              This build uses Candle CPU. Qwen3.8-27B and Bonsai 2 require Apple MLX or Candle CUDA; other supported models can still use CPU.
+            </p>
+          ) : null}
         </div>
         <div className="field">
           <label htmlFor="hf-url">HuggingFace URL or repo</label>
@@ -202,14 +221,31 @@ export function ModelsScreen() {
             value={sourceUrl}
           />
         </div>
+        {exactGgufImport ? (
+          <div className="field">
+            <label htmlFor="hf-projector-url">Companion projector URL (optional)</label>
+            <input
+              autoComplete="off"
+              disabled={busy}
+              id="hf-projector-url"
+              onChange={(event) => setProjectorUrl(event.target.value)}
+              placeholder="https://huggingface.co/owner/repo/blob/revision/mmproj-F16.gguf"
+              spellCheck={false}
+              type="url"
+              value={projectorUrl}
+            />
+            <small>Choose one exact mmproj artifact from the same repository and revision. Empty remains text-only.</small>
+          </div>
+        ) : null}
         <div className="field">
           <span className="field-label">Conversion</span>
+          {exactGgufImport ? <p className="view-copy">Existing GGUF encoding (conversion unavailable)</p> : null}
           <div className="segmented" role="radiogroup" aria-label="Quantization">
             {QUANTIZE_OPTIONS.map((option) => (
               <button
                 aria-checked={quantizeId === option.id}
                 className={quantizeId === option.id ? "segmented-item active" : "segmented-item"}
-                disabled={busy}
+                disabled={busy || exactGgufImport}
                 key={option.id}
                 onClick={() => setQuantizeId(option.id)}
                 role="radio"
@@ -259,22 +295,35 @@ export function ModelsScreen() {
           <ul className="model-list">
             {cachedModels.map((model) => {
               const alreadyRegistered = registry.models.some((entry) => entry.localPath === model.localPath);
+              const selectedProjector = projectorSelections[model.localPath] ?? "";
               return (
                 <li className="model-row" key={model.localPath}>
                   <div className="model-row-main">
                     <span className="model-row-name">{model.name}</span>
                     <span className="model-row-meta">
-                      {model.repo} · {model.providerFamily} · {model.supportsVision ? "Vision" : "Text"}
+                      {model.repo} · {model.providerFamily} · {model.pack === "bonsai2-packed" ? "Bonsai 2 packed" : model.format === "gguf" ? "GGUF" : "Dense"} · {model.supportsVision ? "Vision" : "Text"}
                     </span>
+                    {model.unavailableReason ? <span className="model-row-meta">{model.unavailableReason}</span> : null}
                   </div>
                   <span className="model-row-meta">{formatBytes(model.sizeBytes)}</span>
+                  {model.projectorSources?.length ? (
+                    <select
+                      aria-label={`Projector for ${model.name}`}
+                      disabled={Boolean(adoptingPath) || alreadyRegistered || Boolean(model.unavailableReason)}
+                      onChange={(event) => setProjectorSelections((current) => ({ ...current, [model.localPath]: event.target.value }))}
+                      value={selectedProjector}
+                    >
+                      <option value="">Text only (no projector)</option>
+                      {model.projectorSources.map((source) => <option key={source} value={source}>{source.split("/").at(-1)}</option>)}
+                    </select>
+                  ) : null}
                   <button
                     className="ghost-btn"
-                    disabled={Boolean(adoptingPath) || alreadyRegistered}
-                    onClick={() => handleAdoptCached(model)}
+                    disabled={Boolean(adoptingPath) || alreadyRegistered || Boolean(model.unavailableReason)}
+                    onClick={() => handleAdoptCached({ ...model, projectorSource: selectedProjector || null })}
                     type="button"
                   >
-                    {alreadyRegistered ? "Registered" : adoptingPath === model.localPath ? "Adding…" : "Add"}
+                    {alreadyRegistered ? "Registered" : model.unavailableReason ? "Unavailable" : adoptingPath === model.localPath ? "Adding…" : "Add"}
                   </button>
                 </li>
               );
@@ -289,9 +338,12 @@ export function ModelsScreen() {
           <h2>Local models</h2>
           <p className="view-copy">Pick the one model ChatWorks serves over the OpenAI-compatible API.</p>
         </div>
+        {loadedSource ? <button className="ghost-btn" type="button"
+          disabled={unloading || Boolean(loadingId) || generationBusy}
+          onClick={handleUnload}>{unloading ? "Unloading…" : "Unload model"}</button> : null}
         <CompactSelector
           items={registry.models}
-          selectedId={registry.selectedId ?? ""}
+          selectedId={loadedSource ? registry.selectedId ?? "" : ""}
           onSelect={handleSelect}
           getSubtitle={modelSubtitle}
           busyId={loadingId}
@@ -302,10 +354,12 @@ export function ModelsScreen() {
         {registry.models.length ? (
           <ul className="model-list">
             {registry.models.map((model) => {
+              const selectedProjector = projectorSelections[model.id] ?? model.projectorSource ?? "";
               const isServed =
                 loadedSource &&
                 model.localPath === loadedSource &&
-                (model.quantize ?? null) === (engineStatus?.loaded?.quantize ?? null);
+                (model.quantize ?? null) === (engineStatus?.loaded?.quantize ?? null) &&
+                (selectedProjector || null) === (engineStatus?.loaded?.projector_source ?? null);
               return (
                 <li className={isServed ? "model-row served" : "model-row"} key={model.id}>
                   <div className="model-row-main">
@@ -316,6 +370,17 @@ export function ModelsScreen() {
                     <span className="model-row-meta">{model.repo}</span>
                   </div>
                   <span className="model-row-meta">{modelSubtitle(model)}</span>
+                  {model.projectorSources?.length ? (
+                    <select
+                      aria-label={`Projector for ${model.name}`}
+                      disabled={Boolean(loadingId)}
+                      onChange={(event) => setProjectorSelections((current) => ({ ...current, [model.id]: event.target.value }))}
+                      value={selectedProjector}
+                    >
+                      <option value="">Text only (no projector)</option>
+                      {model.projectorSources.map((source) => <option key={source} value={source}>{source.split("/").at(-1)}</option>)}
+                    </select>
+                  ) : null}
                   <button
                     className="ghost-btn"
                     disabled={Boolean(loadingId) || isServed}

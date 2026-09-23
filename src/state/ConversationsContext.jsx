@@ -20,8 +20,8 @@ export const ChatStateContext = createContext(null);
 ///   - `ConversationsContext` (rarely changes): active id, metadata cache, and the lifecycle
 ///     actions (`selectConversation`, `startNewChat`, `persistConversation`, `renameConversation`,
 ///     `deleteConversation`, `refreshConversations`).
-///   - `ChatStateContext` (changes every token): `messages`, `draft`, `params`, `attachments`,
-///     `videoAttachments` and their setters.
+///   - `ChatStateContext` (changes every token): `messages`, `draft`, `params`, and the ordered
+///     pending `mediaAttachments` queue with its setter.
 ///
 /// App start opens a fresh, unsaved new chat (activeConversationId === null) and loads the history
 /// metadata cache independently — there is no auto-resume.
@@ -34,8 +34,7 @@ export function ConversationsProvider({ children }) {
   const [messages, setMessages] = useState([]);
   const [draft, setDraft] = useState("");
   const [params, setParams] = useState(defaultParams);
-  const [attachments, setAttachments] = useState([]);
-  const [videoAttachments, setVideoAttachments] = useState([]);
+  const [mediaAttachments, setMediaAttachments] = useState([]);
   // `busy` is the active-stream flag. It lives here (not in ChatScreen) so the history nav — a
   // sibling of ChatScreen in the shell — can read it and hard-block conversation switching while a
   // response is streaming (story C). It only flips at stream boundaries, so exposing it through
@@ -118,14 +117,13 @@ export function ConversationsProvider({ children }) {
     }
   }, [defaultParams, activeConversationId]);
 
-  /// Reset to a fresh, unsaved new chat: clears messages/draft/attachments, clears the active id,
+  /// Reset to a fresh, unsaved new chat: clears messages/draft/media, clears the active id,
   /// and resets params to the app defaults. The saved history is untouched.
   const startNewChat = useCallback(() => {
     setActiveConversationId(null);
     setMessages([]);
     setDraft("");
-    setAttachments([]);
-    setVideoAttachments([]);
+    setMediaAttachments([]);
     setParams(paramsFromSettings(appSettings.sampling));
   }, [appSettings]);
 
@@ -140,8 +138,7 @@ export function ConversationsProvider({ children }) {
     setActiveConversationId(conversation.id);
     setMessages(Array.isArray(conversation.messages) ? conversation.messages : []);
     setDraft("");
-    setAttachments([]);
-    setVideoAttachments([]);
+    setMediaAttachments([]);
     setParams(paramsFromConversation(conversation.params));
     return conversation;
   }, []);
@@ -230,12 +227,10 @@ export function ConversationsProvider({ children }) {
       setDraft,
       params,
       setParams,
-      attachments,
-      setAttachments,
-      videoAttachments,
-      setVideoAttachments,
+      mediaAttachments,
+      setMediaAttachments,
     }),
-    [messages, draft, params, attachments, videoAttachments],
+    [messages, draft, params, mediaAttachments],
   );
 
   return (

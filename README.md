@@ -3,21 +3,36 @@
 A SceneWorks-styled desktop app for serving local LLMs. ChatWorks is a [Tauri](https://tauri.app/)
 application: a Rust backend that loads models and runs inference, fronted by an
 OpenAI-compatible HTTP server and a web chat UI. The inference backend is selected per-platform
-at build time — Apple **MLX** on macOS, cross-platform **Candle** on Windows/Linux — through one
+at build time — Apple **MLX** on Apple Silicon macOS and **Candle CPU** on Intel macOS,
+Windows, and Linux (with an optional Candle CUDA profile on Windows/Linux) — through one
 immutable [`SceneWorks/inference`](https://github.com/SceneWorks/inference) runtime release. The
-current cutover pin is `runtime-2026.07.2`; the bundle re-exports the neutral `core-llm` contract
+current cutover pin is `runtime-2026.09.0`; the bundle re-exports the neutral `core-llm` contract
 and explicitly lists every available provider.
 
 - Running on Windows/Linux (Candle): see [WINDOWS.md](WINDOWS.md).
 - Sending video over the OpenAI-compatible API: see [docs/VIDEO_API.md](docs/VIDEO_API.md).
+- Release packaging provisions pinned FFmpeg/ffprobe sidecars with `npm run provision:media`; see [the FFmpeg notice](third_party/ffmpeg/NOTICE.md).
+
+## Package validation
+
+`.github/workflows/package-validation.yml` builds native packages on standard GitHub-hosted
+runners for Apple Silicon macOS (`aarch64-apple-darwin`, MLX), Intel macOS
+(`x86_64-apple-darwin`, CPU), x64 Linux (`x86_64-unknown-linux-gnu`, CPU), arm64 Linux
+(`aarch64-unknown-linux-gnu`, CPU), and x64 Windows (`x86_64-pc-windows-msvc`, CPU), plus a
+separate x64 Windows CUDA lane. The six jobs build the
+checksum-pinned FFmpeg 9.0 source on each native runner, build an unsigned `.app`, `.deb`,
+or NSIS package, then inspect that package for both FFmpeg and ffprobe.
+
+All Git-sourced runtime dependencies are public, so package validation requires no repository
+credential or custom Actions secret. The workflow's built-in token retains read-only contents
+permission; packaging does not publish artifacts, create a release, or require production signing
+credentials.
 
 ## Quick start (development)
 
-The Rust backend requires read access to the private
-[`SceneWorks/inference`](https://github.com/SceneWorks/inference) repository. Authenticate the
-system Git client (for example with `gh auth login` followed by `gh auth setup-git`) before running
-the development command. Unauthenticated clones cannot fetch the runtime while that repository
-remains private.
+The Rust backend resolves its runtime from the public
+[`SceneWorks/inference`](https://github.com/SceneWorks/inference) repository, so a normal Git client
+can fetch it without extra credentials.
 
 ```sh
 npm install
@@ -32,14 +47,20 @@ models through the app.
 
 Model support is detected from a snapshot's `config.json` at load time (see
 `src-tauri/src/model_registry.rs`), then served by the platform's inference provider
-(`mlx-llama` on macOS, `candle-llama` elsewhere). Vision-capable checkpoints are recognized by
+(`mlx-llama` on Apple Silicon macOS, `candle-llama` elsewhere). Vision-capable checkpoints are recognized by
 their `model_type` plus a `vision_config`.
 
 | Model | Family (`model_type`) | Platform / backend | Modalities | Tool calling |
 | ----- | --------------------- | ------------------ | ---------- | ------------ |
 | **Qwen3-VL-8B-Instruct** | `qwen3_vl` | macOS / Apple Silicon (MLX) | Text, image, multi-image, **video** | Yes |
 | Qwen3.6 (e.g. 27B) | `qwen3_5` | macOS / Apple Silicon (MLX) | Text, image, multi-image | Yes |
-| Text-only Qwen / LLaMA-family checkpoints | various | macOS (MLX) · Windows/Linux (Candle) | Text | Model-dependent |
+| Qwen3.8-27B and Bonsai 2 packed variants | `qwen3_5` / `prism_hadamard_qwen35` | Apple Silicon macOS (MLX) · Windows/Linux with Candle CUDA | Text, image, video | Yes |
+| Text-only Qwen / LLaMA-family checkpoints | various | Apple Silicon macOS (MLX) · Intel macOS/Windows/Linux (Candle) | Text | Model-dependent |
+
+Qwen3.8-27B and Bonsai 2 inference is unavailable in Candle CPU builds. Loading these
+checkpoints returns an explicit error before weights are loaded; other compatible models,
+including flat `qwen3_5_text` fine-tunes, retain CPU support. CUDA builds require an NVIDIA
+device; selecting the CUDA build does not silently fall back to CPU for these checkpoints.
 
 ### Qwen3-VL-8B-Instruct
 
@@ -53,7 +74,8 @@ by the real-weights tests under `src-tauri/tests/qwen3vl_*.rs` (gated on `MLX_LL
   - Single image and **multi-image** (image ordering is preserved across content parts).
   - **Video**, sent as pre-sampled frames with optional per-frame timestamps for Qwen3-VL's
     **Text–Timestamp Alignment** (temporal questions). See [docs/VIDEO_API.md](docs/VIDEO_API.md).
-    Note: frames are sampled client-side; the server does not decode video files (see Limitations).
+    The client can send pre-sampled frames or a bounded `video_url.url` file/URL source; see
+    [the video API](docs/VIDEO_API.md).
   - 32-language OCR, spatial / 2D grounding, and long context (the checkpoint advertises a
     262 K-token window).
   - **Tool calling**, including in the same turn as an image (the model emits parseable
@@ -95,8 +117,6 @@ by the dequantize-from-bf16 working set at load, so q4 and q8 land in the same ~
 
 - **Cross-platform (Candle) Qwen3-VL** — Qwen3-VL is macOS/MLX-only today. Bringing the VLM to the
   Candle backend (Windows/Linux) is tracked under epic **sc-8084**.
-- **Server-side video-file decode** — the OpenAI-compatible server accepts *pre-sampled frames*; it
-  does not decode a video file/URL itself. Server-side decode is tracked in **sc-8128**.
 - **Fully-quantized ViT tower** — q4/q8 quantize the language decoder but keep the ViT vision tower
   dense (mixed precision). Quantizing the vision tower is tracked in **sc-8118**.
 
@@ -104,3 +124,32 @@ by the dequantize-from-bf16 working set at load, so q4 and q8 land in the same ~
 
 CODEGRAPH.md is auto-generated by the CodeGraph tool and must not be hand-edited; it regenerates
 from the codebase. This README (plus WINDOWS.md and docs/) is the hand-authored documentation home.
+
+### Per-chat optional controls
+
+The desktop sends MTP Off explicitly. Optional API fields that are absent inherit application
+settings only when the loaded model supports them; inherited reasoning effort is omitted when
+thinking is disabled. Explicit unsupported values still produce the runtime's capability error.
+`model_defaults: ["reasoning_effort", "preserve_thinking", "mtp"]` clears those application
+overrides for one request. An explicit value on the same request takes precedence over clearing.
+The desktop's Model default choices use this clearing mechanism and remain persisted per chat.
+
+Removing an attachment, switching conversations, or leaving the chat cancels its preparation.
+Native URL cancellation closes the download, kills/reaps an owned decoder, and removes staging
+files. Models exposes **Unload model**, available after UI generation stops; it also cancels an
+external API generation before unloading. Registered files and the saved model selection remain
+available for reloading.
+
+### Isolated acceptance profile
+
+Create an empty absolute directory, then launch the packaged executable with
+`CHATWORKS_PROFILE_DIR=/absolute/path/to/profile`. The directory must already exist; invalid
+values fail startup instead of using the ordinary profile. Settings, registry, and conversations
+use that canonical directory. API and HuggingFace credentials use a SHA-256-derived Keychain
+namespace with no fallback to ordinary credentials or inherited `HF_TOKEN`/`HUGGINGFACE_TOKEN`.
+Profile credential errors are reported by imports instead of falling back. WebView state is isolated too: a profile data
+directory on supported platforms, and a distinct persistent WKWebView store UUID on macOS.
+Omitting the variable preserves all existing paths, credentials, and WebView behavior. This is
+an acceptance/testing launch option, not an in-app profile selector. Cached model paths can be
+adopted directly without copying weights; do not enter production credentials in an acceptance
+profile.
