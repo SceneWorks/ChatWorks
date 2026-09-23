@@ -12,13 +12,19 @@ export function formatBytes(bytes) {
 
 export function modelSubtitle(model) {
   const parts = [];
-  if (model.pack === "bonsai2-packed" || model.format === "gguf-prism-packed") parts.push("Bonsai 2 packed");
-  else if (model.format === "gguf") parts.push("GGUF");
-  else if (model.quantize === "q4") parts.push("Q4");
-  else if (model.quantize === "q8") parts.push("Q8");
-  else parts.push("Dense");
+  parts.push(modelWeightLabel(model));
   if (model.sizeBytes) parts.push(formatBytes(model.sizeBytes));
   return parts.join(" · ");
+}
+
+export function modelWeightLabel(model) {
+  if (model.pack === "bonsai2-packed" || model.format === "gguf-prism-packed") return "Bonsai 2 packed";
+  if (model.format === "gguf") return "GGUF";
+  const sourceBits = Number.isInteger(model.sourceBits) && model.sourceBits >= 1 && model.sourceBits <= 8
+    ? model.sourceBits : null;
+  const loadQuantization = model.quantize === "q4" ? "Q4 load" : model.quantize === "q8" ? "Q8 load" : null;
+  if (loadQuantization) return `${sourceBits ? `${sourceBits}-bit source` : "Safetensors"} · ${loadQuantization}`;
+  return sourceBits ? `${sourceBits}-bit` : "Safetensors";
 }
 
 export function isExactGgufUrl(value) {
