@@ -179,6 +179,20 @@ jobs:
           msystem: MSYS
           path-type: inherit
           install: diffutils make xz
+      - name: Select 7-Zip for CUDA package verification
+        shell: msys2 {0}
+        run: |
+          if [[ -x '/c/Program Files/7-Zip/7z.exe' ]]; then
+            seven_zip='/c/Program Files/7-Zip/7z.exe'
+          elif [[ -x '/c/Program Files (x86)/7-Zip/7z.exe' ]]; then
+            seven_zip='/c/Program Files (x86)/7-Zip/7z.exe'
+          else
+            pacman --noconfirm --needed -S mingw-w64-x86_64-7zip
+            seven_zip=/mingw64/bin/7z.exe
+          fi
+          [[ -x "$seven_zip" ]]
+          "$seven_zip" i >/dev/null
+          printf '%s\n' "$(cygpath -w "$(dirname "$seven_zip")")" >> "$(cygpath -u "$GITHUB_PATH")"
       - name: Configure the Windows compiler
         uses: ilammy/msvc-dev-cmd@v1
         with:
@@ -210,7 +224,9 @@ jobs:
         shell: msys2 {0}
         env:
           CHATWORKS_PACKAGE_BACKEND: cuda
-        run: bash scripts/verify-tauri-package.sh
+        run: |
+          node -e "require('node:child_process').execFileSync('7z', ['i'], { stdio: 'ignore' })"
+          bash scripts/verify-tauri-package.sh
       - name: Preserve exact CUDA package and source identity
         shell: powershell
         run: node scripts/package-evidence.mjs collect "$env:GITHUB_WORKSPACE" "$env:CARGO_TARGET_DIR" "$env:RUNNER_TEMP/chatworks-cuda-package" x86_64-pc-windows-msvc cuda "$env:GITHUB_SHA" "$env:RUNNER_TEMP/chatworks-cuda-runtime"
