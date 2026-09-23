@@ -95,7 +95,7 @@ jobs:
             xz
 
       - name: Test package evidence contract
-        run: node --test tests/package-evidence.test.mjs tests/package-workflow.test.mjs
+        run: node --test tests/package-evidence.test.mjs tests/package-workflow.test.mjs tests/verify-tauri-package.test.mjs
 
       - name: Install frontend dependencies
         run: npm ci
@@ -184,7 +184,7 @@ jobs:
         with:
           arch: x64
       - name: Test package evidence contract
-        run: node --test tests/package-evidence.test.mjs tests/package-workflow.test.mjs
+        run: node --test tests/package-evidence.test.mjs tests/package-workflow.test.mjs tests/verify-tauri-package.test.mjs
 
       - name: Install frontend dependencies
         run: npm ci

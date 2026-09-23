@@ -20,7 +20,10 @@ fi
 require_listing_entry() {
   local listing="$1"
   local name="$2"
-  if ! grep -Eiq "(^|[/\\])${name}$" <<<"$listing"; then
+  listing="${listing//$'\r'/}"
+  listing="${listing//\\//}"
+  local escaped_name="${name//./[.]}"
+  if ! grep -Eiq "(^|[[:space:]/])${escaped_name}$" <<<"$listing"; then
     echo "Packaged application is missing $name." >&2
     exit 1
   fi
@@ -62,8 +65,8 @@ case "$target" in
       exit 1
     fi
     listing="$(7z l -ba "$package")"
-    require_listing_entry "$listing" 'ffmpeg\.exe'
-    require_listing_entry "$listing" 'ffprobe\.exe'
+    require_listing_entry "$listing" ffmpeg.exe
+    require_listing_entry "$listing" ffprobe.exe
     if [[ "${CHATWORKS_PACKAGE_BACKEND:-cpu}" == cuda ]]; then
       node "$root/scripts/package-evidence.mjs" verify-cuda "$package" "$RUNNER_TEMP/chatworks-cuda-runtime"
     fi
