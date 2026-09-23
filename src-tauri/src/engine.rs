@@ -31,10 +31,8 @@ type Loader = fn(&LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>>;
 /// serializes their `Generate` commands. Two caveats a future change must respect:
 /// (1) If the actor ever runs generations concurrently (e.g. a worker pool), the slot must be keyed
 ///     by request id so cancel targets the right generation (PR #30 review, R7).
-/// (2) A `cancel()` issued in the window after a `Generate` command is sent but before the actor
-///     installs the flag returns `false` (the flag isn't installed yet); the caller may retry. This
-///     window is bounded by the actor's dequeue time and is not a correctness bug — the generation
-///     simply isn't cancellable until it starts.
+/// (2) A `cancel()` issued before the actor installs the flag returns `false`. Callers that need
+///     cancellation while queued must pass their own flag through `generate_with_cancel`.
 type CancelSlot = Arc<Mutex<Option<CancelFlag>>>;
 
 #[derive(Clone)]
@@ -80,12 +78,22 @@ impl EngineHandle {
     pub fn generate(
         &self,
         request: GenerateRequest,
+        on_event: impl FnMut(StreamPayload),
+    ) -> EngineResult<GenerateResponse> {
+        self.generate_with_cancel(request, CancelFlag::new(), on_event)
+    }
+
+    pub(crate) fn generate_with_cancel(
+        &self,
+        request: GenerateRequest,
+        cancel: CancelFlag,
         mut on_event: impl FnMut(StreamPayload),
     ) -> EngineResult<GenerateResponse> {
         let (reply_tx, reply_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         self.send(EngineCommand::Generate {
             request,
+            cancel,
             event_tx,
             reply_tx,
         })?;
@@ -134,6 +142,7 @@ enum EngineCommand {
     },
     Generate {
         request: GenerateRequest,
+        cancel: CancelFlag,
         event_tx: mpsc::Sender<StreamPayload>,
         reply_tx: mpsc::Sender<EngineResult<GenerateResponse>>,
     },
@@ -171,10 +180,11 @@ impl EngineActor {
                 }
                 EngineCommand::Generate {
                     request,
+                    cancel,
                     event_tx,
                     reply_tx,
                 } => {
-                    let result = self.generate(request, event_tx);
+                    let result = self.generate(request, cancel, event_tx);
                     let _ = reply_tx.send(result);
                 }
             }
@@ -207,6 +217,7 @@ impl EngineActor {
     fn generate(
         &mut self,
         request: GenerateRequest,
+        cancel: CancelFlag,
         event_tx: mpsc::Sender<StreamPayload>,
     ) -> EngineResult<GenerateResponse> {
         let loaded = self
@@ -216,18 +227,21 @@ impl EngineActor {
         // Register the cancel flag before media staging. A direct video URL can spend time
         // downloading or sampling frames before a provider emits its first token, and it must be
         // cancellable through the same lifecycle as generation.
-        let cancel = CancelFlag::new();
         if let Ok(mut slot) = self.cancel.lock() {
             *slot = Some(cancel.clone());
         }
-        let result = request.into_core(cancel).and_then(|core_request| {
-            loaded
-                .provider
-                .generate(&core_request, &mut |event| {
-                    let _ = event_tx.send(StreamPayload::from(event));
-                })
-                .map_err(|error| error.to_string())
-        });
+        let result = if cancel.is_cancelled() {
+            Err("request cancelled before generation".to_string())
+        } else {
+            request.into_core(cancel).and_then(|core_request| {
+                loaded
+                    .provider
+                    .generate(&core_request, &mut |event| {
+                        let _ = event_tx.send(StreamPayload::from(event));
+                    })
+                    .map_err(|error| error.to_string())
+            })
+        };
         // Always clear the in-flight flag, whether media preparation, generation, or cancellation
         // ended the request — a stale flag must never cancel a later generation.
         if let Ok(mut slot) = self.cancel.lock() {

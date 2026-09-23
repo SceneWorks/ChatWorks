@@ -16,6 +16,7 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::app_settings::SamplingDefaults;
+use crate::core_llm::CancelFlag;
 use crate::engine::{
     ConstraintRequest, EngineHandle, GenerateMedia, GenerateMessage, GenerateRequest,
     GenerateResponse, GenerateTool, GenerateToolCall, GenerateVideo, LoadedModelStatus, MtpRequest,
@@ -447,27 +448,30 @@ fn stream_chat_completion(
     let created = created_timestamp();
     let generate_request = request.into_generate(sampling_defaults)?;
     let (tx, rx) = tokio_mpsc::channel::<Result<Event, Infallible>>(32);
+    let cancel = CancelFlag::new();
+    let worker_cancel = cancel.clone();
+    let watch_tx = tx.clone();
+    let (done_tx, done_rx) = oneshot::channel();
 
     tokio::task::spawn_blocking(move || {
-        let result = engine.generate(generate_request, |payload| {
-            if let StreamPayload::Token { text, channel, .. } = payload {
-                let chunk = match channel {
-                    StreamChannel::Content => {
-                        OpenAiChatChunk::token(id.clone(), created, model.clone(), text)
+        let result =
+            engine.generate_with_cancel(generate_request, worker_cancel.clone(), |payload| {
+                if let StreamPayload::Token { text, channel, .. } = payload {
+                    let chunk = match channel {
+                        StreamChannel::Content => {
+                            OpenAiChatChunk::token(id.clone(), created, model.clone(), text)
+                        }
+                        StreamChannel::Thinking => {
+                            OpenAiChatChunk::reasoning(id.clone(), created, model.clone(), text)
+                        }
+                    };
+                    // The response watcher handles disconnects before the first token. A failed send
+                    // also trips this request's flag, without touching a later engine request.
+                    if tx.blocking_send(Ok(sse_json(&chunk))).is_err() {
+                        worker_cancel.cancel();
                     }
-                    StreamChannel::Thinking => {
-                        OpenAiChatChunk::reasoning(id.clone(), created, model.clone(), text)
-                    }
-                };
-                // If the client disconnected (the SSE receiver was dropped), `blocking_send` fails.
-                // Treat that as a cancel request: trip the engine's in-flight CancelFlag so the
-                // provider stops promptly instead of generating into a dead stream (F-004, PR #30
-                // review — the original fix's backend cancel was unreachable end-to-end).
-                if tx.blocking_send(Ok(sse_json(&chunk))).is_err() {
-                    engine.cancel();
                 }
-            }
-        });
+            });
 
         match result {
             Ok(response) => {
@@ -500,6 +504,14 @@ fn stream_chat_completion(
                 let _ = tx.blocking_send(Ok(sse_json(&OpenAiErrorBody::server(error))));
                 let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
             }
+        }
+        let _ = done_tx.send(());
+    });
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = watch_tx.closed() => cancel.cancel(),
+            _ = done_rx => {},
         }
     });
 
@@ -1592,8 +1604,93 @@ mod tests {
     use super::*;
     // The weightless fakes are shared with the engine tests via `test_support` so the two can't
     // drift apart (code-review F-012).
-    use crate::test_support::{fake_loader, fake_telemetry_loader, fake_tool_loader};
+    use crate::core_llm::{
+        FinishReason, LoadSpec, StreamEvent, TextLlm, TextLlmDescriptor, TextLlmOutput,
+        TextLlmRequest, Usage,
+    };
+    use crate::test_support::{
+        fake_loader, fake_telemetry_loader, fake_tool_loader, thinking_descriptor,
+    };
     use serde_json::{json, Value};
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    static CANCEL_EVENTS: OnceLock<Mutex<Option<tokio_mpsc::UnboundedSender<&'static str>>>> =
+        OnceLock::new();
+
+    struct BlockingBeforeFirstToken {
+        descriptor: TextLlmDescriptor,
+        events: tokio_mpsc::UnboundedSender<&'static str>,
+    }
+
+    impl TextLlm for BlockingBeforeFirstToken {
+        fn descriptor(&self) -> &TextLlmDescriptor {
+            &self.descriptor
+        }
+
+        fn validate(&self, request: &TextLlmRequest) -> crate::core_llm::Result<()> {
+            self.descriptor
+                .capabilities
+                .validate_request(&self.descriptor.id, request)
+        }
+
+        fn generate(
+            &self,
+            request: &TextLlmRequest,
+            _on_event: &mut dyn FnMut(StreamEvent),
+        ) -> crate::core_llm::Result<TextLlmOutput> {
+            self.validate(request)?;
+            let prompt = match &request.messages[0].content[0] {
+                crate::core_llm::Content::Text(text) => text.as_str(),
+                _ => panic!("expected text prompt"),
+            };
+            if prompt == "queued" {
+                let _ = self.events.send("queued provider invoked");
+            }
+            if prompt == "hold" {
+                let _ = self.events.send("started before first token");
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !request.cancel.is_cancelled() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if request.cancel.is_cancelled() {
+                    let _ = self.events.send("cancel observed");
+                }
+            }
+            let usage = Usage {
+                prompt_tokens: 1,
+                generated_tokens: 0,
+            };
+            Ok(TextLlmOutput {
+                text: "ok".to_string(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                usage,
+                mtp: None,
+                timings: None,
+                finish_reason: Some(if request.cancel.is_cancelled() {
+                    FinishReason::Cancelled
+                } else {
+                    FinishReason::Stop
+                }),
+            })
+        }
+    }
+
+    fn blocking_loader(_: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
+        let events = CANCEL_EVENTS
+            .get()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        Ok(Box::new(BlockingBeforeFirstToken {
+            descriptor: thinking_descriptor("blocking", 8),
+            events,
+        }))
+    }
 
     fn loaded_fake_engine() -> EngineHandle {
         let engine = EngineHandle::spawn_with_loader(fake_loader);
@@ -2388,6 +2485,112 @@ mod tests {
         assert!(response.contains("\"content\":\"ok\""));
         assert!(response.contains("data: [DONE]"));
         server.stop().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_stream_before_first_token_cancels_only_its_request() {
+        let (events_tx, mut events_rx) = tokio_mpsc::unbounded_channel();
+        *CANCEL_EVENTS
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = Some(events_tx);
+        let engine = EngineHandle::spawn_with_loader(blocking_loader);
+        engine
+            .load_model(crate::engine::LoadModelRequest {
+                source: "/tmp/blocking-model".to_string(),
+                display_name: Some("blocking".to_string()),
+                quantize: None,
+                projector_source: None,
+            })
+            .unwrap();
+        let request = |prompt| {
+            serde_json::from_value(json!({
+                "model": "blocking",
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": true,
+                "max_tokens": 8
+            }))
+            .unwrap()
+        };
+
+        let held =
+            stream_chat_completion(engine.clone(), request("hold"), &test_sampling_defaults())
+                .unwrap()
+                .into_response();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), events_rx.recv())
+                .await
+                .unwrap(),
+            Some("started before first token")
+        );
+
+        // This response is dropped while its generation is still queued. Its flag must already
+        // belong to that request, even though the actor has not registered an in-flight flag.
+        let queued =
+            stream_chat_completion(engine.clone(), request("queued"), &test_sampling_defaults())
+                .unwrap()
+                .into_response();
+        drop(queued);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        drop(held);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), events_rx.recv())
+                .await
+                .unwrap(),
+            Some("cancel observed")
+        );
+
+        // Retain a completed response while another generation starts. Dropping that older
+        // response must not cancel the newer generation through the engine's shared slot.
+        let completed =
+            stream_chat_completion(engine.clone(), request("after"), &test_sampling_defaults())
+                .unwrap()
+                .into_response();
+        let status_engine = engine.clone();
+        tokio::task::spawn_blocking(move || status_engine.status())
+            .await
+            .unwrap()
+            .unwrap();
+        let later =
+            stream_chat_completion(engine.clone(), request("hold"), &test_sampling_defaults())
+                .unwrap()
+                .into_response();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), events_rx.recv())
+                .await
+                .unwrap(),
+            Some("started before first token")
+        );
+        drop(completed);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            events_rx.try_recv().is_err(),
+            "late drop cancelled a newer request"
+        );
+        drop(later);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), events_rx.recv())
+                .await
+                .unwrap(),
+            Some("cancel observed")
+        );
+
+        let next = stream_chat_completion(engine, request("after"), &test_sampling_defaults())
+            .unwrap()
+            .into_response();
+        let body = tokio::time::timeout(
+            Duration::from_secs(2),
+            axum::body::to_bytes(next.into_body(), usize::MAX),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("data: [DONE]"));
+        assert!(
+            events_rx.try_recv().is_err(),
+            "queued request reached the provider"
+        );
     }
 
     #[test]
