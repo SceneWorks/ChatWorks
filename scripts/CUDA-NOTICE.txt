@@ -1,0 +1,12 @@
+NVIDIA CUDA Runtime Redistributable Libraries
+
+The ChatWorks CUDA Windows package includes the CUDA Toolkit 12.9 runtime,
+cuBLAS, cuBLAS Lt, cuRAND, NVRTC and NVRTC built-ins libraries. The exact bytes
+and toolkit version are recorded in cuda-runtime.json beside the executable.
+Copyright (c) NVIDIA Corporation. All rights reserved.
+NVIDIA CUDA Toolkit EULA: https://docs.nvidia.com/cuda/archive/12.9.1/eula/index.html
+The toolkit license is included as CUDA-EULA.txt.
+
+The NVIDIA driver (nvcuda.dll) is not bundled. A compatible NVIDIA display
+driver and CUDA-capable GPU are required. The separate CPU package does not
+require CUDA. The full CUDA Toolkit is not required on the target machine.

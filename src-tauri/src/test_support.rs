@@ -10,14 +10,17 @@
 #![cfg(test)]
 
 use crate::core_llm::{
-    Channel, FinishReason, LoadSpec, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor,
-    TextLlmOutput, TextLlmRequest, ThinkingMode, Usage,
+    Channel, FinishReason, GenerationTimings, LoadSpec, MtpCapabilities, MtpStats, StreamEvent,
+    TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingMode,
+    Usage,
 };
+use std::time::Duration;
 
 /// A weightless `TextLlm` that streams a reasoning token then a content token and finishes `Stop`.
 /// The reasoning token is emitted only when the request's thinking mode is not `Disabled`.
 pub struct FakeProvider {
     pub descriptor: TextLlmDescriptor,
+    pub emit_telemetry: bool,
 }
 
 impl TextLlm for FakeProvider {
@@ -73,6 +76,15 @@ impl TextLlm for FakeProvider {
             thinking,
             tool_calls: Vec::new(),
             usage,
+            mtp: self.emit_telemetry.then_some(MtpStats {
+                proposed_tokens: 4,
+                accepted_tokens: 3,
+                target_forwards: 2,
+            }),
+            timings: self.emit_telemetry.then_some(GenerationTimings {
+                prefill: Duration::from_millis(12),
+                decode: Duration::from_millis(34),
+            }),
             finish_reason: Some(FinishReason::Stop),
         })
     }
@@ -83,6 +95,21 @@ impl TextLlm for FakeProvider {
 pub fn fake_loader(_: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
     Ok(Box::new(FakeProvider {
         descriptor: thinking_descriptor("fake", 8),
+        emit_telemetry: false,
+    }))
+}
+
+/// A weightless MTP-capable fake that reports deterministic native output evidence. It validates
+/// the full HTTP/SSE telemetry path without loading model weights.
+pub fn fake_telemetry_loader(_: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
+    let mut descriptor = thinking_descriptor("fake-telemetry", 8);
+    descriptor.capabilities.mtp = Some(MtpCapabilities {
+        max_draft_tokens: 4,
+        recommended_draft_tokens: 2,
+    });
+    Ok(Box::new(FakeProvider {
+        descriptor,
+        emit_telemetry: true,
     }))
 }
 
@@ -143,6 +170,8 @@ impl TextLlm for FakeToolProvider {
             thinking: None,
             tool_calls: vec![crate::core_llm::ToolCall::new("get_weather", arguments)],
             usage,
+            mtp: None,
+            timings: None,
             finish_reason: Some(FinishReason::Stop),
         })
     }

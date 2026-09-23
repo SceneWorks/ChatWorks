@@ -51,6 +51,7 @@ fn qwen3vl_tool_calling_with_image_over_openai_server() {
             source: model,
             display_name: None,
             quantize: None,
+            projector_source: None,
         })
         .expect("load Qwen3-VL");
     // The same VLM checkpoint must advertise BOTH capabilities — that is precisely what makes
@@ -141,7 +142,10 @@ fn qwen3vl_tool_calling_with_image_over_openai_server() {
         );
 
         let call = &choice["message"]["tool_calls"][0];
-        assert_eq!(call["type"], "function", "tool call must be a function call");
+        assert_eq!(
+            call["type"], "function",
+            "tool call must be a function call"
+        );
         assert_eq!(
             call["function"]["name"], "log_color",
             "the model must call log_color ({want})"

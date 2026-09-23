@@ -12,7 +12,8 @@ use chatworks::conversations::{
     Conversation, ConversationMetadata,
 };
 use chatworks::engine::{
-    EngineHandle, EngineStatus, GenerateRequest, GenerateResponse, LoadModelRequest,
+    prepare_remote_media as prepare_remote_media_inner, EngineHandle, EngineStatus,
+    GenerateRequest, GenerateResponse, LoadModelRequest, PreparedMedia,
 };
 use chatworks::model_registry::{
     adopt_cached_hf_model as adopt_cached_hf_model_inner, clear_hf_token as clear_hf_token_inner,
@@ -61,6 +62,55 @@ fn stream_completion(
 #[tauri::command]
 fn stop_generation(engine: State<'_, EngineHandle>) -> bool {
     engine.cancel()
+}
+
+type MediaPreparations =
+    std::sync::Mutex<std::collections::HashMap<String, chatworks::core_llm::CancelFlag>>;
+
+#[tauri::command]
+fn begin_media_preparation(preparations: State<'_, MediaPreparations>) -> Result<String, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .to_string();
+    preparations
+        .lock()
+        .map_err(|e| e.to_string())?
+        .insert(id.clone(), chatworks::core_llm::CancelFlag::new());
+    Ok(id)
+}
+
+#[tauri::command]
+fn cancel_media_preparation(
+    id: String,
+    preparations: State<'_, MediaPreparations>,
+) -> Result<(), String> {
+    if let Some(flag) = preparations.lock().map_err(|e| e.to_string())?.remove(&id) {
+        flag.cancel();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn prepare_remote_media(
+    id: String,
+    source: String,
+    kind: String,
+    preparations: State<'_, MediaPreparations>,
+) -> Result<PreparedMedia, String> {
+    let flag = preparations
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get(&id)
+        .cloned()
+        .ok_or("media preparation cancelled")?;
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        prepare_remote_media_inner(source, kind, flag)
+    })
+    .await
+    .map_err(|error| error.to_string());
+    preparations.lock().map_err(|e| e.to_string())?.remove(&id);
+    result?
 }
 
 #[tauri::command]
@@ -162,8 +212,9 @@ fn load_registered_model(
     app: AppHandle,
     engine: State<'_, EngineHandle>,
     model_id: String,
+    projector_source: Option<String>,
 ) -> Result<EngineStatus, String> {
-    load_registered_model_inner(&app, &engine, model_id)
+    load_registered_model_inner(&app, &engine, model_id, projector_source)
 }
 
 #[tauri::command]
@@ -225,6 +276,7 @@ fn server_config_from_settings(settings: &AppSettings) -> OpenAiServerConfig {
         host: settings.server.host.clone(),
         port: settings.server.port,
         allow_lan: settings.server.allow_lan,
+        allow_local_files: settings.server.allow_local_files,
         auth_token: if settings.server.auth_enabled {
             read_api_auth_token().ok().flatten()
         } else {
@@ -243,7 +295,10 @@ fn start_server_from_settings(
 }
 
 fn main() {
+    let mut context = tauri::generate_context!();
+    chatworks::profile::isolate_webviews(context.config_mut()).expect("invalid acceptance profile");
     tauri::Builder::default()
+        .manage(MediaPreparations::default())
         .setup(|app| {
             let engine = EngineHandle::spawn();
             let server = OpenAiServerHandle::new();
@@ -264,6 +319,9 @@ fn main() {
             engine_status,
             stream_completion,
             stop_generation,
+            begin_media_preparation,
+            cancel_media_preparation,
+            prepare_remote_media,
             start_openai_server,
             stop_openai_server,
             openai_server_status,
@@ -288,6 +346,6 @@ fn main() {
             rename_conversation,
             delete_conversation,
         ])
-        .run(tauri::generate_context!())
+        .run(context)
         .expect("error while running the ChatWorks desktop shell");
 }

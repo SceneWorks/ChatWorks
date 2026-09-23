@@ -18,10 +18,26 @@ import { normalizeImageAttachment } from "../media/image";
 import { sampleVideoAttachment } from "../media/video";
 import { MessageActions } from "../components/MessageActions";
 import { MessageContent } from "../components/MessageContent";
+import { GenerationControls } from "../components/GenerationControls";
 import { formatToolArguments, ToolCallList, ToolResult } from "../components/ToolCallList";
+import { appendAttachmentPlaceholders, settleAttachment, registerPreparation } from "../state/attachments.js";
+import { applySamplingPreset } from "../state/generation.js";
+import { prepareRemoteMedia } from "../state/media.js";
 
 /// The maximum number of model→tool→model round-trips in a single send, to bound runaway loops.
 const MAX_TOOL_STEPS = 8;
+
+function messageMedia(message) {
+  if (Array.isArray(message?.media)) return message.media;
+  return [
+    ...(message?.images ?? []).map((url) => ({ type: "image", url })),
+    ...(message?.videos ?? []).map((video) => ({ type: "video", ...video })),
+  ];
+}
+
+function matchesHttpUrl(url) {
+  return url.protocol === "https:" || url.protocol === "http:";
+}
 
 export function ChatScreen() {
   const { engineStatus, refreshEngineStatus, appSettings, apiAuthToken } = useApp();
@@ -33,20 +49,35 @@ export function ChatScreen() {
     setDraft,
     params,
     setParams,
-    attachments,
-    setAttachments,
-    videoAttachments,
-    setVideoAttachments,
+    mediaAttachments,
+    setMediaAttachments,
   } = useChatState();
   const [serverStatus, setServerStatus] = useState(null);
   const [error, setError] = useState(null);
   const [pendingAttachments, setPendingAttachments] = useState(0);
+  const [mediaUrl, setMediaUrl] = useState("");
+  const [mediaUrlKind, setMediaUrlKind] = useState("image");
   const [toolSpecs, setToolSpecs] = useState([]); // OpenAI function-tool defs from the backend
   const [toolsEnabled, setToolsEnabled] = useState(true); // offer tools when the model supports them
   const [pendingApproval, setPendingApproval] = useState(null); // {calls, decisions, resolve}
   // AbortController for the in-flight stream, so a Stop click (or unmount) cancels the fetch + the
   // backend generation (F-004). `null` when no stream is in flight.
   const abortRef = useRef(null);
+  const attachmentSequenceRef = useRef(0);
+  const preparationsRef = useRef(new Map());
+  const cancelPreparation = useCallback((id) => {
+    const entry = preparationsRef.current.get(id);
+    entry?.cancel();
+  }, []);
+  useEffect(() => () => {
+    for (const id of preparationsRef.current.keys()) cancelPreparation(id);
+  }, [activeConversationId, cancelPreparation]);
+  useEffect(() => {
+    const retained = new Set(mediaAttachments.map((item) => item.id));
+    for (const id of preparationsRef.current.keys()) {
+      if (!retained.has(id)) cancelPreparation(id);
+    }
+  }, [mediaAttachments, cancelPreparation]);
   const thinkingCapable = supportsThinking(engineStatus);
   const visionCapable = supportsVision(engineStatus);
   const videoCapable = supportsVideo(engineStatus);
@@ -56,7 +87,9 @@ export function ChatScreen() {
     Boolean(engineStatus?.loaded) &&
     !busy &&
     pendingAttachments === 0 &&
-    (Boolean(draft.trim()) || attachments.length > 0 || videoAttachments.length > 0);
+    (Boolean(draft.trim()) || mediaAttachments.length > 0);
+  const samplingPresets = engineStatus?.loaded?.provider?.capabilities?.model_sampling_defaults;
+  const samplingPreset = params.disableThinking ? samplingPresets?.non_thinking : samplingPresets?.thinking;
 
   // Load the built-in tool definitions once; the chat loop offers them when tools are enabled.
   useEffect(() => {
@@ -105,6 +138,13 @@ export function ChatScreen() {
     refreshServerStatus();
   }, [refreshServerStatus]);
 
+  // A provider may expose only one visual modality. Keep the URL picker on an offered choice when
+  // the served model changes, rather than producing a select value with no matching option.
+  useEffect(() => {
+    if (videoCapable && !visionCapable) setMediaUrlKind("video");
+    if (visionCapable && !videoCapable) setMediaUrlKind("image");
+  }, [visionCapable, videoCapable]);
+
   /// Rewind (sc-8147, decision 3): drop message `index` and every message after it, load that
   /// message's text into the composer, and persist the trimmed transcript so the trim survives a
   /// relaunch. Blocked mid-stream and on text-less turns (the buttons are disabled then; this is a
@@ -136,16 +176,14 @@ export function ChatScreen() {
     const userMessage = {
       role: "user",
       content: draft.trim(),
-      images: attachments,
-      videos: videoAttachments,
+      media: mediaAttachments,
     };
     // `conversation` is the committed transcript; the in-flight assistant turn is appended for
     // rendering and only committed once it finishes streaming.
     let conversation = [...messages, userMessage];
     setMessages(conversation);
     setDraft("");
-    setAttachments([]);
-    setVideoAttachments([]);
+    setMediaAttachments([]);
 
     // Lazy save / upsert: on the first send of a new chat this creates the conversation
     // (`save_conversation` with a `crypto.randomUUID()` id, a title derived from the first user
@@ -296,35 +334,78 @@ export function ChatScreen() {
     setParams((current) => ({ ...current, [key]: value }));
   }
 
-  function addImageFiles(fileList) {
-    const files = Array.from(fileList || []).filter((file) => file && file.type.startsWith("image/"));
+  async function prepareMedia(files, prepare, toAttachment) {
     if (!files.length) return;
     setError(null);
+    const queued = files.map((file) => ({
+      id: ++attachmentSequenceRef.current,
+      type: file.type?.startsWith?.("video/") ? "video" : typeof file === "string" ? mediaUrlKind : "image",
+      name: typeof file === "string" ? file.split("/").pop() || `${mediaUrlKind} URL` : file.name || "attachment",
+    }));
+    setMediaAttachments((current) => appendAttachmentPlaceholders(current, queued));
     setPendingAttachments((current) => current + files.length);
-    files.forEach((file) => {
-      normalizeImageAttachment(file)
-        .then((url) => setAttachments((current) => [...current, url]))
-        .catch((cause) => setError(String(cause?.message ?? cause)))
-        .finally(() => setPendingAttachments((current) => Math.max(0, current - 1)));
+    files.forEach((file, index) => {
+      const id = queued[index].id;
+      const { controller, release } = registerPreparation(preparationsRef.current, id,
+        () => setPendingAttachments((current) => Math.max(0, current - 1)));
+      Promise.resolve()
+        .then(() => { controller.signal.throwIfAborted(); return prepare(file, controller.signal); })
+        .then((value) => {
+          if (controller.signal.aborted) return;
+          setMediaAttachments((current) =>
+            settleAttachment(current, queued[index].id, toAttachment(value, file)),
+          );
+        })
+        .catch((cause) => {
+          if (controller.signal.aborted) return;
+          setMediaAttachments((current) => settleAttachment(current, queued[index].id, null));
+          setError(String(cause?.message ?? cause));
+        })
+        .finally(release);
     });
+  }
+
+  function addImageFiles(fileList) {
+    const files = Array.from(fileList || []).filter((file) => file && file.type.startsWith("image/"));
+    prepareMedia(files, normalizeImageAttachment, (url, file) => ({
+      type: "image",
+      url,
+      name: file.name || "image",
+    }));
   }
 
   function addVideoFiles(fileList) {
     const files = Array.from(fileList || []).filter((file) => file && file.type.startsWith("video/"));
-    if (!files.length) return;
-    setError(null);
-    setPendingAttachments((current) => current + files.length);
-    files.forEach((file) => {
-      sampleVideoAttachment(file)
-        .then((sampled) =>
-          setVideoAttachments((current) => [
-            ...current,
-            { name: file.name || "video", ...sampled },
-          ]),
-        )
-        .catch((cause) => setError(String(cause?.message ?? cause)))
-        .finally(() => setPendingAttachments((current) => Math.max(0, current - 1)));
-    });
+    prepareMedia(files, sampleVideoAttachment, (sampled, file) => ({
+      type: "video",
+      name: file.name || "video",
+      ...sampled,
+    }));
+  }
+
+  function addMediaUrl() {
+    const source = mediaUrl.trim();
+    if (!source) return;
+    try {
+      const parsed = new URL(source);
+      if (!matchesHttpUrl(parsed)) throw new Error("Media URL must use http or https.");
+    } catch (cause) {
+      setError(String(cause?.message ?? "Enter a valid media URL."));
+      return;
+    }
+    const type = mediaUrlKind;
+    const capable = type === "image" ? visionCapable : videoCapable;
+    if (!capable) {
+      setError(`${type === "image" ? "Image" : "Video"} input is not supported by the loaded model.`);
+      return;
+    }
+    setMediaUrl("");
+    const sourceName = source.split("/").pop() || `${type} URL`;
+    prepareMedia(
+      [source],
+      (url, signal) => prepareRemoteMedia(invoke, url, type, signal),
+      (prepared) => ({ ...prepared, name: sourceName }),
+    );
   }
 
   return (
@@ -346,27 +427,30 @@ export function ChatScreen() {
           {messages.length ? (
             messages.map((message, index) => {
               const hasToolCalls = Boolean(message.tool_calls && message.tool_calls.length);
+              const media = messageMedia(message);
               return (
                 <article className={`message-bubble ${message.role}`} key={`${message.role}-${index}`}>
                   <div className="message-role">{message.role}</div>
-                  {message.images && message.images.length ? (
+                  {media.length ? (
                     <div className="message-images">
-                      {message.images.map((url, imageIndex) => (
-                        <img key={imageIndex} className="message-image" src={url} alt={`attachment ${imageIndex + 1}`} />
-                      ))}
-                    </div>
-                  ) : null}
-                  {message.videos && message.videos.length ? (
-                    <div className="message-images">
-                      {message.videos.map((video, videoIndex) => (
-                        <img
-                          key={videoIndex}
-                          className="message-image"
-                          src={video.frames?.[0]}
-                          alt={`video ${videoIndex + 1} (${video.frames?.length ?? 0} frames)`}
-                          title={`${video.frames?.length ?? 0} sampled frames`}
-                        />
-                      ))}
+                      {media.map((item, mediaIndex) =>
+                        item.type === "video" ? (
+                          <img
+                            key={mediaIndex}
+                            className="message-image"
+                            src={item.frames?.[0]}
+                            alt={`video ${mediaIndex + 1} (${item.frames?.length ?? 0} frames)`}
+                            title={`${item.frames?.length ?? 0} sampled frames`}
+                          />
+                        ) : (
+                          <img
+                            key={mediaIndex}
+                            className="message-image"
+                            src={item.url}
+                            alt={`attachment ${mediaIndex + 1}`}
+                          />
+                        ),
+                      )}
                     </div>
                   ) : null}
                   {message.role === "tool" ? (
@@ -422,35 +506,20 @@ export function ChatScreen() {
         {error ? <p className="form-error" role="alert">{error}</p> : null}
 
         <form className="composer" onSubmit={handleSubmit}>
-          {visionCapable && attachments.length ? (
+          {mediaAttachments.length ? (
             <div className="composer-attachments">
-              {attachments.map((url, index) => (
-                <div className="composer-thumb" key={index}>
-                  <img src={url} alt={`attachment ${index + 1}`} />
+              {mediaAttachments.map((item, index) => (
+                <div className={`composer-thumb ${item.type === "video" ? "composer-thumb-video" : ""}`} key={index}>
+                  {item.pending ? (
+                    <span className="composer-thumb-badge">Preparing…</span>
+                  ) : (
+                    <img src={item.type === "video" ? item.frames?.[0] : item.url} alt={`${item.type} ${index + 1}`} />
+                  )}
+                  {item.type === "video" ? <span className="composer-thumb-badge">{item.frames?.length ?? 0}f</span> : null}
                   <button
                     type="button"
-                    aria-label="Remove image"
-                    onClick={() => setAttachments((current) => current.filter((_, i) => i !== index))}
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
-            </div>
-          ) : null}
-          {videoCapable && videoAttachments.length ? (
-            <div className="composer-attachments">
-              {videoAttachments.map((video, index) => (
-                <div className="composer-thumb composer-thumb-video" key={index}>
-                  {/* First sampled frame as the video thumbnail; badge shows the frame count. */}
-                  <img src={video.frames[0]} alt={`video ${index + 1}`} />
-                  <span className="composer-thumb-badge">{video.frames.length}f</span>
-                  <button
-                    type="button"
-                    aria-label="Remove video"
-                    onClick={() =>
-                      setVideoAttachments((current) => current.filter((_, i) => i !== index))
-                    }
+                    aria-label={`Remove ${item.type}`}
+                    onClick={() => { cancelPreparation(item.id); setMediaAttachments((current) => current.filter((_, i) => i !== index)); }}
                   >
                     ×
                   </button>
@@ -506,6 +575,7 @@ export function ChatScreen() {
                 <input
                   type="file"
                   accept="video/*"
+                  multiple
                   style={{ display: "none" }}
                   disabled={!engineStatus?.loaded || busy}
                   onChange={(event) => {
@@ -515,6 +585,36 @@ export function ChatScreen() {
                 />
                 {pendingAttachments ? "Preparing..." : "Video"}
               </label>
+            ) : null}
+            {visionCapable || videoCapable ? (
+              <span className="composer-url-input">
+                <select
+                  aria-label="Media URL type"
+                  disabled={busy}
+                  onChange={(event) => setMediaUrlKind(event.target.value)}
+                  value={mediaUrlKind}
+                >
+                  {visionCapable ? <option value="image">Image URL</option> : null}
+                  {videoCapable ? <option value="video">Video URL</option> : null}
+                </select>
+                <input
+                  aria-label="Media URL"
+                  disabled={busy}
+                  onChange={(event) => setMediaUrl(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      addMediaUrl();
+                    }
+                  }}
+                  placeholder="https://…"
+                  type="url"
+                  value={mediaUrl}
+                />
+                <button className="ghost-btn" disabled={!mediaUrl.trim() || busy} onClick={addMediaUrl} type="button">
+                  Add URL
+                </button>
+              </span>
             ) : null}
             <button className="primary-btn" disabled={!canSend} type="submit">
               {busy ? "Streaming…" : "Send"}
@@ -534,6 +634,16 @@ export function ChatScreen() {
           <h2>Sampling</h2>
           <p className="view-copy">Applies only to this chat session.</p>
         </div>
+        {samplingPreset ? (
+          <button
+            className="ghost-btn"
+            disabled={busy}
+            onClick={() => setParams((current) => applySamplingPreset(current, samplingPreset))}
+            type="button"
+          >
+            Apply recommended {params.disableThinking ? "non-thinking" : "thinking"} preset
+          </button>
+        ) : null}
         <div className="field">
           <label htmlFor="system-prompt">System prompt</label>
           <textarea
@@ -596,6 +706,8 @@ export function ChatScreen() {
             </span>
           </label>
         ) : null}
+        <GenerationControls params={params} onChange={updateParam}
+          capabilities={engineStatus?.loaded?.provider?.capabilities ?? {}} />
         {toolsCapable ? (
           <label className="toggle-row">
             <input

@@ -1,0 +1,239 @@
+name: Package validation
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: ${{ matrix.target }} (${{ matrix.backend }}, ${{ matrix.bundle }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            target: aarch64-apple-darwin
+            bundle: app
+            backend: mlx
+          - runner: macos-26-intel
+            target: x86_64-apple-darwin
+            bundle: app
+            backend: cpu
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundle: deb
+            backend: cpu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundle: deb
+            backend: cpu
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            bundle: nsis
+            backend: cpu
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      MEDIA_SIDECAR_TARGET: ${{ matrix.target }}
+
+    steps:
+      - name: Preserve LF scripts on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: git config --global core.autocrlf input
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux build prerequisites
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget \
+            xz-utils
+
+      - name: Configure the Windows compiler
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install the Windows POSIX build shell
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          path-type: inherit
+          install: >-
+            diffutils
+            make
+            xz
+
+      - name: Test package evidence contract
+        run: node --test tests/package-evidence.test.mjs tests/package-workflow.test.mjs tests/verify-tauri-package.test.mjs
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build and verify FFmpeg sidecars
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/provision-ffmpeg-sidecars.sh
+
+      - name: Build and verify FFmpeg sidecars on Windows
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: bash scripts/provision-ffmpeg-sidecars.sh
+
+      - name: Build the native Tauri package
+        run: npm exec tauri -- build --ci --no-sign --bundles ${{ matrix.bundle }} -- --locked
+
+      - name: Verify packaged sidecars
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/verify-tauri-package.sh
+
+      - name: Verify packaged sidecars on Windows
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: bash scripts/verify-tauri-package.sh
+
+      - name: Preserve exact package and source identity
+        shell: bash
+        run: node scripts/package-evidence.mjs collect "$GITHUB_WORKSPACE" "$CARGO_TARGET_DIR" "$RUNNER_TEMP/chatworks-package" "${{ matrix.target }}" "${{ matrix.backend }}" "$GITHUB_SHA"
+
+      - name: Upload verified package and checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatworks-${{ matrix.target }}-${{ matrix.backend }}-${{ github.sha }}
+          path: ${{ runner.temp }}/chatworks-package
+          if-no-files-found: error
+          retention-days: 30
+
+  windows-cuda-package:
+    # The two CUDA listeners share one physical host. This job compiles/packages only;
+    # installed-app/GPU acceptance is a separately reserved operation.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, windows, cuda]
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: powershell
+    concurrency:
+      group: chatworks-windows-cuda-package
+      cancel-in-progress: false
+    env:
+      CARGO_BUILD_JOBS: '12'
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+      MEDIA_SIDECAR_TARGET: x86_64-pc-windows-msvc
+      CUDA_COMPUTE_CAP: '80'
+      CUDA_PATH: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.9'
+      VCVARS: 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat'
+    steps:
+      - name: Select Git Bash for Rust toolchain setup
+        shell: cmd
+        run: |
+          if not exist "C:\Program Files\Git\bin\bash.exe" exit /b 1
+          echo C:\Program Files\Git\bin>>"%GITHUB_PATH%"
+      - name: Select isolated CUDA build directory
+        shell: powershell
+        run: '"CARGO_TARGET_DIR=$env:RUNNER_TEMP/chatworks-cuda-${{ github.run_id }}-${{ github.run_attempt }}" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append'
+      - name: Preserve committed LF bytes on Windows
+        shell: powershell
+        run: git config --global core.autocrlf input
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Windows POSIX build tools
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MSYS
+          path-type: inherit
+          install: diffutils make xz
+      - name: Select 7-Zip for CUDA package verification
+        shell: msys2 {0}
+        run: |
+          if [[ -x '/c/Program Files/7-Zip/7z.exe' ]]; then
+            seven_zip='/c/Program Files/7-Zip/7z.exe'
+          elif [[ -x '/c/Program Files (x86)/7-Zip/7z.exe' ]]; then
+            seven_zip='/c/Program Files (x86)/7-Zip/7z.exe'
+          else
+            pacman --noconfirm --needed -S mingw-w64-x86_64-7zip
+            seven_zip=/mingw64/bin/7z.exe
+          fi
+          [[ -x "$seven_zip" ]]
+          "$seven_zip" i >/dev/null
+          printf '%s\n' "$(cygpath -w "$(dirname "$seven_zip")")" >> "$(cygpath -u "$GITHUB_PATH")"
+      - name: Configure the Windows compiler
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          vsversion: '2022'
+      - name: Test package evidence contract
+        run: node --test tests/package-evidence.test.mjs tests/package-workflow.test.mjs tests/verify-tauri-package.test.mjs
+
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build and verify FFmpeg sidecars
+        shell: msys2 {0}
+        run: bash scripts/provision-ffmpeg-sidecars.sh
+      - name: Stage CUDA runtime redistributables beside the installed executable
+        shell: powershell
+        run: node scripts/package-evidence.mjs stage-cuda "$env:GITHUB_WORKSPACE" "$env:CUDA_PATH" "$env:RUNNER_TEMP/chatworks-cuda-runtime"
+      - name: Build CUDA installer without running a model
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          if errorlevel 1 exit /b 1
+          if /i not "%VisualStudioVersion%"=="17.0" (
+            echo CUDA 12.9 requires Visual Studio 2022; selected %VisualStudioVersion%.
+            exit /b 1
+          )
+          set "PATH=%CUDA_PATH%\bin;%PATH%"
+          npm exec tauri -- build --ci --no-sign --features cuda --bundles nsis --config "%RUNNER_TEMP%\chatworks-cuda-runtime\tauri.cuda.json" -- --locked --no-default-features
+      - name: Verify packaged FFmpeg and CUDA runtime
+        shell: msys2 {0}
+        env:
+          CHATWORKS_PACKAGE_BACKEND: cuda
+        run: |
+          node -e "require('node:child_process').execFileSync('7z', ['i'], { stdio: 'ignore' })"
+          bash scripts/verify-tauri-package.sh
+      - name: Preserve exact CUDA package and source identity
+        shell: powershell
+        run: node scripts/package-evidence.mjs collect "$env:GITHUB_WORKSPACE" "$env:CARGO_TARGET_DIR" "$env:RUNNER_TEMP/chatworks-cuda-package" x86_64-pc-windows-msvc cuda "$env:GITHUB_SHA" "$env:RUNNER_TEMP/chatworks-cuda-runtime"
+      - name: Upload verified CUDA installer and checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: chatworks-x86_64-pc-windows-msvc-cuda-${{ github.sha }}
+          path: ${{ runner.temp }}/chatworks-cuda-package
+          if-no-files-found: error
+          retention-days: 30

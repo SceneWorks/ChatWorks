@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { StatusDot } from "@sceneworks/ui";
 import { useApp } from "../state/AppContext";
+import { GenerationControls } from "../components/GenerationControls";
+import { generationParams, generationSettings } from "../state/generation.js";
 
 export function settingsToForm(settings) {
   return {
@@ -9,11 +11,13 @@ export function settingsToForm(settings) {
     port: String(settings.server.port),
     allowLan: Boolean(settings.server.allowLan),
     authEnabled: Boolean(settings.server.authEnabled),
+    allowLocalFiles: Boolean(settings.server.allowLocalFiles),
     systemPrompt: settings.sampling.systemPrompt,
     temperature: String(settings.sampling.temperature),
     topP: String(settings.sampling.topP),
     maxTokens: String(settings.sampling.maxTokens),
     disableThinking: Boolean(settings.sampling.disableThinking),
+    ...generationParams(settings.sampling),
   };
 }
 
@@ -47,6 +51,7 @@ export function SettingsScreen() {
         port: Number(nextForm.port),
         allowLan: nextForm.allowLan,
         authEnabled: nextForm.authEnabled,
+        allowLocalFiles: nextForm.authEnabled && nextForm.allowLocalFiles,
       },
       sampling: {
         systemPrompt: nextForm.systemPrompt,
@@ -54,6 +59,7 @@ export function SettingsScreen() {
         topP: Number(nextForm.topP),
         maxTokens: Number(nextForm.maxTokens),
         disableThinking: nextForm.disableThinking,
+        ...generationSettings(nextForm),
       },
     };
   }
@@ -142,6 +148,18 @@ export function SettingsScreen() {
           <span>
             Allow LAN exposure
             <small>Required before binding to 0.0.0.0 or ::. Use an auth token for shared networks.</small>
+          </span>
+        </label>
+        <label className="toggle-row">
+          <input
+            checked={form.allowLocalFiles}
+            disabled={!form.authEnabled}
+            onChange={(event) => updateForm("allowLocalFiles", event.target.checked)}
+            type="checkbox"
+          />
+          <span>
+            Allow authenticated API clients to read local media
+            <small>Requires bearer authentication. Desktop file attachments remain available independently.</small>
           </span>
         </label>
         {lanWarning ? (
@@ -238,6 +256,7 @@ export function SettingsScreen() {
             <small>Applied when a thinking-capable loaded model supports no-think mode.</small>
           </span>
         </label>
+        <GenerationControls params={form} onChange={updateForm} prefix="default-generation" />
         <div className="panel-actions">
           <button className="primary-btn" disabled={busy} type="submit">
             {busy ? "Saving…" : "Save settings"}

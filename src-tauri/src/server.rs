@@ -17,9 +17,10 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::app_settings::SamplingDefaults;
 use crate::engine::{
-    EngineHandle, GenerateMessage, GenerateRequest, GenerateResponse, GenerateTool,
-    GenerateToolCall, GenerateVideo, LoadedModelStatus, SamplingRequest, StreamChannel,
-    StreamPayload, ThinkingRequest, UsagePayload,
+    ConstraintRequest, EngineHandle, GenerateMedia, GenerateMessage, GenerateRequest,
+    GenerateResponse, GenerateTool, GenerateToolCall, GenerateVideo, LoadedModelStatus, MtpRequest,
+    ReasoningEffortRequest, SamplingRequest, StreamChannel, StreamPayload, ThinkingRequest,
+    UsagePayload,
 };
 use crate::fsutil::{now_nanos, now_secs};
 
@@ -38,6 +39,8 @@ pub struct OpenAiServerConfig {
     #[serde(default)]
     pub allow_lan: bool,
     #[serde(default)]
+    pub allow_local_files: bool,
+    #[serde(default)]
     pub auth_token: Option<String>,
     #[serde(default)]
     pub sampling_defaults: SamplingDefaults,
@@ -49,6 +52,7 @@ impl Default for OpenAiServerConfig {
             host: default_host(),
             port: default_port(),
             allow_lan: false,
+            allow_local_files: false,
             auth_token: None,
             sampling_defaults: SamplingDefaults::default(),
         }
@@ -78,12 +82,12 @@ impl OpenAiServerHandle {
         config: OpenAiServerConfig,
         engine: EngineHandle,
     ) -> ServerResult<OpenAiServerStatus> {
-        let bind = validate_config(&config)?;
         let auth_token = normalize_token(config.auth_token.clone());
         let server_config = OpenAiServerConfig {
             auth_token,
             ..config
         };
+        let bind = validate_config(&server_config)?;
         self.stop()?;
 
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -250,6 +254,7 @@ async fn run_server(
             config.auth_token,
             config.sampling_defaults,
             config.allow_lan,
+            config.allow_local_files,
         ),
     )
     .with_graceful_shutdown(async {
@@ -264,6 +269,7 @@ fn openai_router(
     auth_token: Option<String>,
     sampling_defaults: SamplingDefaults,
     allow_lan: bool,
+    allow_local_files: bool,
 ) -> Router {
     Router::new()
         .route("/v1/models", get(models).options(cors_preflight))
@@ -275,6 +281,7 @@ fn openai_router(
             engine,
             auth_token,
             sampling_defaults,
+            allow_local_files,
         })
         .layer(DefaultBodyLimit::max(OPENAI_JSON_BODY_LIMIT_BYTES))
         .layer(axum::middleware::from_fn_with_state(
@@ -378,6 +385,7 @@ struct ApiState {
     engine: EngineHandle,
     auth_token: Option<String>,
     sampling_defaults: SamplingDefaults,
+    allow_local_files: bool,
 }
 
 async fn models(
@@ -402,12 +410,24 @@ async fn chat_completions(
     Json(request): Json<OpenAiChatRequest>,
 ) -> Result<Response, ApiError> {
     authorize(&headers, state.auth_token.as_deref())?;
+    request.authorize_local_media(state.allow_local_files)?;
+    let status_engine = state.engine.clone();
+    let status = tokio::task::spawn_blocking(move || status_engine.status())
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .map_err(ApiError::engine)?;
+    let capabilities = &status
+        .loaded
+        .ok_or_else(|| ApiError::bad_request("load a model before generating"))?
+        .provider
+        .capabilities;
+    let defaults = request.resolve_inherited_defaults(&state.sampling_defaults, capabilities);
     if request.stream {
-        let stream = stream_chat_completion(state.engine, request, &state.sampling_defaults)?;
+        let stream = stream_chat_completion(state.engine, request, &defaults)?;
         Ok(stream.into_response())
     } else {
         let model = request.model_name();
-        let generate_request = request.into_generate(&state.sampling_defaults)?;
+        let generate_request = request.into_generate(&defaults)?;
         let response =
             tokio::task::spawn_blocking(move || state.engine.generate(generate_request, |_| {}))
                 .await
@@ -468,6 +488,10 @@ fn stream_chat_completion(
                     finish_reason,
                     Some(OpenAiUsage::from(response.usage)),
                     tool_calls,
+                    NativeTelemetry {
+                        mtp: response.mtp,
+                        timings: response.timings,
+                    },
                 );
                 let _ = tx.blocking_send(Ok(sse_json(&finish)));
                 let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
@@ -542,6 +566,9 @@ fn validate_config(config: &OpenAiServerConfig) -> ServerResult<SocketAddr> {
         .map_err(|_| format!("invalid bind host '{}'", config.host))?;
     if is_unspecified(host) && !config.allow_lan {
         return Err("binding to 0.0.0.0 requires allow_lan=true".to_string());
+    }
+    if config.allow_local_files && config.auth_token.is_none() {
+        return Err("local media access requires a bearer token".to_string());
     }
     Ok(SocketAddr::new(host, config.port))
 }
@@ -683,6 +710,14 @@ struct OpenAiChatRequest {
     #[serde(default)]
     top_p: Option<f32>,
     #[serde(default)]
+    top_k: Option<usize>,
+    #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
+    repetition_penalty: Option<f32>,
+    #[serde(default)]
+    repetition_context: Option<usize>,
+    #[serde(default)]
     max_tokens: Option<u32>,
     #[serde(default)]
     max_completion_tokens: Option<u32>,
@@ -692,6 +727,19 @@ struct OpenAiChatRequest {
     stop: Option<StopValue>,
     #[serde(default)]
     disable_thinking: Option<bool>,
+    #[serde(default)]
+    enable_thinking: Option<bool>,
+    #[serde(default)]
+    reasoning_effort: Option<ReasoningEffortRequest>,
+    /// Explicitly clear application overrides and use the model default.
+    #[serde(default)]
+    model_defaults: Vec<ModelDefaultControl>,
+    #[serde(default)]
+    preserve_thinking: Option<bool>,
+    #[serde(default)]
+    mtp: Option<MtpRequest>,
+    #[serde(default)]
+    response_format: Option<OpenAiResponseFormat>,
     /// Tools / functions offered to the model, in the OpenAI function-tool shape
     /// (`{"type":"function","function":{"name","description","parameters"}}`). Threaded to the
     /// provider, which rejects them with a 400 if it does not advertise tool support.
@@ -699,12 +747,82 @@ struct OpenAiChatRequest {
     tools: Option<Vec<OpenAiTool>>,
 }
 
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ModelDefaultControl {
+    ReasoningEffort,
+    PreserveThinking,
+    Mtp,
+}
+
 impl OpenAiChatRequest {
+    fn resolve_inherited_defaults(
+        &self,
+        defaults: &SamplingDefaults,
+        caps: &crate::engine::CapabilitySummary,
+    ) -> SamplingDefaults {
+        let mut resolved = defaults.clone();
+        let disabled = self
+            .disable_thinking
+            .unwrap_or(defaults.disable_thinking && self.enable_thinking != Some(true))
+            || self.enable_thinking == Some(false);
+        if disabled
+            || !caps.supports_reasoning_effort
+            || self
+                .model_defaults
+                .contains(&ModelDefaultControl::ReasoningEffort)
+        {
+            resolved.reasoning_effort = None;
+        }
+        if !caps.supports_preserve_thinking
+            || self
+                .model_defaults
+                .contains(&ModelDefaultControl::PreserveThinking)
+        {
+            resolved.preserve_thinking = None;
+        }
+        if caps.mtp.is_none() || self.model_defaults.contains(&ModelDefaultControl::Mtp) {
+            resolved.mtp_mode = "off".to_string();
+        }
+        resolved
+    }
+
+    #[cfg(test)]
+    fn into_generate_for_engine(
+        self,
+        defaults: &SamplingDefaults,
+        engine: &EngineHandle,
+    ) -> Result<GenerateRequest, ApiError> {
+        let status = engine.status().map_err(ApiError::engine)?;
+        let caps = &status
+            .loaded
+            .ok_or_else(|| ApiError::bad_request("load a model before generating"))?
+            .provider
+            .capabilities;
+        let resolved = self.resolve_inherited_defaults(defaults, caps);
+        self.into_generate(&resolved)
+    }
+
     fn model_name(&self) -> String {
         self.model
             .clone()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "chatworks".to_string())
+    }
+
+    fn authorize_local_media(&self, allow_local_files: bool) -> Result<(), ApiError> {
+        let requests_local_file = self.messages.iter().any(|message| {
+            message
+                .content
+                .as_ref()
+                .is_some_and(OpenAiMessageContent::contains_local_media)
+        });
+        if requests_local_file && !allow_local_files {
+            return Err(ApiError::bad_request(
+                "local media paths are disabled for the HTTP API; enable authenticated local media access in Settings or use the desktop file picker",
+            ));
+        }
+        Ok(())
     }
 
     fn into_generate(self, defaults: &SamplingDefaults) -> Result<GenerateRequest, ApiError> {
@@ -722,7 +840,9 @@ impl OpenAiChatRequest {
                 content: defaults.system_prompt.clone(),
                 images: Vec::new(),
                 videos: Vec::new(),
+                media: Vec::new(),
                 tool_calls: Vec::new(),
+                thinking: None,
             });
         }
         for message in self.messages {
@@ -734,29 +854,99 @@ impl OpenAiChatRequest {
             .into_iter()
             .map(OpenAiTool::into_generate)
             .collect::<Result<Vec<_>, _>>()?;
-        let disable_thinking = self.disable_thinking.unwrap_or(defaults.disable_thinking);
+        let disable_thinking = self
+            .disable_thinking
+            .unwrap_or(defaults.disable_thinking && self.enable_thinking != Some(true));
         Ok(GenerateRequest {
             messages,
             sampling: SamplingRequest {
                 temperature: Some(self.temperature.unwrap_or(defaults.temperature)),
                 top_p: Some(self.top_p.unwrap_or(defaults.top_p)),
-                top_k: None,
-                repetition_penalty: None,
-                repetition_context: None,
+                top_k: self.top_k.or(defaults.top_k),
+                presence_penalty: self.presence_penalty.or(defaults.presence_penalty),
+                repetition_penalty: self.repetition_penalty.or(defaults.repetition_penalty),
+                repetition_context: self.repetition_context.or(defaults.repetition_context),
             },
             max_new_tokens: self
                 .max_completion_tokens
                 .or(self.max_tokens)
                 .unwrap_or(defaults.max_tokens),
-            seed: self.seed,
+            seed: self.seed.or(defaults.seed),
             stop: self.stop.map(StopValue::into_vec).unwrap_or_default(),
-            thinking: if disable_thinking {
-                ThinkingRequest::Disabled
-            } else {
-                ThinkingRequest::Auto
-            },
+            thinking: ThinkingRequest::Auto,
+            enable_thinking: self.enable_thinking,
+            disable_thinking: Some(disable_thinking),
+            reasoning_effort: self.reasoning_effort.or_else(|| {
+                if disable_thinking
+                    || self.enable_thinking == Some(false)
+                    || self
+                        .model_defaults
+                        .contains(&ModelDefaultControl::ReasoningEffort)
+                {
+                    return None;
+                }
+                defaults
+                    .reasoning_effort
+                    .as_deref()
+                    .and_then(parse_reasoning_effort)
+            }),
+            preserve_thinking: self.preserve_thinking.or(
+                if self
+                    .model_defaults
+                    .contains(&ModelDefaultControl::PreserveThinking)
+                {
+                    None
+                } else {
+                    defaults.preserve_thinking
+                },
+            ),
+            mtp: self.mtp.unwrap_or_else(|| {
+                if self.model_defaults.contains(&ModelDefaultControl::Mtp) {
+                    MtpRequest::Off
+                } else {
+                    mtp_from_defaults(defaults)
+                }
+            }),
+            constraint: response_format_constraint(self.response_format)?,
             tools,
         })
+    }
+}
+
+fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffortRequest> {
+    match value {
+        "low" => Some(ReasoningEffortRequest::Low),
+        "medium" => Some(ReasoningEffortRequest::Medium),
+        "xhigh" => Some(ReasoningEffortRequest::Xhigh),
+        _ => None,
+    }
+}
+
+fn mtp_from_defaults(defaults: &SamplingDefaults) -> MtpRequest {
+    match defaults.mtp_mode.as_str() {
+        "auto" => MtpRequest::Auto,
+        "enabled" => MtpRequest::Enabled {
+            draft_tokens: defaults.mtp_draft_tokens,
+        },
+        _ => MtpRequest::Off,
+    }
+}
+
+#[derive(Deserialize)]
+struct OpenAiResponseFormat {
+    #[serde(rename = "type")]
+    kind: String,
+}
+fn response_format_constraint(
+    format: Option<OpenAiResponseFormat>,
+) -> Result<Option<ConstraintRequest>, ApiError> {
+    match format.map(|value| value.kind) {
+        None => Ok(None),
+        Some(value) if value == "text" => Ok(None),
+        Some(value) if value == "json_object" => Ok(Some(ConstraintRequest::Json)),
+        Some(value) => Err(ApiError::bad_request(format!(
+            "unsupported response_format type '{value}' (only json_object is supported)"
+        ))),
     }
 }
 
@@ -808,24 +998,28 @@ struct OpenAiChatMessage {
     content: Option<OpenAiMessageContent>,
     #[serde(default)]
     tool_calls: Vec<OpenAiToolCall>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
 }
 
 impl OpenAiChatMessage {
     fn into_generate(self) -> Result<GenerateMessage, ApiError> {
-        let (content, images, videos) = match self.content {
+        let (content, images, videos, media) = match self.content {
             Some(content) => content.into_parts()?,
-            None => (String::new(), Vec::new(), Vec::new()),
+            None => (String::new(), Vec::new(), Vec::new(), Vec::new()),
         };
         Ok(GenerateMessage {
             role: self.role,
             content,
             images,
             videos,
+            media,
             tool_calls: self
                 .tool_calls
                 .into_iter()
                 .map(OpenAiToolCall::into_generate)
                 .collect::<Result<Vec<_>, _>>()?,
+            thinking: self.reasoning_content,
         })
     }
 }
@@ -875,13 +1069,32 @@ enum OpenAiMessageContent {
 }
 
 impl OpenAiMessageContent {
+    fn contains_local_media(&self) -> bool {
+        match self {
+            Self::Text(_) => false,
+            Self::Parts(parts) => parts.iter().any(|part| match part.kind.as_str() {
+                "image_url" => part
+                    .image_url
+                    .as_ref()
+                    .is_some_and(|image| is_local_media_source(&image.url)),
+                "video_url" => part
+                    .video_url
+                    .as_ref()
+                    .and_then(|video| video.url.as_deref())
+                    .is_some_and(is_local_media_source),
+                _ => false,
+            }),
+        }
+    }
+
     /// Split OpenAI content into concatenated text, the ordered image-URL attachments, and the
     /// ordered video attachments. A plain string is text with no images/videos (the text path stays
     /// byte-identical).
     ///
-    /// **Video representation (sc-8081).** There is no standard OpenAI `image_url` analog for video.
-    /// We accept a **`video_url` content part carrying pre-sampled frames** plus optional per-frame
-    /// timestamps:
+    /// **Video representation.** There is no standard OpenAI `image_url` analog for video. A
+    /// `video_url` accepts either pre-sampled frames plus timestamps, or one explicit file/URL in
+    /// `video_url.url`. The latter is staged under bounded download/file limits and decoded by the
+    /// app's FFmpeg media component before it reaches the same temporal frame path.
     /// ```json
     /// { "type": "video_url",
     ///   "video_url": {
@@ -890,19 +1103,24 @@ impl OpenAiMessageContent {
     ///     "fps": 2.0                  // optional; used to derive timestamps when absent
     ///   } }
     /// ```
-    /// The host (the ChatWorks frontend) samples frames client-side, so v1 needs **no heavy
-    /// server-side video-file decoder** (arbitrary `.mp4` decode is a tracked follow-up). Each frame
-    /// is an image data URL decoded exactly like an `image_url`. If `timestamps` is omitted it is
+    /// The ChatWorks frontend may sample frames client-side, while an explicit `video_url.url`
+    /// uses the bundled FFmpeg sidecar. Each frame is an image data URL decoded exactly like an
+    /// `image_url`. If `timestamps` is omitted it is
     /// derived from `fps` (`i / fps`) or, lacking both, frame index seconds (`i`, i.e. 1 fps) — the
-    /// engine forwards these straight into `VideoRef`, which drives Text–Timestamp Alignment.
+    /// engine forwards these straight into `VideoRef`, which drives Text–Timestamp Alignment. A
+    /// single `url` is intentionally not combined with `frames`; frames take precedence to retain
+    /// backwards-compatible caller control of exact sampling.
     #[allow(clippy::type_complexity)]
-    fn into_parts(self) -> Result<(String, Vec<String>, Vec<GenerateVideo>), ApiError> {
+    fn into_parts(
+        self,
+    ) -> Result<(String, Vec<String>, Vec<GenerateVideo>, Vec<GenerateMedia>), ApiError> {
         match self {
-            Self::Text(value) => Ok((value, Vec::new(), Vec::new())),
+            Self::Text(value) => Ok((value, Vec::new(), Vec::new(), Vec::new())),
             Self::Parts(parts) => {
                 let mut text = String::new();
                 let mut images = Vec::new();
                 let mut videos = Vec::new();
+                let mut media = Vec::new();
                 for part in parts {
                     match part.kind.as_str() {
                         "text" => text.push_str(&part.text.unwrap_or_default()),
@@ -910,45 +1128,115 @@ impl OpenAiMessageContent {
                             let url = part.image_url.map(|image| image.url).ok_or_else(|| {
                                 ApiError::bad_request("image_url part is missing its url")
                             })?;
-                            images.push(url);
+                            images.push(url.clone());
+                            if is_media_source_url(&url) {
+                                media.push(GenerateMedia::ImageSource { url });
+                            } else {
+                                media.push(GenerateMedia::Image { url });
+                            }
                         }
                         "video_url" => {
                             let video = part.video_url.ok_or_else(|| {
                                 ApiError::bad_request("video_url part is missing its video_url")
                             })?;
                             if video.frames.is_empty() {
+                                let url = video.url.ok_or_else(|| ApiError::bad_request(
+                                    "video_url part must carry frames or a file/URL in video_url.url",
+                                ))?;
+                                media.push(GenerateMedia::VideoSource { url });
+                                continue;
+                            }
+                            if video.fps.is_some_and(|fps| !fps.is_finite() || fps <= 0.0) {
                                 return Err(ApiError::bad_request(
-                                    "video_url part must carry at least one frame",
+                                    "video_url fps must be finite and greater than zero",
                                 ));
                             }
                             // Derive timestamps when absent: explicit > fps-derived > 1-fps index.
                             let n = video.frames.len();
                             let timestamps = match video.timestamps {
-                                Some(ts) if ts.len() == n => ts,
+                                Some(ts) if ts.len() == n => {
+                                    validate_video_timestamps(&ts)?;
+                                    ts
+                                }
                                 Some(ts) => {
                                     return Err(ApiError::bad_request(format!(
                                         "video_url timestamps length {} != frame count {n}",
                                         ts.len()
-                                    )))
+                                    )));
                                 }
                                 None => {
-                                    let fps = video.fps.filter(|f| *f > 0.0).unwrap_or(1.0);
+                                    let fps = video.fps.unwrap_or(1.0);
                                     (0..n).map(|i| i as f32 / fps).collect()
                                 }
                             };
-                            videos.push(GenerateVideo { frames: video.frames, timestamps });
+                            let generated = GenerateVideo {
+                                frames: video.frames,
+                                timestamps,
+                            };
+                            media.push(GenerateMedia::Video {
+                                frames: generated.frames.clone(),
+                                timestamps: generated.timestamps.clone(),
+                            });
+                            videos.push(generated);
                         }
                         other => {
                             return Err(ApiError::bad_request(format!(
                                 "unsupported content part type '{other}'"
-                            )))
+                            )));
                         }
                     }
                 }
-                Ok((text, images, videos))
+                Ok((text, images, videos, media))
             }
         }
     }
+}
+
+fn validate_video_timestamps(timestamps: &[f32]) -> Result<(), ApiError> {
+    if timestamps
+        .iter()
+        .any(|timestamp| !timestamp.is_finite() || *timestamp < 0.0)
+    {
+        return Err(ApiError::bad_request(
+            "video_url timestamps must be finite and non-negative",
+        ));
+    }
+    if timestamps.windows(2).any(|pair| pair[1] < pair[0]) {
+        return Err(ApiError::bad_request(
+            "video_url timestamps must be monotonically nondecreasing",
+        ));
+    }
+    Ok(())
+}
+
+fn is_media_source_url(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("http://")
+        || value.starts_with("https://")
+        || value.starts_with("file:")
+        || value.starts_with('/')
+        || (value
+            .as_bytes()
+            .get(1)
+            .is_some_and(|separator| *separator == b':')
+            && value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic))
+}
+
+fn is_local_media_source(value: &str) -> bool {
+    let value = value.trim();
+    value.starts_with("file:")
+        || value.starts_with('/')
+        || (value
+            .as_bytes()
+            .get(1)
+            .is_some_and(|separator| *separator == b':')
+            && value
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphabetic))
 }
 
 #[derive(Deserialize)]
@@ -973,7 +1261,12 @@ struct OpenAiImageUrl {
 /// [`OpenAiMessageContent::into_parts`] for the decision rationale and the wire shape.
 #[derive(Deserialize)]
 struct OpenAiVideoUrl {
+    /// A local file path, `file://` URI, or HTTP(S) URL. It is decoded by the native media
+    /// component into bounded timestamped frames. Mutually exclusive with `frames`.
+    #[serde(default)]
+    url: Option<String>,
     /// Sampled frames, in temporal order, each a `data:image/…;base64,…` URL (or bare base64).
+    #[serde(default)]
     frames: Vec<String>,
     /// Optional per-frame timestamps in seconds (one per frame). Derived from `fps` / frame index
     /// when absent.
@@ -1008,6 +1301,12 @@ struct OpenAiChatResponse {
     model: String,
     choices: Vec<OpenAiChatChoice>,
     usage: OpenAiUsage,
+    /// ChatWorks extension: native MTP counters, absent when ordinary autoregressive decode ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chatworks_mtp: Option<crate::engine::MtpStatsPayload>,
+    /// ChatWorks extension: synchronized backend phase timings, absent when unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chatworks_timings: Option<crate::engine::GenerationTimingsPayload>,
 }
 
 impl OpenAiChatResponse {
@@ -1018,6 +1317,8 @@ impl OpenAiChatResponse {
             tool_calls,
             usage,
             finish_reason,
+            mtp,
+            timings,
         } = response;
         let has_tool_calls = !tool_calls.is_empty();
         // A tool-call turn finishes with `tool_calls`, overriding the engine's stop/length reason.
@@ -1050,8 +1351,16 @@ impl OpenAiChatResponse {
                 finish_reason: Some(finish_reason),
             }],
             usage: OpenAiUsage::from(usage),
+            chatworks_mtp: mtp,
+            chatworks_timings: timings,
         }
     }
+}
+
+#[derive(Serialize)]
+struct NativeTelemetry {
+    mtp: Option<crate::engine::MtpStatsPayload>,
+    timings: Option<crate::engine::GenerationTimingsPayload>,
 }
 
 #[derive(Serialize)]
@@ -1063,6 +1372,12 @@ struct OpenAiChatChunk {
     choices: Vec<OpenAiChatChoice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<OpenAiUsage>,
+    /// ChatWorks extension: native MTP counters, emitted only on the terminal stream chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chatworks_mtp: Option<crate::engine::MtpStatsPayload>,
+    /// ChatWorks extension: synchronized backend phase timings, emitted only on the terminal stream chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chatworks_timings: Option<crate::engine::GenerationTimingsPayload>,
 }
 
 impl OpenAiChatChunk {
@@ -1083,6 +1398,8 @@ impl OpenAiChatChunk {
                 finish_reason: None,
             }],
             usage: None,
+            chatworks_mtp: None,
+            chatworks_timings: None,
         }
     }
 
@@ -1103,6 +1420,8 @@ impl OpenAiChatChunk {
                 finish_reason: None,
             }],
             usage: None,
+            chatworks_mtp: None,
+            chatworks_timings: None,
         }
     }
 
@@ -1113,6 +1432,7 @@ impl OpenAiChatChunk {
         finish_reason: String,
         usage: Option<OpenAiUsage>,
         tool_calls: Vec<OpenAiToolCallDelta>,
+        telemetry: NativeTelemetry,
     ) -> Self {
         Self {
             id,
@@ -1130,6 +1450,8 @@ impl OpenAiChatChunk {
                 finish_reason: Some(finish_reason),
             }],
             usage,
+            chatworks_mtp: telemetry.mtp,
+            chatworks_timings: telemetry.timings,
         }
     }
 }
@@ -1270,7 +1592,7 @@ mod tests {
     use super::*;
     // The weightless fakes are shared with the engine tests via `test_support` so the two can't
     // drift apart (code-review F-012).
-    use crate::test_support::{fake_loader, fake_tool_loader};
+    use crate::test_support::{fake_loader, fake_telemetry_loader, fake_tool_loader};
     use serde_json::{json, Value};
 
     fn loaded_fake_engine() -> EngineHandle {
@@ -1280,6 +1602,20 @@ mod tests {
                 source: "/tmp/fake-model".to_string(),
                 display_name: Some("fake-model".to_string()),
                 quantize: None,
+                projector_source: None,
+            })
+            .unwrap();
+        engine
+    }
+
+    fn loaded_telemetry_engine() -> EngineHandle {
+        let engine = EngineHandle::spawn_with_loader(fake_telemetry_loader);
+        engine
+            .load_model(crate::engine::LoadModelRequest {
+                source: "/tmp/fake-telemetry".to_string(),
+                display_name: Some("fake-telemetry".to_string()),
+                quantize: None,
+                projector_source: None,
             })
             .unwrap();
         engine
@@ -1292,6 +1628,7 @@ mod tests {
                 source: "/tmp/fake-tools".to_string(),
                 display_name: Some("fake-tools".to_string()),
                 quantize: None,
+                projector_source: None,
             })
             .unwrap();
         engine
@@ -1347,6 +1684,213 @@ mod tests {
     }
 
     #[test]
+    fn local_media_api_policy_requires_authentication_and_explicit_opt_in() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": [{
+                "type": "image_url", "image_url": {"url": "file:///tmp/private.png"}
+            }]}]
+        }))
+        .unwrap();
+        let error = request.authorize_local_media(false).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(request.authorize_local_media(true).is_ok());
+
+        let alternate_file_uri: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": [{
+                "type": "video_url", "video_url": {"url": "file:/tmp/private.mp4"}
+            }]}]
+        }))
+        .unwrap();
+        assert!(alternate_file_uri.authorize_local_media(false).is_err());
+
+        let unauthenticated = OpenAiServerConfig {
+            host: "0.0.0.0".to_string(),
+            allow_lan: true,
+            allow_local_files: true,
+            ..Default::default()
+        };
+        assert!(validate_config(&unauthenticated).is_err());
+        let authenticated = OpenAiServerConfig {
+            auth_token: Some("secret".to_string()),
+            ..unauthenticated
+        };
+        assert!(validate_config(&authenticated).is_ok());
+        assert!(authorize(&HeaderMap::new(), authenticated.auth_token.as_deref()).is_err());
+    }
+
+    #[test]
+    fn non_streaming_response_preserves_native_telemetry() {
+        let response = OpenAiChatResponse::from_generate(
+            "test".to_string(),
+            GenerateResponse {
+                text: "ok".to_string(),
+                thinking: None,
+                tool_calls: Vec::new(),
+                usage: crate::engine::UsagePayload {
+                    prompt_tokens: 1,
+                    generated_tokens: 1,
+                    total_tokens: 2,
+                },
+                finish_reason: "stop".to_string(),
+                mtp: Some(crate::engine::MtpStatsPayload {
+                    proposed_tokens: 4,
+                    accepted_tokens: 3,
+                    target_forwards: 2,
+                }),
+                timings: Some(crate::engine::GenerationTimingsPayload {
+                    prefill_ms: 12,
+                    decode_ms: 34,
+                }),
+            },
+        );
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["chatworks_mtp"]["accepted_tokens"], 3);
+        assert_eq!(json["chatworks_timings"]["prefill_ms"], 12);
+    }
+
+    #[test]
+    fn streaming_terminal_chunk_preserves_native_telemetry() {
+        let response = OpenAiChatChunk::finish(
+            "chatcmpl-test".to_string(),
+            1,
+            "test".to_string(),
+            "stop".to_string(),
+            Some(OpenAiUsage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            }),
+            Vec::new(),
+            NativeTelemetry {
+                mtp: Some(crate::engine::MtpStatsPayload {
+                    proposed_tokens: 4,
+                    accepted_tokens: 3,
+                    target_forwards: 2,
+                }),
+                timings: Some(crate::engine::GenerationTimingsPayload {
+                    prefill_ms: 12,
+                    decode_ms: 34,
+                }),
+            },
+        );
+        let json = serde_json::to_value(response).unwrap();
+        assert_eq!(json["chatworks_mtp"]["accepted_tokens"], 3);
+        assert_eq!(json["chatworks_timings"]["decode_ms"], 34);
+    }
+
+    #[test]
+    fn inherited_controls_resolve_through_loaded_engine_but_explicit_unsupported_controls_error() {
+        let engine = loaded_fake_engine();
+        let defaults = SamplingDefaults {
+            system_prompt: String::new(),
+            max_tokens: 8,
+            reasoning_effort: Some("xhigh".into()),
+            preserve_thinking: Some(true),
+            mtp_mode: "enabled".into(),
+            ..Default::default()
+        };
+        let base = json!({"messages":[{"role":"user","content":"hello"}]});
+        let request: OpenAiChatRequest = serde_json::from_value(base.clone()).unwrap();
+        let generated = request
+            .into_generate_for_engine(&defaults, &engine)
+            .unwrap();
+        assert!(engine.generate(generated, |_| {}).is_ok());
+        for (key, value, expected) in [
+            ("reasoning_effort", json!("low"), "reasoning_effort"),
+            ("preserve_thinking", json!(true), "preserve_thinking"),
+            ("mtp", json!({"mode":"enabled", "draft_tokens":3}), "MTP"),
+        ] {
+            let mut wire = base.clone();
+            wire[key] = value;
+            let request: OpenAiChatRequest = serde_json::from_value(wire).unwrap();
+            let generated = request
+                .into_generate_for_engine(&defaults, &engine)
+                .unwrap();
+            assert!(engine
+                .generate(generated, |_| {})
+                .unwrap_err()
+                .contains(expected));
+        }
+    }
+
+    #[test]
+    fn effective_thinking_filters_only_inherited_effort() {
+        let mut caps = crate::engine::CapabilitySummary::from(
+            crate::test_support::thinking_descriptor("fixture", 8).capabilities,
+        );
+        caps.supports_reasoning_effort = true;
+        let defaults = SamplingDefaults {
+            disable_thinking: true,
+            reasoning_effort: Some("xhigh".into()),
+            ..Default::default()
+        };
+        for (control, disabled, has_effort) in [
+            (json!({"disable_thinking":true}), true, false),
+            (json!({"enable_thinking":true}), false, true),
+        ] {
+            let mut wire = control;
+            wire["messages"] = json!([{"role":"user", "content":"hello"}]);
+            let request: OpenAiChatRequest = serde_json::from_value(wire).unwrap();
+            let resolved = request.resolve_inherited_defaults(&defaults, &caps);
+            let generated = request.into_generate(&resolved).unwrap();
+            assert_eq!(generated.disable_thinking, Some(disabled));
+            assert_eq!(generated.reasoning_effort.is_some(), has_effort);
+        }
+    }
+
+    #[test]
+    fn desktop_controls_clear_nontrivial_defaults_across_capability_switches() {
+        let mut wire: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/generation-wire.json")).unwrap();
+        wire["messages"] = json!([{"role":"user", "content":"hello"}]);
+        wire["disable_thinking"] = json!(true);
+        let defaults = SamplingDefaults {
+            system_prompt: String::new(),
+            reasoning_effort: Some("xhigh".into()),
+            preserve_thinking: Some(true),
+            mtp_mode: "enabled".into(),
+            ..Default::default()
+        };
+        for supported in [true, false] {
+            let mut caps = crate::test_support::thinking_descriptor("fixture", 8).capabilities;
+            caps.supports_reasoning_effort = supported;
+            caps.supports_preserve_thinking = supported;
+            let summary = crate::engine::CapabilitySummary::from(caps);
+            let request: OpenAiChatRequest = serde_json::from_value(wire.clone()).unwrap();
+            let resolved = request.resolve_inherited_defaults(&defaults, &summary);
+            let output = request.into_generate(&resolved).unwrap();
+            assert!(output.reasoning_effort.is_none());
+            assert!(output.preserve_thinking.is_none());
+            assert!(matches!(output.mtp, MtpRequest::Off));
+        }
+        // An ordinary external API client inherits only controls supported by this model.
+        let caps = crate::engine::CapabilitySummary::from(
+            crate::test_support::thinking_descriptor("fixture", 8).capabilities,
+        );
+        let request: OpenAiChatRequest =
+            serde_json::from_value(json!({"messages":[{"role":"user","content":"hello"}]}))
+                .unwrap();
+        let resolved = request.resolve_inherited_defaults(&defaults, &caps);
+        let output = request.into_generate(&resolved).unwrap();
+        assert!(output.reasoning_effort.is_none());
+        assert!(output.preserve_thinking.is_none());
+        assert!(matches!(output.mtp, MtpRequest::Off));
+        // Explicit unsupported intent is retained, for actionable native capability validation.
+        wire["reasoning_effort"] = json!("low");
+        wire["preserve_thinking"] = json!(true);
+        wire["mtp"] = json!({"mode":"auto"});
+        let request: OpenAiChatRequest = serde_json::from_value(wire).unwrap();
+        let resolved = request.resolve_inherited_defaults(&defaults, &caps);
+        let output = request.into_generate(&resolved).unwrap();
+        assert!(matches!(
+            output.reasoning_effort,
+            Some(ReasoningEffortRequest::Low)
+        ));
+        assert_eq!(output.preserve_thinking, Some(true));
+        assert!(matches!(output.mtp, MtpRequest::Auto));
+    }
+
+    #[test]
     fn maps_chat_request_to_engine_request() {
         let request: OpenAiChatRequest = serde_json::from_value(json!({
             "model": "fake",
@@ -1376,6 +1920,53 @@ mod tests {
         assert!(matches!(generate.thinking, ThinkingRequest::Auto));
     }
 
+    #[test]
+    fn maps_native_qwen_controls_and_preserves_reasoning_history() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "assistant", "content": "answer", "reasoning_content": "trace"}],
+            "top_k": 12, "presence_penalty": 1.5, "repetition_penalty": 1.1, "repetition_context": 32,
+            "reasoning_effort": "low", "preserve_thinking": true,
+            "mtp": {"mode": "enabled", "draft_tokens": 3},
+            "response_format": {"type": "json_object"}
+        })).unwrap();
+        let generate = request.into_generate(&test_sampling_defaults()).unwrap();
+        assert_eq!(generate.messages[0].thinking.as_deref(), Some("trace"));
+        assert_eq!(generate.sampling.top_k, Some(12));
+        assert_eq!(generate.sampling.presence_penalty, Some(1.5));
+        assert_eq!(generate.sampling.repetition_penalty, Some(1.1));
+        assert_eq!(generate.sampling.repetition_context, Some(32));
+        assert!(matches!(
+            generate.reasoning_effort,
+            Some(ReasoningEffortRequest::Low)
+        ));
+        assert_eq!(generate.preserve_thinking, Some(true));
+        assert!(matches!(
+            generate.mtp,
+            MtpRequest::Enabled { draft_tokens: 3 }
+        ));
+        assert!(matches!(generate.constraint, Some(ConstraintRequest::Json)));
+    }
+
+    #[test]
+    fn rejects_contradictory_thinking_flags_and_unknown_response_format() {
+        let conflict: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "enable_thinking": true, "disable_thinking": true
+        }))
+        .unwrap();
+        let generated = conflict.into_generate(&test_sampling_defaults()).unwrap();
+        assert_eq!(generated.enable_thinking, Some(true));
+        assert_eq!(generated.disable_thinking, Some(true));
+        let unsupported: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "response_format": {"type": "json_schema"}
+        }))
+        .unwrap();
+        assert!(unsupported
+            .into_generate(&test_sampling_defaults())
+            .is_err());
+    }
+
     /// A `video_url` content part with pre-sampled frames + explicit timestamps parses into a
     /// `GenerateVideo` carrying the frames and timestamps verbatim, alongside the text (sc-8081).
     #[test]
@@ -1392,7 +1983,10 @@ mod tests {
             "max_tokens": 8
         }))
         .unwrap();
-        let defaults = SamplingDefaults { system_prompt: String::new(), ..Default::default() };
+        let defaults = SamplingDefaults {
+            system_prompt: String::new(),
+            ..Default::default()
+        };
         let generate = request.into_generate(&defaults).unwrap();
         let msg = &generate.messages[0];
         assert_eq!(msg.content, "what happens");
@@ -1400,6 +1994,88 @@ mod tests {
         assert_eq!(msg.videos.len(), 1);
         assert_eq!(msg.videos[0].frames.len(), 2);
         assert_eq!(msg.videos[0].timestamps, vec![0.0, 0.5]);
+        assert!(
+            matches!(msg.media.as_slice(), [GenerateMedia::Video { timestamps, .. }] if timestamps == &vec![0.0, 0.5])
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_video_timestamps_and_fps_at_the_api_boundary() {
+        for timestamps in [vec![-1.0, 0.0], vec![2.0, 1.0], vec![f32::NAN, 1.0]] {
+            assert!(validate_video_timestamps(&timestamps).is_err());
+        }
+        assert!(validate_video_timestamps(&[0.0, 0.0, 1.5]).is_ok());
+
+        let invalid_fps = OpenAiMessageContent::Parts(vec![OpenAiContentPart {
+            kind: "video_url".to_string(),
+            text: None,
+            image_url: None,
+            video_url: Some(OpenAiVideoUrl {
+                url: None,
+                frames: vec!["data:image/jpeg;base64,AAA".to_string()],
+                timestamps: None,
+                fps: Some(f32::INFINITY),
+            }),
+        }]);
+        assert!(invalid_fps.into_parts().is_err());
+    }
+
+    #[test]
+    fn preserves_mixed_media_order_and_accepts_a_video_file_or_url_source() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAA"}},
+                {"type": "video_url", "video_url": {"url": "file:///tmp/example.mp4"}},
+                {"type": "video_url", "video_url": {
+                    "frames": ["data:image/jpeg;base64,BBB"], "timestamps": [3.5]
+                }},
+                {"type": "text", "text": "compare them"}
+            ]}]
+        }))
+        .unwrap();
+        let generated = request
+            .into_generate(&SamplingDefaults {
+                system_prompt: String::new(),
+                ..Default::default()
+            })
+            .unwrap();
+        let message = &generated.messages[0];
+        assert_eq!(message.content, "compare them");
+        assert!(matches!(message.media.as_slice(), [
+            GenerateMedia::Image { url },
+            GenerateMedia::VideoSource { url: source },
+            GenerateMedia::Video { timestamps, .. },
+        ] if url == "data:image/jpeg;base64,AAA"
+            && source == "file:///tmp/example.mp4"
+            && timestamps == &vec![3.5]));
+    }
+
+    #[test]
+    fn recognizes_windows_file_paths_as_native_media_sources() {
+        assert!(is_media_source_url(r"C:\Users\me\clip.mp4"));
+        assert!(is_media_source_url(r"z:\cache\image.jpg"));
+        assert!(!is_media_source_url("data:image/jpeg;base64,AAA"));
+    }
+
+    #[test]
+    fn maps_file_and_http_image_urls_to_bounded_native_sources() {
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "file:///tmp/picture.png"}},
+                {"type": "image_url", "image_url": {"url": "https://cdn.example.test/picture.jpg"}}
+            ]}]
+        }))
+        .unwrap();
+        let generated = request
+            .into_generate(&SamplingDefaults {
+                system_prompt: String::new(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(matches!(generated.messages[0].media.as_slice(), [
+            GenerateMedia::ImageSource { url: local },
+            GenerateMedia::ImageSource { url: remote },
+        ] if local == "file:///tmp/picture.png" && remote == "https://cdn.example.test/picture.jpg"));
     }
 
     /// When `timestamps` is omitted, they are derived from `fps` (`i / fps`).
@@ -1418,9 +2094,15 @@ mod tests {
             "max_tokens": 8
         }))
         .unwrap();
-        let defaults = SamplingDefaults { system_prompt: String::new(), ..Default::default() };
+        let defaults = SamplingDefaults {
+            system_prompt: String::new(),
+            ..Default::default()
+        };
         let generate = request.into_generate(&defaults).unwrap();
-        assert_eq!(generate.messages[0].videos[0].timestamps, vec![0.0, 0.5, 1.0, 1.5]);
+        assert_eq!(
+            generate.messages[0].videos[0].timestamps,
+            vec![0.0, 0.5, 1.0, 1.5]
+        );
     }
 
     /// A `video_url` part with no frames is a 400, and a timestamp/frame-count mismatch is a 400.
@@ -1443,7 +2125,9 @@ mod tests {
             ]}]
         }))
         .unwrap();
-        assert!(mismatched.into_generate(&SamplingDefaults::default()).is_err());
+        assert!(mismatched
+            .into_generate(&SamplingDefaults::default())
+            .is_err());
     }
 
     #[test]
@@ -1459,6 +2143,7 @@ mod tests {
             top_p: 0.8,
             max_tokens: 64,
             disable_thinking: true,
+            ..Default::default()
         };
         let generate = request.into_generate(&defaults).unwrap();
         assert_eq!(generate.messages.len(), 2);
@@ -1467,7 +2152,8 @@ mod tests {
         assert_eq!(generate.sampling.temperature, Some(0.3));
         assert_eq!(generate.sampling.top_p, Some(0.8));
         assert_eq!(generate.max_new_tokens, 64);
-        assert!(matches!(generate.thinking, ThinkingRequest::Disabled));
+        assert!(matches!(generate.thinking, ThinkingRequest::Auto));
+        assert_eq!(generate.disable_thinking, Some(true));
     }
 
     #[test]
@@ -1479,7 +2165,8 @@ mod tests {
         .unwrap();
 
         let generate = request.into_generate(&SamplingDefaults::default()).unwrap();
-        assert!(matches!(generate.thinking, ThinkingRequest::Disabled));
+        assert!(matches!(generate.thinking, ThinkingRequest::Auto));
+        assert_eq!(generate.disable_thinking, Some(true));
     }
 
     #[test]
@@ -1552,6 +2239,38 @@ mod tests {
 
     fn response_body(response: &str) -> &str {
         response.split("\r\n\r\n").nth(1).unwrap_or_default()
+    }
+
+    #[test]
+    fn http_rejects_local_media_before_decoder_access_when_policy_is_off() {
+        let server = OpenAiServerHandle::new();
+        let status = server
+            .start(
+                OpenAiServerConfig {
+                    port: 0,
+                    sampling_defaults: test_sampling_defaults(),
+                    ..Default::default()
+                },
+                loaded_fake_engine(),
+            )
+            .unwrap();
+        let addr = status.bound_addr.unwrap();
+        let response = http_post_json(
+            &addr,
+            "/v1/chat/completions",
+            json!({
+                "model": "fake-model",
+                "messages": [{"role": "user", "content": [{
+                    "type": "image_url",
+                    "image_url": {"url": "file:///path/that/must/not/be-opened.png"}
+                }]}],
+                "max_tokens": 8
+            }),
+            None,
+        );
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(response_body(&response).contains("local media paths are disabled"));
+        server.stop().unwrap();
     }
 
     #[test]
@@ -1661,10 +2380,46 @@ mod tests {
             None,
         );
         // Loopback (allow_lan=false) omits the CORS allow-origin header (code-review F-003).
-        assert!(!response.to_ascii_lowercase().contains("access-control-allow-origin"));
+        assert!(!response
+            .to_ascii_lowercase()
+            .contains("access-control-allow-origin"));
         assert!(response.contains("data: {\"id\":\"chatcmpl-"));
         assert!(response.contains("\"reasoning_content\":\"reason\""));
         assert!(response.contains("\"content\":\"ok\""));
+        assert!(response.contains("data: [DONE]"));
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn streams_terminal_native_telemetry_over_http() {
+        let server = OpenAiServerHandle::new();
+        let status = server
+            .start(
+                OpenAiServerConfig {
+                    port: 0,
+                    sampling_defaults: test_sampling_defaults(),
+                    ..Default::default()
+                },
+                loaded_telemetry_engine(),
+            )
+            .unwrap();
+        let addr = status.bound_addr.unwrap();
+        let response = http_post_json(
+            &addr,
+            "/v1/chat/completions",
+            json!({
+                "model": "fake-telemetry",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true,
+                "mtp": {"mode": "enabled", "draft_tokens": 2},
+                "max_tokens": 8
+            }),
+            None,
+        );
+        assert!(response.contains(
+            "\"chatworks_mtp\":{\"proposed_tokens\":4,\"accepted_tokens\":3,\"target_forwards\":2}"
+        ));
+        assert!(response.contains("\"chatworks_timings\":{\"prefill_ms\":12,\"decode_ms\":34}"));
         assert!(response.contains("data: [DONE]"));
         server.stop().unwrap();
     }
@@ -1715,10 +2470,13 @@ mod tests {
             )
             .unwrap();
         let addr = status.bound_addr.unwrap();
-        let response = http_options_with_origin(&addr, "/v1/chat/completions", "http://evil.example");
+        let response =
+            http_options_with_origin(&addr, "/v1/chat/completions", "http://evil.example");
         assert!(response.starts_with("HTTP/1.1 204 No Content"));
         assert!(
-            !response.to_ascii_lowercase().contains("access-control-allow-origin"),
+            !response
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
             "loopback must not grant a non-webview origin: {response}"
         );
         server.stop().unwrap();
@@ -1742,7 +2500,8 @@ mod tests {
             .unwrap();
         let addr = status.bound_addr.unwrap();
         // The Vite dev webview origin.
-        let response = http_options_with_origin(&addr, "/v1/chat/completions", "http://127.0.0.1:5173");
+        let response =
+            http_options_with_origin(&addr, "/v1/chat/completions", "http://127.0.0.1:5173");
         assert!(response.starts_with("HTTP/1.1 204 No Content"));
         assert!(response.contains("access-control-allow-origin: http://127.0.0.1:5173"));
         assert!(response.contains("access-control-allow-methods: GET, POST, OPTIONS"));
@@ -1771,7 +2530,8 @@ mod tests {
             )
             .unwrap();
         let addr = status.bound_addr.unwrap();
-        let response = http_options_with_origin(&addr, "/v1/chat/completions", "http://evil.example");
+        let response =
+            http_options_with_origin(&addr, "/v1/chat/completions", "http://evil.example");
         assert!(response.starts_with("HTTP/1.1 204 No Content"));
         assert!(response.contains("access-control-allow-origin: *"));
         assert!(response.to_ascii_lowercase().contains("vary: origin"));

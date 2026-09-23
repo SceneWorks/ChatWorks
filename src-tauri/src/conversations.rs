@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 use crate::fsutil::{now_secs, write_json_atomic};
 
@@ -17,9 +17,16 @@ const PREVIEW_MAX_CHARS: usize = 80;
 const META_SUFFIX: &str = ".meta";
 const JSON_SUFFIX: &str = ".json";
 
+fn default_mtp_mode() -> String {
+    "off".to_string()
+}
+fn default_mtp_draft_tokens() -> u32 {
+    3
+}
+
 /// Per-conversation sampling overrides. Mirrors the in-app sampling defaults shape so a
 /// conversation carries the exact params it was run with and round-trips untouched.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationParams {
     #[serde(default)]
@@ -32,6 +39,45 @@ pub struct ConversationParams {
     pub max_tokens: u32,
     #[serde(default)]
     pub disable_thinking: bool,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub preserve_thinking: Option<bool>,
+    #[serde(default = "default_mtp_mode")]
+    pub mtp_mode: String,
+    #[serde(default = "default_mtp_draft_tokens")]
+    pub mtp_draft_tokens: u32,
+    #[serde(default)]
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub presence_penalty: Option<f32>,
+    #[serde(default)]
+    pub repetition_penalty: Option<f32>,
+    #[serde(default)]
+    pub repetition_context: Option<usize>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+}
+
+impl Default for ConversationParams {
+    fn default() -> Self {
+        Self {
+            system_prompt: String::new(),
+            temperature: 0.0,
+            top_p: 0.0,
+            max_tokens: 0,
+            disable_thinking: false,
+            reasoning_effort: None,
+            preserve_thinking: None,
+            mtp_mode: default_mtp_mode(),
+            mtp_draft_tokens: default_mtp_draft_tokens(),
+            top_k: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            repetition_context: None,
+            seed: None,
+        }
+    }
 }
 
 /// Full conversation transcript + params. `messages` is kept as a flexible
@@ -76,7 +122,10 @@ pub fn get_conversation(app: &AppHandle, id: &str) -> Result<Conversation, Strin
     get_conversation_in_dir(&dir, id)
 }
 
-pub fn save_conversation(app: &AppHandle, conversation: Conversation) -> Result<Conversation, String> {
+pub fn save_conversation(
+    app: &AppHandle,
+    conversation: Conversation,
+) -> Result<Conversation, String> {
     save_conversation_in_dir(&conversations_dir(app)?, conversation)
 }
 
@@ -97,7 +146,7 @@ fn conversations_dir(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    app.path().app_data_dir().map_err(|error| error.to_string())
+    crate::profile::data_dir(app)
 }
 
 fn conversation_file_path(dir: &Path, id: &str) -> PathBuf {
@@ -144,7 +193,10 @@ fn list_conversations_in_dir(dir: &Path) -> Result<Vec<ConversationMetadata>, St
     let mut sidecar_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut sidecar_paths: Vec<PathBuf> = Vec::new();
     let mut body_ids_without_sidecar: Vec<String> = Vec::new();
-    for entry in fs::read_dir(dir).map_err(|error| error.to_string())?.flatten() {
+    for entry in fs::read_dir(dir)
+        .map_err(|error| error.to_string())?
+        .flatten()
+    {
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -183,7 +235,11 @@ fn list_conversations_in_dir(dir: &Path) -> Result<Vec<ConversationMetadata>, St
         items.push(meta);
     }
 
-    items.sort_by(|a, b| b.updated_at.cmp(&a.updated_at).then_with(|| a.id.cmp(&b.id)));
+    items.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     Ok(items)
 }
 
@@ -196,7 +252,10 @@ fn get_conversation_in_dir(dir: &Path, id: &str) -> Result<Conversation, String>
     read_conversation_file(&path)
 }
 
-fn save_conversation_in_dir(dir: &Path, mut conversation: Conversation) -> Result<Conversation, String> {
+fn save_conversation_in_dir(
+    dir: &Path,
+    mut conversation: Conversation,
+) -> Result<Conversation, String> {
     // Canonicalize the id once at the storage boundary so the safety check and the storage key agree
     // on the id (F-009): the key is built from the validated, trimmed id, not the raw input.
     conversation.id = validate_id(&conversation.id)?;
@@ -206,7 +265,10 @@ fn save_conversation_in_dir(dir: &Path, mut conversation: Conversation) -> Resul
         // Preserve the original creation time on update when the caller omits it; stamp `now`
         // only for genuinely new conversations.
         let existing = if path.exists() {
-            read_conversation_file(&path).ok().map(|stored| stored.created_at).unwrap_or(0)
+            read_conversation_file(&path)
+                .ok()
+                .map(|stored| stored.created_at)
+                .unwrap_or(0)
         } else {
             0
         };
@@ -220,7 +282,11 @@ fn save_conversation_in_dir(dir: &Path, mut conversation: Conversation) -> Resul
     Ok(conversation)
 }
 
-fn rename_conversation_in_dir(dir: &Path, id: &str, title: &str) -> Result<ConversationMetadata, String> {
+fn rename_conversation_in_dir(
+    dir: &Path,
+    id: &str,
+    title: &str,
+) -> Result<ConversationMetadata, String> {
     let id = validate_id(id)?;
     let mut conversation = get_conversation_in_dir(dir, &id)?;
     conversation.title = title.to_string();
@@ -339,6 +405,7 @@ mod tests {
             top_p: 0.8,
             max_tokens: 128,
             disable_thinking: false,
+            ..Default::default()
         };
         let conversation = Conversation {
             id: "abc".to_string(),
@@ -376,7 +443,16 @@ mod tests {
     #[test]
     fn save_rejects_path_traversal_id() {
         let dir = test_dir("traversal-id");
-        let cases = ["../escape", "a/b", "a\\b", ".", "..", "bad\u{0000}id", " .. ", "  .  "];
+        let cases = [
+            "../escape",
+            "a/b",
+            "a\\b",
+            ".",
+            "..",
+            "bad\u{0000}id",
+            " .. ",
+            "  .  ",
+        ];
         for id in cases {
             let conversation = Conversation {
                 id: id.to_string(),
@@ -515,7 +591,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(conversation_file_path(dir.path(), "sc").exists(), "body file must exist");
+        assert!(
+            conversation_file_path(dir.path(), "sc").exists(),
+            "body file must exist"
+        );
         assert!(
             conversation_meta_path(dir.path(), "sc").exists(),
             "sidecar file must exist after save"
@@ -653,8 +732,16 @@ mod tests {
             },
         );
         // stale temp files + unrelated files should not be listed or crash
-        fs::write(dir.join(format!("keep{JSON_SUFFIX}{TMP_SUFFIX}")), "garbage").unwrap();
-        fs::write(dir.join(format!("keep{META_SUFFIX}{TMP_SUFFIX}")), "garbage").unwrap();
+        fs::write(
+            dir.join(format!("keep{JSON_SUFFIX}{TMP_SUFFIX}")),
+            "garbage",
+        )
+        .unwrap();
+        fs::write(
+            dir.join(format!("keep{META_SUFFIX}{TMP_SUFFIX}")),
+            "garbage",
+        )
+        .unwrap();
         fs::write(dir.join("notes.md"), "nope").unwrap();
         let list = list_conversations_in_dir(dir.path()).unwrap();
         assert_eq!(list.len(), 1);
@@ -687,7 +774,11 @@ mod tests {
         .unwrap();
 
         let list = list_conversations_in_dir(dir.path()).unwrap();
-        assert_eq!(list.len(), 1, "list must find the conversation via the sidecar");
+        assert_eq!(
+            list.len(),
+            1,
+            "list must find the conversation via the sidecar"
+        );
         assert_eq!(list[0].id, "nb");
         assert_eq!(list[0].title, "NoBody");
         assert_eq!(list[0].preview, "preview text");
@@ -723,8 +814,12 @@ mod tests {
             },
         )
         .unwrap();
-        let body_size = fs::metadata(conversation_file_path(dir.path(), "big")).unwrap().len();
-        let meta_size = fs::metadata(conversation_meta_path(dir.path(), "big")).unwrap().len();
+        let body_size = fs::metadata(conversation_file_path(dir.path(), "big"))
+            .unwrap()
+            .len();
+        let meta_size = fs::metadata(conversation_meta_path(dir.path(), "big"))
+            .unwrap()
+            .len();
         assert!(
             meta_size < body_size / 1000,
             "sidecar ({meta_size}B) should be far smaller than body ({body_size}B)"
@@ -824,8 +919,14 @@ mod tests {
         assert!(conversation_meta_path(dir.path(), "d1").exists());
 
         delete_conversation_in_dir(dir.path(), "d1").unwrap();
-        assert!(!conversation_file_path(dir.path(), "d1").exists(), "body must be removed");
-        assert!(!conversation_meta_path(dir.path(), "d1").exists(), "sidecar must be removed");
+        assert!(
+            !conversation_file_path(dir.path(), "d1").exists(),
+            "body must be removed"
+        );
+        assert!(
+            !conversation_meta_path(dir.path(), "d1").exists(),
+            "sidecar must be removed"
+        );
         assert!(get_conversation_in_dir(dir.path(), "d1").is_err());
         assert!(list_conversations_in_dir(dir.path()).unwrap().is_empty());
     }
