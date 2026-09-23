@@ -378,6 +378,7 @@ async fn import_hf_model_inner(
     if files.is_empty() {
         return Err("no loadable model files found in the HuggingFace repo".to_string());
     }
+    preflight_cpu_import(&client, &model_ref, &files, token.as_deref()).await?;
     let total_bytes = sum_known_sizes(&files);
     fs::create_dir_all(&snapshot_dir).map_err(|error| error.to_string())?;
 
@@ -520,6 +521,89 @@ async fn fetch_hf_files(
     }
     files.sort_by(|a, b| a.rfilename.cmp(&b.rfilename));
     select_import_files(files, model_ref, projector_ref)
+}
+
+/// Resolve CPU capability before creating a snapshot or starting its file-download loop.
+/// A config request is small and lets renamed/fine-tuned safetensors use the same content
+/// identity as cache adoption; published packed GGUF has no config sidecar to inspect.
+async fn preflight_cpu_import(
+    client: &reqwest::Client,
+    model_ref: &HfModelRef,
+    files: &[HfSibling],
+    token: Option<&str>,
+) -> Result<(), String> {
+    if !cpu_build() {
+        return Ok(());
+    }
+    guard_cpu_import(model_ref, files, None, true)?;
+    if files
+        .iter()
+        .any(|file| file.rfilename.ends_with(".safetensors"))
+    {
+        let config = fetch_import_config(client, model_ref, token).await?;
+        return guard_cpu_import(model_ref, files, Some(&config), true);
+    }
+    guard_cpu_import(model_ref, files, None, true)
+}
+
+fn guard_cpu_import(
+    model_ref: &HfModelRef,
+    files: &[HfSibling],
+    config: Option<&serde_json::Value>,
+    cpu: bool,
+) -> Result<(), String> {
+    if !cpu {
+        return Ok(());
+    }
+    let unsupported_config = config.is_some_and(is_accelerator_only_config);
+    if unsupported_config
+        || (is_published_accelerator_only_repo(&model_ref.repo) && !files.is_empty())
+    {
+        return Err(CPU_MODEL_UNAVAILABLE.to_string());
+    }
+    Ok(())
+}
+
+fn is_published_accelerator_only_repo(repo: &str) -> bool {
+    [
+        "Qwen/Qwen3.8-27B",
+        "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit",
+        "prism-ml/Ternary-Bonsai-2-27B-gguf",
+    ]
+    .iter()
+    .any(|published| repo.eq_ignore_ascii_case(published))
+}
+
+async fn fetch_import_config(
+    client: &reqwest::Client,
+    model_ref: &HfModelRef,
+    token: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let url = format!(
+        "https://{}/{}/resolve/{}/config.json",
+        HF_HOST, model_ref.repo, model_ref.revision
+    );
+    let mut request = client.get(url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| format!("cannot inspect model config before import: {error}"))?;
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        if body.len().saturating_add(chunk.len()) > 1024 * 1024 {
+            return Err("model config is too large to inspect before import".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body)
+        .map_err(|error| format!("cannot inspect model config before import: {error}"))
 }
 
 /// Import one direct GGUF at a time. This prevents a repo that publishes PQ2, PTQ1, and projector
@@ -1022,6 +1106,10 @@ fn is_qwen38_parent_config(config: &serde_json::Value) -> bool {
         && text["vocab_size"] == 248320
 }
 
+fn is_accelerator_only_config(config: &serde_json::Value) -> bool {
+    is_qwen38_parent_config(config) || config["model_type"] == "prism_hadamard_qwen35"
+}
+
 fn is_accelerator_only_model(path: &Path) -> Result<bool, String> {
     if !path.exists() {
         return Ok(false);
@@ -1036,7 +1124,7 @@ fn is_accelerator_only_model(path: &Path) -> Result<bool, String> {
         serde_json::from_str(&body).map_err(|error| error.to_string())?;
     // This config is checked as soon as it is downloaded, before the sidecars arrive.
     // The exact Prism model type is sufficient for a protective CPU rejection.
-    Ok(is_qwen38_parent_config(&config) || config["model_type"] == "prism_hadamard_qwen35")
+    Ok(is_accelerator_only_config(&config))
 }
 
 /// Reads only GGUF metadata and, for Qwen35, its tensor directory. Weight bytes are never read.
@@ -1159,12 +1247,15 @@ fn is_packed_prism_gguf(path: &Path) -> bool {
 const CPU_MODEL_UNAVAILABLE: &str = "Qwen3.8-27B and Bonsai 2 inference require Apple MLX or Candle CUDA; this ChatWorks build uses Candle CPU";
 
 fn cpu_model_unavailable_reason(path: &Path) -> Result<Option<&'static str>, String> {
-    let cpu = cfg!(all(
+    cpu_model_unavailable_reason_for(path, cpu_build())
+}
+
+fn cpu_build() -> bool {
+    cfg!(all(
         not(all(target_os = "macos", target_arch = "aarch64")),
         feature = "cpu",
         not(feature = "cuda")
-    ));
-    cpu_model_unavailable_reason_for(path, cpu)
+    ))
 }
 
 fn cpu_model_unavailable_reason_for(
@@ -1917,6 +2008,75 @@ mod tests {
         assert!(cpu_model_unavailable_reason_for(root.path(), true)
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn cpu_import_preflight_rejects_before_any_selected_file_is_downloadable() {
+        let qwen = HfModelRef::parse("Qwen/Qwen3.8-27B").unwrap();
+        // The first selected file is the one that previously started downloading before
+        // config.json could reach the in-loop CPU guard.
+        let files = vec![
+            HfSibling {
+                rfilename: "chat_template.jinja".to_string(),
+                size: Some(8_700),
+            },
+            HfSibling {
+                rfilename: "config.json".to_string(),
+                size: Some(2_000),
+            },
+            HfSibling {
+                rfilename: "model-00001-of-00002.safetensors".to_string(),
+                size: Some(26_000_000_000),
+            },
+        ];
+        let parent = serde_json::json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "vision_config": {"model_type": "qwen3_5"},
+            "text_config": {"model_type": "qwen3_5_text", "hidden_size": 5120,
+                            "num_hidden_layers": 64, "vocab_size": 248320,
+                            "mtp_num_hidden_layers": 1}
+        });
+        assert_eq!(
+            guard_cpu_import(&qwen, &files, None, true).unwrap_err(),
+            CPU_MODEL_UNAVAILABLE
+        );
+        let alias = HfModelRef::parse("someone/renamed-qwen-parent").unwrap();
+        assert_eq!(
+            guard_cpu_import(&alias, &files, Some(&parent), true).unwrap_err(),
+            CPU_MODEL_UNAVAILABLE
+        );
+        assert!(guard_cpu_import(&alias, &files, Some(&parent), false).is_ok());
+
+        // A compatible flat text fine-tune must still reach the ordinary CPU import path.
+        assert!(guard_cpu_import(&alias, &files, Some(&parent["text_config"]), true).is_ok());
+        assert!(guard_cpu_import(
+            &alias,
+            &files,
+            Some(&serde_json::json!({"model_type": "prism_hadamard_qwen35"})),
+            true
+        )
+        .is_err());
+
+        let bonsai = HfModelRef::parse("https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/blob/main/Ternary-Bonsai-2-27B-PQ2_0.gguf").unwrap();
+        let packed = vec![HfSibling {
+            rfilename: "Ternary-Bonsai-2-27B-PQ2_0.gguf".to_string(),
+            size: Some(6_700_000_000),
+        }];
+        assert_eq!(
+            guard_cpu_import(&bonsai, &packed, None, true).unwrap_err(),
+            CPU_MODEL_UNAVAILABLE
+        );
+        assert!(guard_cpu_import(&bonsai, &packed, None, false).is_ok());
+        let ptq = vec![HfSibling {
+            rfilename: "Ternary-Bonsai-2-27B-PTQ1_0.gguf".to_string(),
+            size: Some(5_500_000_000),
+        }];
+        assert!(guard_cpu_import(&bonsai, &ptq, None, true).is_err());
+        let bonsai_mlx = HfModelRef::parse("prism-ml/Ternary-Bonsai-2-27B-mlx-2bit").unwrap();
+        assert!(guard_cpu_import(&bonsai_mlx, &files, None, true).is_err());
+        let ordinary = HfModelRef::parse("someone/ordinary-gguf").unwrap();
+        assert!(guard_cpu_import(&ordinary, &packed, None, true).is_ok());
     }
 
     #[test]
