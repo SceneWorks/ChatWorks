@@ -309,10 +309,16 @@ pub fn load_registered_model(
     Ok(status)
 }
 
-pub fn hf_token_status() -> HfTokenStatus {
-    HfTokenStatus {
-        present: read_hf_token().ok().flatten().is_some(),
-    }
+pub fn hf_token_status() -> Result<HfTokenStatus, String> {
+    hf_status_from_read(read_hf_token)
+}
+
+fn hf_status_from_read<E: std::fmt::Display>(
+    read: impl FnOnce() -> Result<Option<String>, E>,
+) -> Result<HfTokenStatus, String> {
+    Ok(HfTokenStatus {
+        present: read().map_err(|error| error.to_string())?.is_some(),
+    })
 }
 
 pub fn set_hf_token(request: SetHfTokenRequest) -> Result<HfTokenStatus, String> {
@@ -325,15 +331,14 @@ pub fn set_hf_token(request: SetHfTokenRequest) -> Result<HfTokenStatus, String>
     entry
         .set_password(token)
         .map_err(|error| error.to_string())?;
-    Ok(hf_token_status())
+    Ok(HfTokenStatus { present: true })
 }
 
 pub fn clear_hf_token() -> Result<HfTokenStatus, String> {
     let entry = crate::profile::credential(HF_KEYCHAIN_SERVICE, HF_KEYCHAIN_USER)
         .map_err(|error| error.to_string())?;
     match entry.delete_credential() {
-        Ok(()) => Ok(hf_token_status()),
-        Err(keyring::Error::NoEntry) => Ok(hf_token_status()),
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(HfTokenStatus { present: false }),
         Err(error) => Err(error.to_string()),
     }
 }
@@ -1657,7 +1662,13 @@ fn import_token(
         })
     } else {
         // Preserve the ordinary profile's existing Keychain/environment precedence.
-        Ok(scoped.ok().flatten().or_else(environment))
+        match scoped {
+            Ok(Some(token)) => Ok(Some(token)),
+            Ok(None) => Ok(environment()),
+            Err(error) => environment()
+                .ok_or_else(|| format!("could not read HuggingFace credential: {error}"))
+                .map(Some),
+        }
     }
 }
 
@@ -2650,6 +2661,12 @@ mod profile_import_tests {
     use super::*;
 
     #[test]
+    fn hf_status_keeps_read_errors_distinct_from_missing_tokens() {
+        assert!(!hf_status_from_read(|| Ok::<_, &str>(None)).unwrap().present);
+        assert!(hf_status_from_read(|| Err::<Option<String>, _>("denied")).is_err());
+    }
+
+    #[test]
     fn isolated_import_never_inherits_either_environment_credential() {
         for (primary, legacy) in [
             (Some("primary".to_string()), None),
@@ -2709,5 +2726,8 @@ mod profile_import_tests {
             .unwrap(),
             Some("environment".into())
         );
+        assert!(import_token(false, Err(keyring::Error::NoEntry), || None)
+            .unwrap_err()
+            .contains("could not read HuggingFace credential"));
     }
 }

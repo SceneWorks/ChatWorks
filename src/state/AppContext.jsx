@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 import { invoke } from "@tauri-apps/api/core";
 import { DEFAULT_ACCENT, Icon } from "@sceneworks/ui";
 import { generationParams } from "./generation.js";
+import { loadAppCredentialState } from "./credentials.js";
 
 export const AppContext = createContext(null);
 
@@ -66,18 +67,21 @@ export function AppProvider({ children }) {
   const [engineStatus, setEngineStatus] = useState(null);
   const [appSettings, setAppSettings] = useState(DEFAULT_APP_SETTINGS);
   const [apiAuthToken, setApiAuthToken] = useState(null);
+  const [apiAuthError, setApiAuthError] = useState(null);
 
   const refreshAppSettings = useCallback(() => {
-    return Promise.all([
-      invoke("load_app_settings"),
-      invoke("api_auth_token").catch(() => null),
-    ])
-      .then(([settings, token]) => {
+    return loadAppCredentialState(invoke)
+      .then(({ settings, token, error }) => {
         setAppSettings(settings);
         setApiAuthToken(token);
+        setApiAuthError(error);
         return settings;
       })
-      .catch(() => DEFAULT_APP_SETTINGS);
+      .catch((cause) => {
+        setApiAuthToken(null);
+        setApiAuthError(`Could not load settings: ${String(cause)}`);
+        return DEFAULT_APP_SETTINGS;
+      });
   }, []);
 
   const refreshEngineStatus = useCallback(() => {
@@ -130,9 +134,11 @@ export function AppProvider({ children }) {
       setAppSettings,
       apiAuthToken,
       setApiAuthToken,
+      apiAuthError,
+      setApiAuthError,
       refreshAppSettings,
     }),
-    [accent, activeView, apiAuthToken, appSettings, engineStatus, refreshAppSettings, refreshEngineStatus, theme],
+    [accent, activeView, apiAuthError, apiAuthToken, appSettings, engineStatus, refreshAppSettings, refreshEngineStatus, theme],
   );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
