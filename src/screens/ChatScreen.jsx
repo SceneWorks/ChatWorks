@@ -20,6 +20,7 @@ import { MessageActions } from "../components/MessageActions";
 import { MessageContent } from "../components/MessageContent";
 import { GenerationControls } from "../components/GenerationControls";
 import { DecodePathStatus } from "../components/DecodePathStatus.js";
+import { dismissSpeculativeNotice, enableSpeculativeAuto } from "../state/decodePath.js";
 import { formatToolArguments, ToolCallList, ToolResult } from "../components/ToolCallList";
 import { appendAttachmentPlaceholders, settleAttachment, registerPreparation } from "../state/attachments.js";
 import { applySamplingPreset } from "../state/generation.js";
@@ -41,7 +42,7 @@ function matchesHttpUrl(url) {
 }
 
 export function ChatScreen() {
-  const { engineStatus, refreshEngineStatus, appSettings, apiAuthToken } = useApp();
+  const { engineStatus, refreshEngineStatus, appSettings, updateAppSettings, apiAuthToken } = useApp();
   const { activeConversationId, persistConversation, startNewChat, busy, setBusy } = useConversations();
   const {
     messages,
@@ -316,8 +317,7 @@ export function ChatScreen() {
     } finally {
       abortRef.current = null;
       setBusy(false);
-      // Pick up the decode path the runtime reported for this generation (sc-24139).
-      refreshEngineStatus();
+      // The decode path of the finished generation arrives as an `engine://decode` push (sc-24139).
     }
   }
 
@@ -711,7 +711,15 @@ export function ChatScreen() {
         ) : null}
         <GenerationControls params={params} onChange={updateParam}
           capabilities={engineStatus?.loaded?.provider?.capabilities ?? {}} />
-        <DecodePathStatus engineStatus={engineStatus} />
+        <DecodePathStatus
+          engineStatus={engineStatus}
+          notice={{
+            appSettings,
+            executionBackend: engineStatus?.execution_backend,
+            onEnableAuto: () => updateAppSettings(enableSpeculativeAuto).catch((cause) => setError(String(cause))),
+            onDismiss: () => updateAppSettings(dismissSpeculativeNotice).catch((cause) => setError(String(cause))),
+          }}
+        />
         {toolsCapable ? (
           <label className="toggle-row">
             <input

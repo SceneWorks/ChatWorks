@@ -301,6 +301,12 @@ fn main() {
         .manage(MediaPreparations::default())
         .setup(|app| {
             let engine = EngineHandle::spawn();
+            // Every finished generation (desktop or API client) pushes the served model's decode
+            // status, so the decode-path view updates without polling (sc-24139).
+            let handle = app.handle().clone();
+            engine.observe_generations(move |status| {
+                let _ = handle.emit("engine://decode", status);
+            });
             let server = OpenAiServerHandle::new();
             let settings = load_app_settings_inner(app.handle()).unwrap_or_else(|error| {
                 eprintln!("ChatWorks settings failed to load: {error}");

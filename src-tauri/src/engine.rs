@@ -36,10 +36,15 @@ type Loader = fn(&LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>>;
 ///     cancellation while queued must pass their own flag through `generate_with_cancel`.
 type CancelSlot = Arc<Mutex<Option<CancelFlag>>>;
 
+/// Told about every generation the engine finishes — from the desktop UI or an API client alike —
+/// so the UI's decode-path status updates without polling (sc-24139).
+type GenerationObserver = Arc<Mutex<Option<Box<dyn Fn(DecodeStatusPayload) + Send>>>>;
+
 #[derive(Clone)]
 pub struct EngineHandle {
     tx: mpsc::Sender<EngineCommand>,
     cancel: CancelSlot,
+    observer: GenerationObserver,
 }
 
 impl EngineHandle {
@@ -51,11 +56,26 @@ impl EngineHandle {
         let (tx, rx) = mpsc::channel();
         let cancel: CancelSlot = Arc::new(Mutex::new(None));
         let actor_cancel = Arc::clone(&cancel);
+        let observer: GenerationObserver = Arc::new(Mutex::new(None));
+        let actor_observer = Arc::clone(&observer);
         thread::Builder::new()
             .name("chatworks-engine".to_string())
-            .spawn(move || EngineActor::new(loader, rx, actor_cancel).run())
+            .spawn(move || EngineActor::new(loader, rx, actor_cancel, actor_observer).run())
             .expect("failed to start ChatWorks engine thread");
-        Self { tx, cancel }
+        Self {
+            tx,
+            cancel,
+            observer,
+        }
+    }
+
+    /// Call `observer` with the served model's decode status after every generation the engine
+    /// finishes, whoever asked for it (the desktop UI or an OpenAI-API client). Replaces any
+    /// previous observer.
+    pub fn observe_generations(&self, observer: impl Fn(DecodeStatusPayload) + Send + 'static) {
+        if let Ok(mut slot) = self.observer.lock() {
+            *slot = Some(Box::new(observer));
+        }
     }
 
     pub fn load_model(&self, request: LoadModelRequest) -> EngineResult<EngineStatus> {
@@ -154,15 +174,22 @@ struct EngineActor {
     rx: mpsc::Receiver<EngineCommand>,
     loaded: Option<LoadedModel>,
     cancel: CancelSlot,
+    observer: GenerationObserver,
 }
 
 impl EngineActor {
-    fn new(loader: Loader, rx: mpsc::Receiver<EngineCommand>, cancel: CancelSlot) -> Self {
+    fn new(
+        loader: Loader,
+        rx: mpsc::Receiver<EngineCommand>,
+        cancel: CancelSlot,
+        observer: GenerationObserver,
+    ) -> Self {
         Self {
             loader,
             rx,
             loaded: None,
             cancel,
+            observer,
         }
     }
 
@@ -207,12 +234,12 @@ impl EngineActor {
             source: request.source,
             display_name: request.display_name,
             quantize: request.quantize,
-            cuda_graphs: request.cuda_graphs,
             projector_source: request.projector_source,
             provider,
             descriptor,
             load_report,
             last_decode: None,
+            decode_reported: None,
         });
         Ok(self.status())
     }
@@ -252,14 +279,24 @@ impl EngineActor {
         }
         // The status view shows the decode path of the most recent generation, as the runtime
         // measured it; a failed request clears it rather than leaving an older run's path readable
-        // as if it described this one (the runtime's own record behaves the same way).
+        // as if it described this one (the runtime's own record behaves the same way). A finished
+        // generation the runtime did not report on (MLX today) is recorded as such, so the view
+        // says "not reported" rather than promising a report that never comes.
         let decode = result
             .as_ref()
             .ok()
             .and_then(|output| output.decode.clone())
             .map(DecodeReportPayload::from);
+        let decode_reported = result.as_ref().ok().map(|_| decode.is_some());
         if let Some(loaded) = self.loaded.as_mut() {
             loaded.last_decode = decode.clone();
+            loaded.decode_reported = decode_reported;
+            let status = loaded.decode_status();
+            if let Ok(observer) = self.observer.lock() {
+                if let Some(observer) = observer.as_ref() {
+                    observer(status);
+                }
+            }
         }
         let output = result?;
         Ok(GenerateResponse {
@@ -300,12 +337,12 @@ struct LoadedModel {
     source: String,
     display_name: Option<String>,
     quantize: Option<QuantizeRequest>,
-    cuda_graphs: Option<bool>,
     projector_source: Option<String>,
     provider: Box<dyn TextLlm>,
     descriptor: TextLlmDescriptor,
     load_report: Option<LoadReportPayload>,
     last_decode: Option<DecodeReportPayload>,
+    decode_reported: Option<bool>,
 }
 
 impl LoadedModel {
@@ -317,11 +354,28 @@ impl LoadedModel {
                 .clone()
                 .unwrap_or_else(|| model_name(&self.source)),
             quantize: self.quantize,
-            cuda_graphs: self.cuda_graphs,
+            cuda_graphs: self.settled_cuda_graphs(),
             projector_source: self.projector_source.clone(),
             provider: ProviderSummary::from(self.descriptor.clone()),
             load_report: self.load_report.clone(),
             last_decode: self.last_decode.clone(),
+            decode_reported: self.decode_reported,
+        }
+    }
+
+    /// The CUDA-graph switch the runtime settled at load (its load report), never the request:
+    /// `None` where the runtime does not report one or the provider does not use the switch.
+    fn settled_cuda_graphs(&self) -> Option<bool> {
+        self.load_report
+            .as_ref()
+            .and_then(|report| report.cuda_graphs)
+    }
+
+    fn decode_status(&self) -> DecodeStatusPayload {
+        DecodeStatusPayload {
+            source: self.source.clone(),
+            last_decode: self.last_decode.clone(),
+            decode_reported: self.decode_reported,
         }
     }
 }
@@ -1510,7 +1564,8 @@ pub struct LoadedModelStatus {
     pub source: String,
     pub name: String,
     pub quantize: Option<QuantizeRequest>,
-    /// The CUDA-graph switch this model was loaded with (`None` = the runtime default).
+    /// The CUDA-graph switch the runtime settled at load, from its load report — not the request.
+    /// `None` where the runtime does not report one or the provider does not use the switch.
     pub cuda_graphs: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub projector_source: Option<String>,
@@ -1519,6 +1574,20 @@ pub struct LoadedModelStatus {
     pub load_report: Option<LoadReportPayload>,
     /// The decode path of the most recent generation, as the runtime measured it.
     pub last_decode: Option<DecodeReportPayload>,
+    /// Whether the most recent generation came with a decode report: `None` before the first
+    /// finished generation (or after a failed one), `Some(false)` when a generation finished and
+    /// the runtime reported nothing (a runtime or provider that does not measure its path).
+    pub decode_reported: Option<bool>,
+}
+
+/// The served model's decode status after a generation, pushed to the UI (the
+/// `engine://decode` event) for every finished generation, from the desktop or an API client.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DecodeStatusPayload {
+    /// The served model the generation ran on (`LoadedModelStatus::source`).
+    pub source: String,
+    pub last_decode: Option<DecodeReportPayload>,
+    pub decode_reported: Option<bool>,
 }
 
 /// One optional runtime feature: available, or unavailable with the runtime's reason.
@@ -1584,6 +1653,8 @@ pub struct LoadReportPayload {
     pub requested: Option<QuantizeRequest>,
     /// Resident projection kinds, as the runtime counted them after the load.
     pub projections: Vec<ProjectionReportPayload>,
+    /// The CUDA-graph switch the load settled (`None` where the provider does not use it).
+    pub cuda_graphs: Option<bool>,
 }
 impl From<LoadReport> for LoadReportPayload {
     fn from(value: LoadReport) -> Self {
@@ -1594,6 +1665,7 @@ impl From<LoadReport> for LoadReportPayload {
                 .into_iter()
                 .map(ProjectionReportPayload::from)
                 .collect(),
+            cuda_graphs: value.cuda_graphs,
         }
     }
 }
@@ -2287,9 +2359,12 @@ mod tests {
             );
             let loaded = status.loaded.unwrap();
             assert_eq!(loaded.quantize, quantize);
-            assert_eq!(loaded.cuda_graphs, cuda_graphs);
+            // The status carries the switch the runtime settled (its load report: the request,
+            // else the runtime's default, off), not the request itself.
+            assert_eq!(loaded.cuda_graphs, Some(cuda_graphs.unwrap_or(false)));
             let report = loaded.load_report.expect("the runtime's load report");
             assert_eq!(report.requested, quantize);
+            assert_eq!(report.cuda_graphs, loaded.cuda_graphs);
         }
         // The wire names of the three formats.
         assert_eq!(
@@ -2315,6 +2390,9 @@ mod tests {
     fn the_decode_path_reaches_the_response_and_the_model_status() {
         use crate::test_support::recording_loader;
         let engine = EngineHandle::spawn_with_loader(recording_loader);
+        let pushed: Arc<Mutex<Vec<DecodeStatusPayload>>> = Arc::default();
+        let observed = Arc::clone(&pushed);
+        engine.observe_generations(move |status| observed.lock().unwrap().push(status));
         let status = engine
             .load_model(LoadModelRequest {
                 source: "/tmp/sc-24139-status".to_string(),
@@ -2346,19 +2424,112 @@ mod tests {
         );
         assert_eq!(decode.nvfp4_projections.path, "mixed");
         let status = engine.status().unwrap();
-        assert_eq!(status.loaded.unwrap().last_decode, Some(decode));
+        let loaded = status.loaded.unwrap();
+        assert_eq!(loaded.last_decode, Some(decode.clone()));
+        assert_eq!(loaded.decode_reported, Some(true));
+        // The UI is told without polling: the finished generation's status was pushed.
+        assert_eq!(
+            pushed.lock().unwrap().last(),
+            Some(&DecodeStatusPayload {
+                source: "/tmp/sc-24139-status".to_string(),
+                last_decode: Some(decode),
+                decode_reported: Some(true),
+            })
+        );
 
         // A failed request clears the status' decode path rather than leaving the previous one.
         let mut failing = hello_request();
         failing.max_new_tokens = 9_999;
         assert!(engine.generate(failing, |_| {}).is_err());
-        assert!(engine
-            .status()
+        let loaded = engine.status().unwrap().loaded.unwrap();
+        assert!(loaded.last_decode.is_none());
+        assert_eq!(loaded.decode_reported, None, "no generation finished");
+        assert_eq!(
+            pushed.lock().unwrap().len(),
+            2,
+            "the failure was pushed too"
+        );
+        assert_eq!(pushed.lock().unwrap()[1].last_decode, None);
+    }
+
+    /// sc-24139: a runtime/provider that never reports its decode path (MLX today) is told apart
+    /// from "not measured yet" once a generation finishes, and a provider that does not take the
+    /// CUDA-graph switch shows no settled switch even when one was requested.
+    #[test]
+    fn a_generation_without_a_report_is_recorded_as_not_reported() {
+        let engine = EngineHandle::spawn_with_loader(crate::test_support::fake_loader);
+        let loaded = engine
+            .load_model(LoadModelRequest {
+                source: "/tmp/sc-24139-unreported".to_string(),
+                display_name: None,
+                quantize: None,
+                projector_source: None,
+                cuda_graphs: Some(true),
+            })
             .unwrap()
             .loaded
-            .unwrap()
-            .last_decode
-            .is_none());
+            .unwrap();
+        assert_eq!(loaded.decode_reported, None, "no generation yet");
+        assert_eq!(
+            loaded.cuda_graphs, None,
+            "the request is not the settled switch"
+        );
+        let output = engine.generate(hello_request(), |_| {}).unwrap();
+        assert!(output.decode.is_none());
+        let loaded = engine.status().unwrap().loaded.unwrap();
+        assert_eq!(loaded.decode_reported, Some(false));
+        assert!(loaded.last_decode.is_none());
+    }
+
+    /// The Rust → UI wire shape of everything the decode-path view reads (sc-24139): an
+    /// `EngineStatus` built from runtime reports through the same conversions the engine uses,
+    /// serialized, must equal `tests/engine-status-wire.json` — the fixture
+    /// `tests/decode-path.test.mjs` renders the view from.
+    #[test]
+    fn engine_status_wire_shape_matches_the_ui_fixture() {
+        use crate::core_llm::{BackendCapabilities, FeatureSupport};
+        let engine = EngineHandle::spawn_with_loader(crate::test_support::recording_loader);
+        engine
+            .load_model(LoadModelRequest {
+                source: "/models/qwen3.8-27b".to_string(),
+                display_name: Some("Qwen3.8-27B NVFP4".to_string()),
+                quantize: Some(QuantizeRequest::Nvfp4),
+                projector_source: None,
+                cuda_graphs: Some(true),
+            })
+            .unwrap();
+        engine.generate(hello_request(), |_| {}).unwrap();
+        let loaded = engine.status().unwrap().loaded.unwrap();
+        let status = EngineStatus {
+            loaded: Some(loaded),
+            execution_backend: "candle-cuda",
+            backend_capabilities: BackendCapabilitiesPayload::from(&BackendCapabilities {
+                backend: "candle-cuda".to_string(),
+                device: "cuda:0".to_string(),
+                compute_capability: Some((12, 0)),
+                nvfp4: FeatureSupport::available(),
+                cuda_graphs: FeatureSupport::available(),
+            }),
+            providers: Vec::new(),
+        };
+        let wire = serde_json::to_value(&status).unwrap();
+        let loaded = &wire["loaded"];
+        // Exactly the fields `src/state/decodePath.js` reads.
+        let read_by_the_view = serde_json::json!({
+            "execution_backend": wire["execution_backend"],
+            "backend_capabilities": wire["backend_capabilities"],
+            "loaded": {
+                "source": loaded["source"],
+                "quantize": loaded["quantize"],
+                "cuda_graphs": loaded["cuda_graphs"],
+                "load_report": loaded["load_report"],
+                "last_decode": loaded["last_decode"],
+                "decode_reported": loaded["decode_reported"],
+            },
+        });
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../tests/engine-status-wire.json")).unwrap();
+        assert_eq!(read_by_the_view, fixture);
     }
 
     /// E6 (sc-24139): ChatWorks keeps no memory estimator of its own; the runtime's load

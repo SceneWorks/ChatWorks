@@ -202,6 +202,13 @@ pub fn adopt_cached_hf_model(
         request.quantize,
         crate::inference_runtime::backend_capabilities(),
     )?;
+    // The host can serve NVFP4 — can this snapshot? Asked of the runtime before the entry is
+    // registered, so a checkpoint whose provider refuses NVFP4 never becomes an unloadable entry.
+    ensure_snapshot_weight_format_supported(
+        request.quantize,
+        Path::new(&candidate.local_path),
+        crate::inference_runtime::nvfp4_support,
+    )?;
     let model_ref = HfModelRef {
         repo: candidate.repo.clone(),
         revision: candidate.revision.clone(),
@@ -295,20 +302,17 @@ pub fn load_registered_model(
         crate::inference_runtime::backend_capabilities(),
     )?;
     // The CUDA-graph switch is a load option (the CUDA runtime settles the model's stream at
-    // load), so the saved setting is read here and a change applies on the next load.
-    let cuda_graphs_setting = crate::app_settings::load_app_settings(app)
-        .map(|settings| settings.runtime.cuda_graphs)
-        .unwrap_or(false);
-    let status = engine.load_model(LoadModelRequest {
-        source: entry.local_path.clone(),
-        display_name: Some(entry.name.clone()),
-        quantize: entry.quantize,
-        projector_source: projector_source.clone(),
-        cuda_graphs: load_cuda_graphs(
-            cuda_graphs_setting,
-            crate::inference_runtime::backend_capabilities(),
-        ),
+    // load), so the saved setting is read here and a change applies on the next load. A settings
+    // file that cannot be read is an error, never a silent "graphs off".
+    let settings = crate::app_settings::load_app_settings(app).map_err(|error| {
+        format!("settings could not be read, so the saved CUDA-graph setting is unknown: {error}")
     })?;
+    let status = engine.load_model(load_request_for(
+        &entry,
+        projector_source.clone(),
+        &settings,
+        crate::inference_runtime::backend_capabilities(),
+    ))?;
     // A present empty string from the picker is an intentional "Text only" selection. Keep it
     // distinct from an omitted command argument, which preserves an existing association.
     if requested_projector.is_some() {
@@ -360,6 +364,11 @@ async fn import_hf_model_inner(
         request.quantize,
         crate::inference_runtime::backend_capabilities(),
     )?;
+    // A file-specific import is one GGUF, which keeps its stored encoding: refuse a load-time
+    // format now rather than after downloading it.
+    if model_ref.file_name.is_some() {
+        validate_quantize_request("gguf", None, request.quantize)?;
+    }
     let data_dir = app_data_dir(app)?;
     let snapshots_dir = data_dir.join("models").join("snapshots");
     let snapshot_dir = snapshots_dir.join(snapshot_dir_name(&model_ref));
@@ -393,6 +402,10 @@ async fn import_hf_model_inner(
     if files.is_empty() {
         return Err("no loadable model files found in the HuggingFace repo".to_string());
     }
+    // `config.json` comes first so the runtime can answer per-snapshot questions (NVFP4) before a
+    // single weight shard is fetched.
+    let files = config_first(files);
+    ensure_snapshot_config_listed(&files, request.quantize)?;
     let total_bytes = sum_known_sizes(&files);
     fs::create_dir_all(&snapshot_dir).map_err(|error| error.to_string())?;
 
@@ -420,13 +433,23 @@ async fn import_hf_model_inner(
                     total_bytes,
                 },
             );
-            validate_config_file_if_available(&snapshot_dir, &file.rfilename)?;
+            check_downloaded_file(
+                &snapshot_dir,
+                &file.rfilename,
+                request.quantize,
+                crate::inference_runtime::nvfp4_support,
+            )?;
             continue;
         }
         download
             .download_file(file, &target, &mut downloaded_bytes)
             .await?;
-        validate_config_file_if_available(&snapshot_dir, &file.rfilename)?;
+        check_downloaded_file(
+            &snapshot_dir,
+            &file.rfilename,
+            request.quantize,
+            crate::inference_runtime::nvfp4_support,
+        )?;
     }
 
     emit_progress(
@@ -640,6 +663,76 @@ pub(crate) fn ensure_weight_format_supported(
     Ok(())
 }
 
+/// The per-snapshot half of [`ensure_weight_format_supported`] (sc-24139): the host can serve NVFP4,
+/// but can the provider the runtime would load `source` with? `probe` is the runtime's own
+/// weightless answer ([`crate::inference_runtime::nvfp4_support`]: that provider's load gates,
+/// then the device gate), so a snapshot the load would refuse is refused here with the load's
+/// reason — before it is registered, and on import before its weight shards are downloaded.
+/// ChatWorks holds no model-family rule of its own.
+pub(crate) fn ensure_snapshot_weight_format_supported(
+    quantize: Option<QuantizeRequest>,
+    source: &Path,
+    probe: impl FnOnce(&LoadSpec) -> crate::core_llm::FeatureSupport,
+) -> Result<(), String> {
+    if quantize != Some(QuantizeRequest::Nvfp4) {
+        return Ok(());
+    }
+    let support = probe(&LoadSpec {
+        source: source.to_string_lossy().to_string(),
+        projector_source: None,
+        quantize: Some(QuantizeRequest::Nvfp4.into()),
+        cuda_graphs: None,
+    });
+    if support.supported {
+        return Ok(());
+    }
+    Err(support.reason.unwrap_or_else(|| {
+        "nvfp4: the inference runtime cannot serve NVFP4 for this snapshot".to_string()
+    }))
+}
+
+/// The import-download order: `config.json` first (the rest keep their order), so the snapshot's
+/// per-model checks run before any weight shard is fetched.
+fn config_first(mut files: Vec<HfSibling>) -> Vec<HfSibling> {
+    files.sort_by_key(|file| file.rfilename != "config.json");
+    files
+}
+
+/// NVFP4 quantizes a dense safetensors snapshot, which the runtime identifies by its
+/// `config.json`; a repo without one (a GGUF) cannot be imported as NVFP4, and is refused before
+/// any download.
+fn ensure_snapshot_config_listed(
+    files: &[HfSibling],
+    quantize: Option<QuantizeRequest>,
+) -> Result<(), String> {
+    if quantize == Some(QuantizeRequest::Nvfp4)
+        && !files.iter().any(|file| file.rfilename == "config.json")
+    {
+        return Err(
+            "nvfp4: NVFP4 quantizes a dense safetensors snapshot, and this repository lists no \
+             config.json"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Checks run as each import file lands. Once `config.json` is on disk — the first file fetched —
+/// the snapshot's config is validated and, for an NVFP4 import, the runtime is asked whether it
+/// can serve this snapshot as NVFP4, so a refusal stops the import before any weight shard.
+fn check_downloaded_file(
+    snapshot_dir: &Path,
+    file_name: &str,
+    quantize: Option<QuantizeRequest>,
+    probe: impl FnOnce(&LoadSpec) -> crate::core_llm::FeatureSupport,
+) -> Result<(), String> {
+    validate_config_file_if_available(snapshot_dir, file_name)?;
+    if file_name == "config.json" {
+        ensure_snapshot_weight_format_supported(quantize, snapshot_dir, probe)?;
+    }
+    Ok(())
+}
+
 /// The runtime load's CUDA-graph switch for the saved setting: sent explicitly (so the setting,
 /// not an environment default, decides) where the runtime honours the switch, and omitted where
 /// it reports the switch unavailable.
@@ -648,6 +741,24 @@ pub(crate) fn load_cuda_graphs(
     capabilities: &crate::core_llm::BackendCapabilities,
 ) -> Option<bool> {
     capabilities.cuda_graphs.supported.then_some(setting)
+}
+
+/// The engine load request for a registered entry under the saved settings (sc-24139): the
+/// entry's weight format and projector, and the saved CUDA-graph setting as the runtime's
+/// load-time switch where the runtime honours it ([`load_cuda_graphs`]).
+pub(crate) fn load_request_for(
+    entry: &ModelEntry,
+    projector_source: Option<String>,
+    settings: &crate::app_settings::AppSettings,
+    capabilities: &crate::core_llm::BackendCapabilities,
+) -> LoadModelRequest {
+    LoadModelRequest {
+        source: entry.local_path.clone(),
+        display_name: Some(entry.name.clone()),
+        quantize: entry.quantize,
+        projector_source,
+        cuda_graphs: load_cuda_graphs(settings.runtime.cuda_graphs, capabilities),
+    }
 }
 
 fn validate_quantize_request(
@@ -1836,6 +1947,194 @@ mod tests {
         );
         assert_eq!(load_cuda_graphs(true, &capabilities(true, false)), None);
         assert_eq!(load_cuda_graphs(false, &capabilities(true, false)), None);
+    }
+
+    /// A StarVector-1B snapshot (`config.json` only): a family the runtime refuses NVFP4 for by
+    /// name, on every Candle build.
+    fn starvector_1b_snapshot(label: &str) -> TempDir {
+        let dir = TempDir::new(label);
+        fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({
+                "model_type": "starvector",
+                "starcoder_model_name": "bigcode/starcoderbase-1b",
+                "image_encoder_type": "clip",
+                "image_size": 224,
+                "hidden_size": 2048,
+                "vocab_size": 49156,
+                "max_position_embeddings": 8192,
+                "num_hidden_layers": 24,
+                "num_attention_heads": 16,
+                "multi_query": true
+            })
+            .to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// Major (sc-24139): the host capability is not enough — NVFP4 is asked of the runtime for the
+    /// snapshot itself, and the runtime's refusal (the load's own) stops adopt/import. Other
+    /// formats never ask.
+    #[test]
+    fn nvfp4_is_asked_of_the_runtime_per_snapshot() {
+        use crate::core_llm::{FeatureSupport, Quantize};
+        let asked = std::cell::RefCell::new(None);
+        let error = ensure_snapshot_weight_format_supported(
+            Some(QuantizeRequest::Nvfp4),
+            Path::new("/snapshots/llava"),
+            |spec: &LoadSpec| {
+                *asked.borrow_mut() = Some((spec.source.clone(), spec.quantize));
+                FeatureSupport::unavailable(
+                    "nvfp4: NVFP4 projections are served for the qwen3_5 family only, not LLaVA",
+                )
+            },
+        )
+        .unwrap_err();
+        assert!(error.ends_with("not LLaVA"), "{error}");
+        assert_eq!(
+            asked.into_inner(),
+            Some((
+                Path::new("/snapshots/llava").to_string_lossy().to_string(),
+                Some(Quantize::Nvfp4)
+            ))
+        );
+        assert!(ensure_snapshot_weight_format_supported(
+            Some(QuantizeRequest::Nvfp4),
+            Path::new("/snapshots/qwen"),
+            |_: &LoadSpec| FeatureSupport::available(),
+        )
+        .is_ok());
+        for other in [None, Some(QuantizeRequest::Q4), Some(QuantizeRequest::Q8)] {
+            assert!(ensure_snapshot_weight_format_supported(
+                other,
+                Path::new("/snapshots/any"),
+                |_: &LoadSpec| -> FeatureSupport { panic!("{other:?} asked the NVFP4 probe") },
+            )
+            .is_ok());
+        }
+
+        // The linked runtime answers from the provider's own load gate.
+        let dir = starvector_1b_snapshot("registry-nvfp4-starvector");
+        let error = ensure_snapshot_weight_format_supported(
+            Some(QuantizeRequest::Nvfp4),
+            dir.path(),
+            crate::inference_runtime::nvfp4_support,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("nvfp4: "), "{error}");
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        assert!(error.contains("StarVector-1B"), "{error}");
+    }
+
+    /// Major (sc-24139): an NVFP4 import fetches `config.json` first and stops on the runtime's
+    /// refusal as soon as it lands — before any weight shard.
+    #[test]
+    fn an_nvfp4_import_is_refused_once_config_json_lands() {
+        let sibling = |name: &str| HfSibling {
+            rfilename: name.to_string(),
+            size: None,
+        };
+        let order: Vec<String> = config_first(vec![
+            sibling("added_tokens.json"),
+            sibling("chat_template.jinja"),
+            sibling("config.json"),
+            sibling("consolidated.safetensors"),
+        ])
+        .into_iter()
+        .map(|file| file.rfilename)
+        .collect();
+        assert_eq!(
+            order,
+            [
+                "config.json",
+                "added_tokens.json",
+                "chat_template.jinja",
+                "consolidated.safetensors"
+            ]
+        );
+        // A repository without a config.json cannot be an NVFP4 import.
+        let gguf_only = [sibling("model-Q4_K_M.gguf")];
+        assert!(
+            ensure_snapshot_config_listed(&gguf_only, Some(QuantizeRequest::Nvfp4))
+                .unwrap_err()
+                .starts_with("nvfp4: ")
+        );
+        assert!(ensure_snapshot_config_listed(&gguf_only, None).is_ok());
+
+        let dir = starvector_1b_snapshot("registry-nvfp4-import");
+        let refuse = |_: &LoadSpec| {
+            crate::core_llm::FeatureSupport::unavailable("nvfp4: not for this snapshot")
+        };
+        assert_eq!(
+            check_downloaded_file(
+                dir.path(),
+                "config.json",
+                Some(QuantizeRequest::Nvfp4),
+                refuse
+            )
+            .unwrap_err(),
+            "nvfp4: not for this snapshot"
+        );
+        // A shard landing never asks (the question was settled when config.json landed).
+        assert!(check_downloaded_file(
+            dir.path(),
+            "model.safetensors",
+            Some(QuantizeRequest::Nvfp4),
+            |_: &LoadSpec| -> crate::core_llm::FeatureSupport { panic!("asked for a shard") },
+        )
+        .is_ok());
+    }
+
+    /// Minor (sc-24139): the load request for a registered entry carries its weight format and
+    /// projector, and the saved CUDA-graph setting exactly where the runtime honours the switch.
+    #[test]
+    fn the_load_request_follows_the_entry_and_the_saved_settings() {
+        let model_ref = HfModelRef::parse("Qwen/Qwen3.8-27B").unwrap();
+        let entry = ModelEntry {
+            id: model_id(&model_ref, Some(QuantizeRequest::Nvfp4)),
+            name: "Qwen3.8-27B NVFP4".to_string(),
+            repo: model_ref.repo.clone(),
+            revision: model_ref.revision.clone(),
+            source_url: model_ref.source_url(),
+            local_path: "/snapshots/qwen3.8-27b".to_string(),
+            quantize: Some(QuantizeRequest::Nvfp4),
+            imported_at: 1,
+            file_count: 3,
+            size_bytes: None,
+            format: default_model_format(),
+            pack: None,
+            provider_id: None,
+            projector_source: None,
+            projector_sources: Vec::new(),
+        };
+        let mut settings = crate::app_settings::AppSettings::default();
+        settings.runtime.cuda_graphs = true;
+        let request = load_request_for(
+            &entry,
+            Some("/snapshots/mmproj.gguf".to_string()),
+            &settings,
+            &capabilities(true, true),
+        );
+        assert_eq!(request.source, "/snapshots/qwen3.8-27b");
+        assert_eq!(request.display_name.as_deref(), Some("Qwen3.8-27B NVFP4"));
+        assert_eq!(request.quantize, Some(QuantizeRequest::Nvfp4));
+        assert_eq!(
+            request.projector_source.as_deref(),
+            Some("/snapshots/mmproj.gguf")
+        );
+        assert_eq!(request.cuda_graphs, Some(true));
+        settings.runtime.cuda_graphs = false;
+        assert_eq!(
+            load_request_for(&entry, None, &settings, &capabilities(true, true)).cuda_graphs,
+            Some(false)
+        );
+        // Where the runtime reports the switch unavailable it is not sent at all.
+        settings.runtime.cuda_graphs = true;
+        assert_eq!(
+            load_request_for(&entry, None, &settings, &capabilities(true, false)).cuda_graphs,
+            None
+        );
     }
 
     #[test]

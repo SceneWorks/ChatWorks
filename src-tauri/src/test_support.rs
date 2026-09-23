@@ -92,6 +92,8 @@ pub fn recording_loader(spec: &LoadSpec) -> crate::core_llm::Result<Box<dyn Text
             params: 1_000,
             resident_bytes: 562,
         }],
+        // Settled like the Candle runtime: the request, else its default (off).
+        cuda_graphs: Some(spec.cuda_graphs.unwrap_or(false)),
     });
     Ok(Box::new(provider))
 }

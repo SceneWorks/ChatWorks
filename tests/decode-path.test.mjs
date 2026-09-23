@@ -4,13 +4,22 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import React from "react";
 import ReactDOMServer from "react-dom/server";
+import { readFile } from "node:fs/promises";
 import {
+  applyDecodeEvent,
   cudaGraphsControl,
   decodePathRows,
+  dismissSpeculativeNotice,
+  enableSpeculativeAuto,
+  graphsReloadPending,
+  LAST_GENERATION,
+  NVFP4_LOSSY_NOTE,
   selectedWeightFormat,
+  serveAction,
+  speculativeNotice,
   weightFormatOptions,
 } from "../src/state/decodePath.js";
-import { DecodePathStatus } from "../src/components/DecodePathStatus.js";
+import { DecodePathStatus, SpeculativeNotice } from "../src/components/DecodePathStatus.js";
 import { modelSubtitle } from "../src/state/models.js";
 
 const SM120 = {
@@ -125,7 +134,7 @@ test("the status rows name the proposer, graph fallback, NVFP4 path, and sampler
   assert.equal(rows.proposer.value, "mtp · 3 drafts");
   assert.equal(rows.proposer.detail, "Accepted 6 of 9 drafts in 5 forwards");
   assert.equal(rows.cuda_graphs.value, "eager");
-  assert.equal(rows.cuda_graphs.detail, "fallback: deltanet_state_unstable");
+  assert.equal(rows.cuda_graphs.detail, "0 captured · fallback: deltanet_state_unstable");
   assert.equal(rows.nvfp4.value, "mixed");
   assert.equal(rows.nvfp4.detail, "fallback: rows");
   assert.equal(rows.sampler.value, "device");
@@ -162,10 +171,25 @@ test("an Auto request without an MTP head, graphs off, and a host sampler read a
 });
 
 test("before a generation the view says the path is not measured yet", () => {
-  const rows = decodePathRows(status(CPU, { quantize: "q8", cuda_graphs: null, load_report: null, last_decode: null }));
-  assert.deepEqual(rows.map((row) => row.key), ["backend", "weights", "decode"]);
-  assert.equal(rows[2].value, "not measured yet");
+  const rows = decodePathRows(status(CPU, {
+    quantize: "q8", cuda_graphs: null, load_report: null, last_decode: null, decode_reported: null,
+  }));
+  assert.deepEqual(rows.map((row) => row.key), ["backend", "weights", "graph_switch", "decode"]);
+  assert.equal(rows[3].value, "not measured yet");
+  // It promises nothing a runtime may never deliver.
+  assert.doesNotMatch(rows[3].detail, /after the next generation/);
+  assert.match(rows[3].detail, /where the runtime reports it/);
   assert.deepEqual(decodePathRows(status(MLX, null)).map((row) => row.key), ["backend"]);
+});
+
+test("a finished generation the runtime did not report on reads 'not reported', not 'not measured yet'", () => {
+  const rows = decodePathRows(status(MLX, {
+    quantize: null, cuda_graphs: null, load_report: null, last_decode: null, decode_reported: false,
+  }));
+  const decode = rows.find((row) => row.key === "decode");
+  assert.equal(decode.value, "not reported");
+  assert.match(decode.detail, /does not report its decode path/);
+  assert.equal(decode.section, LAST_GENERATION);
 });
 
 test("the decode-path status view renders every reported path", () => {
@@ -193,4 +217,152 @@ test("the decode-path status view renders every reported path", () => {
     assert.ok(html.includes(text), `missing ${text} in ${html}`);
   }
   assert.ok(html.includes('data-row="cuda_graphs"'));
+});
+
+test("NVFP4 is labelled lossy in the picker itself, with the measured perplexity cost visible", () => {
+  for (const caps of [SM120, SM89, CPU]) {
+    const nvfp4 = weightFormatOptions(caps).find((option) => option.id === "nvfp4");
+    assert.match(nvfp4.label, /lossy/i, "the label, not a tooltip, says lossy");
+    assert.equal(nvfp4.note, NVFP4_LOSSY_NOTE);
+  }
+  assert.ok(NVFP4_LOSSY_NOTE.includes("+7.37% perplexity"), NVFP4_LOSSY_NOTE);
+  assert.ok(NVFP4_LOSSY_NOTE.includes("never preselected"), NVFP4_LOSSY_NOTE);
+  // Never the default: the picker starts at dense and every other format carries no lossy note.
+  assert.equal(selectedWeightFormat(weightFormatOptions(SM120), undefined).id, "dense");
+  for (const option of weightFormatOptions(SM120).filter((item) => item.id !== "nvfp4")) {
+    assert.equal(option.note, null, option.id);
+  }
+});
+
+test("the pending reload compares the SAVED setting with the switch the load settled, and the served row offers Reload", () => {
+  // Saved on, served model settled off: reload pending, and the served row can act on it.
+  assert.equal(graphsReloadPending(SM120, true, { cuda_graphs: false }), true);
+  assert.deepEqual(serveAction(true, true), { label: "Reload", disabled: false });
+  assert.match(cudaGraphsControl(SM120, true, { cuda_graphs: false }).note, /reload it from Models/);
+  // Saved matches the settled switch: nothing to do.
+  assert.equal(graphsReloadPending(SM120, false, { cuda_graphs: false }), false);
+  assert.deepEqual(serveAction(true, false), { label: "Serving", disabled: true });
+  assert.deepEqual(serveAction(false, true), { label: "Serve", disabled: false });
+  // A provider that does not take the switch (settled null) never asks for a reload.
+  assert.equal(graphsReloadPending(SM120, true, { cuda_graphs: null }), false);
+  // Where the runtime reports the switch unavailable, neither does anything else.
+  assert.equal(graphsReloadPending(CPU, true, { cuda_graphs: false }), false);
+});
+
+test("the view shows the decode implementation, fused primitives, graphs captured, and the settled switch", () => {
+  const loaded = {
+    quantize: "nvfp4",
+    cuda_graphs: true,
+    load_report: { requested: "nvfp4", projections: [], cuda_graphs: true },
+    last_decode: {
+      ...DECODE,
+      cuda_graphs: { ...DECODE.cuda_graphs, path: "mixed", replayed: 7, eager: 2, captured: 3 },
+      fused_primitives: { path: "mixed", reason: "dtype" },
+    },
+    decode_reported: true,
+  };
+  const rows = Object.fromEntries(decodePathRows(status(SM120, loaded)).map((row) => [row.key, row]));
+  assert.equal(rows.implementation.label, "Decode implementation");
+  assert.equal(rows.implementation.value, "mtp");
+  assert.equal(rows.fused.label, "Fused primitives");
+  assert.equal(rows.fused.value, "mixed");
+  assert.equal(rows.fused.detail, "fallback: dtype");
+  assert.equal(rows.cuda_graphs.value, "mixed (7 replayed, 2 eager)");
+  assert.equal(rows.cuda_graphs.detail, "3 captured · fallback: deltanet_state_unstable");
+  assert.equal(rows.graph_switch.value, "on");
+  const unused = decodePathRows(status(SM120, { ...loaded, cuda_graphs: null }))
+    .find((row) => row.key === "graph_switch");
+  assert.equal(unused.value, "not used");
+  // Every per-generation row is labelled as the last generation; the host and load rows are not.
+  for (const row of Object.values(rows)) {
+    const perGeneration = !["backend", "weights", "graph_switch"].includes(row.key);
+    assert.equal(row.section, perGeneration ? LAST_GENERATION : null, row.key);
+  }
+});
+
+test("the Rust wire shape renders: the view reads tests/engine-status-wire.json as the engine serializes it", async () => {
+  const wire = JSON.parse(await readFile(new URL("engine-status-wire.json", import.meta.url)));
+  const rows = Object.fromEntries(decodePathRows(wire).map((row) => [row.key, row]));
+  assert.equal(rows.backend.value, "candle-cuda · cuda:0 · sm_120");
+  assert.equal(rows.weights.value, "NVFP4");
+  assert.equal(rows.weights.detail, "Resident projections: nvfp4 × 448");
+  assert.equal(rows.graph_switch.value, "on");
+  assert.equal(rows.implementation.value, "mtp");
+  assert.equal(rows.proposer.value, "mtp · 2 drafts");
+  assert.equal(rows.proposer.detail, "Accepted 3 of 4 drafts in 2 forwards");
+  assert.equal(rows.cuda_graphs.value, "eager");
+  assert.equal(rows.cuda_graphs.detail, "0 captured · fallback: deltanet_state_unstable");
+  assert.equal(rows.nvfp4.value, "mixed");
+  assert.equal(rows.nvfp4.detail, "fallback: rows");
+  assert.equal(rows.fused.value, "fused");
+  assert.equal(rows.sampler.value, "device");
+  assert.equal(rows.kv_cache.value, "static · gqa attention");
+  const html = ReactDOMServer.renderToStaticMarkup(React.createElement(DecodePathStatus, { engineStatus: wire }));
+  assert.ok(html.includes(`<p class="decode-path-section">${LAST_GENERATION}</p>`), html);
+});
+
+test("a pushed decode status updates the served model without polling, and only that model", () => {
+  const before = status(SM120, {
+    source: "/m/a", quantize: null, cuda_graphs: false, load_report: null, last_decode: null, decode_reported: null,
+  });
+  const pushed = applyDecodeEvent(before, { source: "/m/a", last_decode: DECODE, decode_reported: true });
+  assert.deepEqual(pushed.loaded.last_decode, DECODE);
+  assert.equal(pushed.loaded.decode_reported, true);
+  assert.equal(before.loaded.last_decode, null, "the previous status is not mutated");
+  // A push for another model (the served model changed meanwhile) is ignored.
+  assert.equal(applyDecodeEvent(before, { source: "/m/b", last_decode: DECODE, decode_reported: true }), before);
+  assert.equal(applyDecodeEvent(null, { source: "/m/a" }), null);
+  // An unreported generation lands as such.
+  const unreported = applyDecodeEvent(before, { source: "/m/a", last_decode: null, decode_reported: false });
+  assert.equal(decodePathRows(unreported).find((row) => row.key === "decode").value, "not reported");
+});
+
+const CARRIED_OVER = {
+  sampling: { mtpMode: "off" },
+  notices: { speculativeOffCarriedOver: true, speculativeNoticeDismissed: false },
+};
+
+test("the speculative notice shows once for a carried-over off on CUDA, and hides otherwise", () => {
+  const shown = speculativeNotice(CARRIED_OVER, "candle-cuda");
+  assert.equal(shown.show, true);
+  assert.equal(shown.message, "Speculative decoding is available — turn on Auto");
+  assert.equal(shown.actionLabel, "Turn on Auto");
+  // Hidden: another backend, an off that was not carried over, a mode other than off, dismissed.
+  assert.equal(speculativeNotice(CARRIED_OVER, "candle-cpu").show, false);
+  assert.equal(speculativeNotice(CARRIED_OVER, "mlx").show, false);
+  assert.equal(
+    speculativeNotice({ ...CARRIED_OVER, notices: { speculativeOffCarriedOver: false } }, "candle-cuda").show,
+    false,
+  );
+  assert.equal(speculativeNotice({ ...CARRIED_OVER, sampling: { mtpMode: "auto" } }, "candle-cuda").show, false);
+  assert.equal(speculativeNotice(undefined, "candle-cuda").show, false);
+  assert.equal(speculativeNotice(dismissSpeculativeNotice(CARRIED_OVER), "candle-cuda").show, false);
+});
+
+test("the notice's one-click action turns on Auto; dismissing persists without touching the saved mode", () => {
+  const auto = enableSpeculativeAuto(CARRIED_OVER);
+  assert.equal(auto.sampling.mtpMode, "auto");
+  assert.equal(auto.notices.speculativeOffCarriedOver, false);
+  assert.equal(speculativeNotice(auto, "candle-cuda").show, false);
+  const dismissed = dismissSpeculativeNotice(CARRIED_OVER);
+  assert.equal(dismissed.sampling.mtpMode, "off", "a dismissal never changes the saved choice");
+  assert.equal(dismissed.notices.speculativeNoticeDismissed, true);
+  assert.equal(dismissed.notices.speculativeOffCarriedOver, true);
+  assert.equal(CARRIED_OVER.notices.speculativeNoticeDismissed, false, "the input is not mutated");
+});
+
+test("the notice renders in the decode-path panel with its action and dismiss buttons", () => {
+  const notice = { appSettings: CARRIED_OVER, executionBackend: "candle-cuda", onEnableAuto() {}, onDismiss() {} };
+  const html = ReactDOMServer.renderToStaticMarkup(React.createElement(DecodePathStatus, {
+    engineStatus: status(SM120, null),
+    notice,
+  }));
+  assert.ok(html.includes("Speculative decoding is available — turn on Auto"), html);
+  assert.ok(html.includes(">Turn on Auto</button>"), html);
+  assert.ok(html.includes(">Dismiss</button>"), html);
+  const hidden = ReactDOMServer.renderToStaticMarkup(React.createElement(SpeculativeNotice, {
+    ...notice,
+    appSettings: dismissSpeculativeNotice(CARRIED_OVER),
+  }));
+  assert.equal(hidden, "");
 });

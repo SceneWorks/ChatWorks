@@ -5,11 +5,18 @@ import { CompactSelector, StatusDot } from "@sceneworks/ui";
 import { useApp } from "../state/AppContext";
 import { useConversations } from "../state/ConversationsContext";
 import { formatBytes, isExactGgufUrl, modelSubtitle, unloadServedModel } from "../state/models.js";
-import { selectedWeightFormat, weightFormatOptions } from "../state/decodePath.js";
+import {
+  dismissSpeculativeNotice,
+  enableSpeculativeAuto,
+  graphsReloadPending,
+  selectedWeightFormat,
+  serveAction,
+  weightFormatOptions,
+} from "../state/decodePath.js";
 import { DecodePathStatus } from "../components/DecodePathStatus.js";
 
 export function ModelsScreen() {
-  const { engineStatus, refreshEngineStatus } = useApp();
+  const { engineStatus, refreshEngineStatus, appSettings, updateAppSettings } = useApp();
   const { busy: generationBusy } = useConversations();
   const [unloading, setUnloading] = useState(false);
   const [registry, setRegistry] = useState({ models: [], selectedId: null });
@@ -33,6 +40,14 @@ export function ModelsScreen() {
   // unless it reports a compute capability >= sm_120 CUDA device (sc-24139).
   const weightFormats = weightFormatOptions(engineStatus?.backend_capabilities);
   const unavailableFormats = weightFormats.filter((option) => option.disabled);
+  const formatNotes = weightFormats.filter((option) => option.note && !option.disabled);
+  // The served model runs under a CUDA-graph switch other than the saved setting: its row offers
+  // "Reload" (graphs are a load option).
+  const reloadPending = graphsReloadPending(
+    engineStatus?.backend_capabilities,
+    appSettings?.runtime?.cudaGraphs,
+    engineStatus?.loaded,
+  );
   const selectedModel = registry.models.find((model) => model.id === registry.selectedId) ?? null;
   const exactGgufImport = isExactGgufUrl(sourceUrl);
 
@@ -256,6 +271,11 @@ export function ModelsScreen() {
               </button>
             ))}
           </div>
+          {formatNotes.map((option) => (
+            <small className="field-note lossy" key={`${option.id}-note`}>
+              {option.note}
+            </small>
+          ))}
           {unavailableFormats.map((option) => (
             <small className="field-note" key={option.id}>
               {option.label} unavailable: {option.reason}
@@ -367,6 +387,7 @@ export function ModelsScreen() {
                 model.localPath === loadedSource &&
                 (model.quantize ?? null) === (engineStatus?.loaded?.quantize ?? null) &&
                 (selectedProjector || null) === (engineStatus?.loaded?.projector_source ?? null);
+              const action = serveAction(Boolean(isServed), reloadPending);
               return (
                 <li className={isServed ? "model-row served" : "model-row"} key={model.id}>
                   <div className="model-row-main">
@@ -390,11 +411,12 @@ export function ModelsScreen() {
                   ) : null}
                   <button
                     className="ghost-btn"
-                    disabled={Boolean(loadingId) || isServed}
+                    disabled={Boolean(loadingId) || action.disabled}
                     onClick={() => handleSelect(model)}
+                    title={action.label === "Reload" ? "Reload with the saved CUDA-graph setting" : undefined}
                     type="button"
                   >
-                    {loadingId === model.id ? "Loading…" : isServed ? "Serving" : "Serve"}
+                    {loadingId === model.id ? "Loading…" : action.label}
                   </button>
                 </li>
               );
@@ -408,7 +430,16 @@ export function ModelsScreen() {
             Selected: <strong>{selectedModel.name}</strong> ({selectedModel.repo})
           </p>
         ) : null}
-        <DecodePathStatus engineStatus={engineStatus} title="Served model decode path" />
+        <DecodePathStatus
+          engineStatus={engineStatus}
+          title="Served model decode path"
+          notice={{
+            appSettings,
+            executionBackend: engineStatus?.execution_backend,
+            onEnableAuto: () => updateAppSettings(enableSpeculativeAuto).catch((cause) => setError(String(cause))),
+            onDismiss: () => updateAppSettings(dismissSpeculativeNotice).catch((cause) => setError(String(cause))),
+          }}
+        />
       </div>
 
       <div className="panel">

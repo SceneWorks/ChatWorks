@@ -3,7 +3,7 @@
 use std::sync::OnceLock;
 
 use crate::core_llm::{
-    BackendCapabilities, LoadSpec, TextLlm, TextLlmRegistration, TextLlmRegistry,
+    BackendCapabilities, FeatureSupport, LoadSpec, TextLlm, TextLlmRegistration, TextLlmRegistry,
 };
 
 #[cfg(all(
@@ -45,6 +45,15 @@ pub(crate) fn textllms() -> impl ExactSizeIterator<Item = &'static TextLlmRegist
 pub(crate) fn backend_capabilities() -> &'static BackendCapabilities {
     static CAPABILITIES: OnceLock<BackendCapabilities> = OnceLock::new();
     CAPABILITIES.get_or_init(platform_runtime::text_backend_capabilities)
+}
+
+/// Whether an NVFP4 load of the snapshot at `spec.source` can pass every gate the linked runtime's
+/// load runs before it reads a weight (sc-24139): the runtime answers for the provider it would
+/// load the snapshot with, from that provider's own load gates, then the device gate. Reads only
+/// the snapshot's `config.json`; asked before a snapshot is registered (or its weights downloaded)
+/// as NVFP4. ChatWorks keeps no model-family rule of its own.
+pub(crate) fn nvfp4_support(spec: &LoadSpec) -> FeatureSupport {
+    platform_runtime::text_nvfp4_support(spec)
 }
 
 pub(crate) const fn execution_backend() -> &'static str {
@@ -120,13 +129,31 @@ mod tests {
     fn backend_capabilities_come_from_the_linked_runtime() {
         let caps = super::backend_capabilities();
         assert_eq!(caps.backend, super::execution_backend());
-        // On the CUDA build with a CUDA device, the switch is offered and the device's compute
-        // capability is reported (NVFP4 then follows the sm_120 floor, with the gate's reason).
+        // The CUDA build reports a CUDA load device — the switch offered, the compute capability
+        // reported, NVFP4 following the sm_120 floor with the gate's reason — or, with no device
+        // to open, refuses both features with a reason. Never a silent pass: `REQUIRE_CUDA=1` (a
+        // GPU lane) makes a missing device a failure.
         #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
         if caps.device.starts_with("cuda:") {
             assert!(caps.cuda_graphs.supported, "{:?}", caps.cuda_graphs);
             let (major, _) = caps.compute_capability.expect("a CUDA device reports it");
             assert_eq!(caps.nvfp4.supported, major >= 12, "{:?}", caps.nvfp4);
+            if !caps.nvfp4.supported {
+                assert!(caps.nvfp4.reason.as_deref().unwrap().contains("sm_120"));
+            }
+        } else {
+            assert!(
+                std::env::var("REQUIRE_CUDA").as_deref() != Ok("1"),
+                "REQUIRE_CUDA=1 but the CUDA build found no CUDA device: {}",
+                caps.device
+            );
+            for feature in [&caps.nvfp4, &caps.cuda_graphs] {
+                assert!(!feature.supported, "{feature:?}");
+                assert!(
+                    feature.reason.as_deref().is_some_and(|r| !r.is_empty()),
+                    "{feature:?}"
+                );
+            }
         }
         #[cfg(not(all(not(target_os = "macos"), feature = "cuda")))]
         {

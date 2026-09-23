@@ -1,0 +1,43 @@
+{
+  "execution_backend": "candle-cuda",
+  "backend_capabilities": {
+    "backend": "candle-cuda",
+    "device": "cuda:0",
+    "compute_capability": "sm_120",
+    "nvfp4": { "supported": true, "reason": null },
+    "cuda_graphs": { "supported": true, "reason": null }
+  },
+  "loaded": {
+    "source": "/models/qwen3.8-27b",
+    "quantize": "nvfp4",
+    "cuda_graphs": true,
+    "load_report": {
+      "requested": "nvfp4",
+      "projections": [{ "kind": "nvfp4", "count": 448, "params": 1000, "resident_bytes": 562 }],
+      "cuda_graphs": true
+    },
+    "last_decode": {
+      "path": "mtp",
+      "proposer": "mtp",
+      "draft_tokens": 2,
+      "sampler": "device",
+      "kv_cache": "static",
+      "attention": "gqa",
+      "cuda_graphs": {
+        "enabled": true,
+        "path": "eager",
+        "replayed": 0,
+        "eager": 3,
+        "captured": 0,
+        "fallback_reason": "deltanet_state_unstable"
+      },
+      "nvfp4_projections": { "path": "mixed", "reason": "rows" },
+      "fused_primitives": { "path": "fused", "reason": null },
+      "target_forwards": 2,
+      "proposed_tokens": 4,
+      "accepted_tokens": 3,
+      "replay_forwards": 0
+    },
+    "decode_reported": true
+  }
+}

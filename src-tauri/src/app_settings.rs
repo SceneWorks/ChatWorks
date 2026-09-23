@@ -20,6 +20,11 @@ const API_AUTH_KEYCHAIN_USER: &str = "api-auth-token";
 /// **missing** `mtpMode` takes the new platform default ([`default_mtp_mode`]: `auto` on the Candle
 /// CUDA build, `off` on MLX and Candle CPU). Files at version 1 or later were written under the new
 /// default, so a saved `off` there is an explicit choice by construction.
+///
+/// Because every pre-marker save wrote `mtpMode`, most upgrading users keep `off` under that rule.
+/// Where the build's default is not `off` (Candle CUDA), such a carried-over `off` is flagged
+/// ([`NoticeSettings::speculative_off_carried_over`]) so the UI can offer — once, dismissibly — to
+/// turn on Auto, without ever changing the saved choice itself.
 pub const CURRENT_SETTINGS_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -34,6 +39,8 @@ pub struct AppSettings {
     pub sampling: SamplingDefaults,
     #[serde(default)]
     pub runtime: RuntimeSettings,
+    #[serde(default)]
+    pub notices: NoticeSettings,
 }
 
 impl Default for AppSettings {
@@ -43,8 +50,24 @@ impl Default for AppSettings {
             server: ServerSettings::default(),
             sampling: SamplingDefaults::default(),
             runtime: RuntimeSettings::default(),
+            notices: NoticeSettings::default(),
         }
     }
+}
+
+/// One-time UI notices and their persisted dismissals (sc-24139).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct NoticeSettings {
+    /// Speculative decoding is `off` only because a pre-marker settings file carried `off` over on
+    /// a build whose default is `auto` (see [`CURRENT_SETTINGS_VERSION`]). Set by the migration;
+    /// cleared as soon as the mode is anything but `off`, so a later explicit `off` never
+    /// re-raises the notice.
+    #[serde(default)]
+    pub speculative_off_carried_over: bool,
+    /// The user dismissed the "speculative decoding is available" notice.
+    #[serde(default)]
+    pub speculative_notice_dismissed: bool,
 }
 
 /// Load-time runtime options (sc-24139). These change how a model is **loaded**, so a change
@@ -64,15 +87,31 @@ impl AppSettings {
     /// [`CURRENT_SETTINGS_VERSION`]) and validation. The result carries the current marker, so the
     /// next save records it.
     pub fn from_stored_json(body: &str) -> Result<Self, String> {
-        serde_json::from_str::<AppSettings>(body)
-            .map_err(|error| error.to_string())?
-            .normalized()
+        Self::from_stored_json_for(body, crate::inference_runtime::execution_backend())
+    }
+
+    /// [`from_stored_json`](Self::from_stored_json) for an execution backend label, whose
+    /// speculative default ([`default_mtp_mode_for`]) decides whether a pre-marker `off` was
+    /// carried over rather than chosen under the current default.
+    pub fn from_stored_json_for(body: &str, execution_backend: &str) -> Result<Self, String> {
+        let mut settings =
+            serde_json::from_str::<AppSettings>(body).map_err(|error| error.to_string())?;
+        if settings.settings_version == 0
+            && settings.sampling.mtp_mode == "off"
+            && default_mtp_mode_for(execution_backend) != "off"
+        {
+            settings.notices.speculative_off_carried_over = true;
+        }
+        settings.normalized()
     }
 
     pub fn normalized(mut self) -> Result<Self, String> {
         // A pre-marker file's values are kept as written (validated below); stamping the marker
         // records on the next save that this file now carries explicit choices.
         self.settings_version = CURRENT_SETTINGS_VERSION;
+        if self.sampling.mtp_mode != "off" {
+            self.notices.speculative_off_carried_over = false;
+        }
         self.server.host = self.server.host.trim().to_string();
         if self.server.host.is_empty() {
             return Err("bind host is required".to_string());
@@ -408,6 +447,68 @@ mod tests {
         assert!(!migrated.runtime.cuda_graphs);
         let empty = AppSettings::from_stored_json("{}").unwrap();
         assert_eq!(empty.sampling.mtp_mode, default_mtp_mode());
+    }
+
+    /// sc-24139 feature-end review: a pre-marker `off` kept by the migration on a build whose
+    /// default is `auto` is flagged as carried over (the UI then offers Auto, once) — while the
+    /// saved `off` itself is untouched. Nothing is flagged where `off` is the default, for a
+    /// current-schema `off`, or for any other saved mode; the flag and a dismissal persist through
+    /// a save, and moving off `off` clears the flag for good.
+    #[test]
+    fn a_carried_over_off_is_flagged_for_the_speculative_notice() {
+        let legacy = r#"{"server":{},"sampling":{"mtpMode":"off","mtpDraftTokens":3}}"#;
+        let migrated = AppSettings::from_stored_json_for(legacy, "candle-cuda").unwrap();
+        assert_eq!(
+            migrated.sampling.mtp_mode, "off",
+            "the saved choice survives"
+        );
+        assert!(migrated.notices.speculative_off_carried_over);
+        assert!(!migrated.notices.speculative_notice_dismissed);
+
+        // Not carried over: where `off` is the default, a current-schema `off`, another mode.
+        for (body, backend) in [
+            (legacy, "candle-cpu"),
+            (legacy, "mlx"),
+            (
+                r#"{"settingsVersion":1,"sampling":{"mtpMode":"off"}}"#,
+                "candle-cuda",
+            ),
+            (r#"{"sampling":{"mtpMode":"enabled"}}"#, "candle-cuda"),
+            // A missing mode takes this build's default, which is never a carried-over `off`.
+            (
+                r#"{"sampling":{}}"#,
+                crate::inference_runtime::execution_backend(),
+            ),
+        ] {
+            let settings = AppSettings::from_stored_json_for(body, backend).unwrap();
+            assert!(
+                !settings.notices.speculative_off_carried_over,
+                "{body} on {backend}"
+            );
+        }
+
+        // The flag and a dismissal survive a save (the file is at the current schema from then on).
+        let mut dismissed = migrated.clone();
+        dismissed.notices.speculative_notice_dismissed = true;
+        let saved = serde_json::to_string(&dismissed.normalized().unwrap()).unwrap();
+        let reloaded = AppSettings::from_stored_json_for(&saved, "candle-cuda").unwrap();
+        assert!(reloaded.notices.speculative_off_carried_over);
+        assert!(reloaded.notices.speculative_notice_dismissed);
+
+        // Turning Auto on clears the flag, so a later explicit `off` never re-raises the notice.
+        let mut auto = migrated;
+        auto.sampling.mtp_mode = "auto".to_string();
+        let auto = auto.normalized().unwrap();
+        assert!(!auto.notices.speculative_off_carried_over);
+        let mut off_again = auto;
+        off_again.sampling.mtp_mode = "off".to_string();
+        assert!(
+            !off_again
+                .normalized()
+                .unwrap()
+                .notices
+                .speculative_off_carried_over
+        );
     }
 
     #[test]

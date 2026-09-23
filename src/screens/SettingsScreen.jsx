@@ -4,7 +4,8 @@ import { StatusDot } from "@sceneworks/ui";
 import { useApp } from "../state/AppContext";
 import { GenerationControls } from "../components/GenerationControls";
 import { generationParams, generationSettings } from "../state/generation.js";
-import { cudaGraphsControl } from "../state/decodePath.js";
+import { cudaGraphsControl, dismissSpeculativeNotice, enableSpeculativeAuto } from "../state/decodePath.js";
+import { SpeculativeNotice } from "../components/DecodePathStatus.js";
 
 export function settingsToForm(settings) {
   return {
@@ -24,7 +25,9 @@ export function settingsToForm(settings) {
 }
 
 export function SettingsScreen() {
-  const { appSettings, setAppSettings, apiAuthToken, setApiAuthToken, refreshAppSettings, engineStatus } = useApp();
+  const {
+    appSettings, setAppSettings, updateAppSettings, apiAuthToken, setApiAuthToken, refreshAppSettings, engineStatus,
+  } = useApp();
   const [form, setForm] = useState(() => settingsToForm(appSettings));
   const [serverStatus, setServerStatus] = useState(null);
   const [tokenInput, setTokenInput] = useState("");
@@ -66,7 +69,21 @@ export function SettingsScreen() {
       runtime: {
         cudaGraphs: Boolean(nextForm.cudaGraphs),
       },
+      // One-time notices and their dismissals are not form fields; keep them as saved.
+      notices: appSettings.notices,
     };
+  }
+
+  async function applyNotice(transform) {
+    setBusy(true);
+    setError(null);
+    try {
+      await updateAppSettings(transform);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function saveSettings(nextForm = form, tokenOverride) {
@@ -107,8 +124,13 @@ export function SettingsScreen() {
 
   const apiAuthPresent = Boolean(apiAuthToken);
   // CUDA graphs are a load option on the Candle CUDA runtime (sc-24139): gated on the runtime's
-  // own report, and a change applies to the next model load.
-  const graphs = cudaGraphsControl(engineStatus?.backend_capabilities, form.cudaGraphs, engineStatus?.loaded);
+  // own report, and a change applies to the next model load. The pending-reload note compares the
+  // SAVED setting with the switch the served model was loaded under.
+  const graphs = cudaGraphsControl(
+    engineStatus?.backend_capabilities,
+    appSettings.runtime?.cudaGraphs,
+    engineStatus?.loaded,
+  );
   const lanWarning = form.host === "0.0.0.0" || form.host === "::" || form.allowLan;
 
   return (
@@ -264,6 +286,13 @@ export function SettingsScreen() {
             <small>Applied when a thinking-capable loaded model supports no-think mode.</small>
           </span>
         </label>
+        <SpeculativeNotice
+          appSettings={appSettings}
+          busy={busy}
+          executionBackend={engineStatus?.execution_backend}
+          onDismiss={() => applyNotice(dismissSpeculativeNotice)}
+          onEnableAuto={() => applyNotice(enableSpeculativeAuto)}
+        />
         <GenerationControls params={form} onChange={updateForm} prefix="default-generation" />
 
         <div className="panel-head section-head">

@@ -965,3 +965,40 @@
   color: var(--text-muted);
   font-family: inherit;
 }
+
+.decode-path-section {
+  margin: 6px 0 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.field-note.lossy {
+  color: var(--text);
+}
+
+.speculative-notice {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-1, var(--surface-2));
+}
+
+.speculative-notice p {
+  margin: 0;
+}
+
+.speculative-notice small {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-muted);
+}
+
+.speculative-notice-actions {
+  display: flex;
+  gap: var(--gap-1);
+}
