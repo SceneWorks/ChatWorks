@@ -917,3 +917,51 @@
     transform: none;
   }
 }
+
+/* Runtime-reported weight formats and decode path (sc-24139) */
+.field-note {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.decode-path {
+  display: grid;
+  gap: var(--gap-1);
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+
+.decode-path-rows {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.decode-path-row {
+  display: grid;
+  grid-template-columns: minmax(96px, 150px) minmax(0, 1fr);
+  gap: var(--gap-2);
+  font-size: 13px;
+}
+
+.decode-path-row dt {
+  color: var(--text-muted);
+  font-weight: 700;
+}
+
+.decode-path-row dd {
+  margin: 0;
+  color: var(--text);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.decode-path-row dd small {
+  display: block;
+  color: var(--text-muted);
+  font-family: inherit;
+}

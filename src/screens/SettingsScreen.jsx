@@ -4,6 +4,7 @@ import { StatusDot } from "@sceneworks/ui";
 import { useApp } from "../state/AppContext";
 import { GenerationControls } from "../components/GenerationControls";
 import { generationParams, generationSettings } from "../state/generation.js";
+import { cudaGraphsControl } from "../state/decodePath.js";
 
 export function settingsToForm(settings) {
   return {
@@ -18,11 +19,12 @@ export function settingsToForm(settings) {
     maxTokens: String(settings.sampling.maxTokens),
     disableThinking: Boolean(settings.sampling.disableThinking),
     ...generationParams(settings.sampling),
+    cudaGraphs: Boolean(settings.runtime?.cudaGraphs),
   };
 }
 
 export function SettingsScreen() {
-  const { appSettings, setAppSettings, apiAuthToken, setApiAuthToken, refreshAppSettings } = useApp();
+  const { appSettings, setAppSettings, apiAuthToken, setApiAuthToken, refreshAppSettings, engineStatus } = useApp();
   const [form, setForm] = useState(() => settingsToForm(appSettings));
   const [serverStatus, setServerStatus] = useState(null);
   const [tokenInput, setTokenInput] = useState("");
@@ -60,6 +62,9 @@ export function SettingsScreen() {
         maxTokens: Number(nextForm.maxTokens),
         disableThinking: nextForm.disableThinking,
         ...generationSettings(nextForm),
+      },
+      runtime: {
+        cudaGraphs: Boolean(nextForm.cudaGraphs),
       },
     };
   }
@@ -101,6 +106,9 @@ export function SettingsScreen() {
   }
 
   const apiAuthPresent = Boolean(apiAuthToken);
+  // CUDA graphs are a load option on the Candle CUDA runtime (sc-24139): gated on the runtime's
+  // own report, and a change applies to the next model load.
+  const graphs = cudaGraphsControl(engineStatus?.backend_capabilities, form.cudaGraphs, engineStatus?.loaded);
   const lanWarning = form.host === "0.0.0.0" || form.host === "::" || form.allowLan;
 
   return (
@@ -257,6 +265,29 @@ export function SettingsScreen() {
           </span>
         </label>
         <GenerationControls params={form} onChange={updateForm} prefix="default-generation" />
+
+        <div className="panel-head section-head">
+          <p className="eyebrow">Runtime</p>
+          <h2>Model loading</h2>
+          <p className="view-copy">Options the inference runtime applies when it loads a model.</p>
+        </div>
+        <label className="toggle-row">
+          <input
+            checked={Boolean(form.cudaGraphs) && !graphs.disabled}
+            disabled={graphs.disabled}
+            onChange={(event) => updateForm("cudaGraphs", event.target.checked)}
+            type="checkbox"
+          />
+          <span>
+            CUDA graphs (experimental)
+            <small>
+              {graphs.disabled
+                ? `Unavailable: ${graphs.reason}`
+                : `Replays captured decode steps; steps that cannot be captured run eagerly and the decode path names why. ${graphs.note}`}
+            </small>
+          </span>
+        </label>
+        {graphs.pendingReload ? <p className="warning-card">{graphs.note}</p> : null}
         <div className="panel-actions">
           <button className="primary-btn" disabled={busy} type="submit">
             {busy ? "Saving…" : "Save settings"}

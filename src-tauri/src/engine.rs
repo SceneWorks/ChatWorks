@@ -9,10 +9,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::core_llm::{
-    CancelFlag, Channel, Constraint, Content, FinishReason, GenerationTimings, ImageRef, LoadSpec,
-    Message, MtpCapabilities, MtpMode, MtpStats, Quantize, ReasoningEffort, Role, Sampling,
-    StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest, ThinkingMode,
-    ToolCall, ToolSpec, Usage, VideoRef,
+    BackendCapabilities, CancelFlag, Channel, Constraint, Content, CudaGraphsReport, DecodeReport,
+    FeatureSupport, FinishReason, GenerationTimings, ImageRef, LoadReport, LoadSpec, Message,
+    MtpCapabilities, MtpMode, MtpStats, PathReport, ProjectionReport, Quantize, ReasoningEffort,
+    Role, Sampling, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest,
+    ThinkingMode, ToolCall, ToolSpec, Usage, VideoRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -196,20 +197,22 @@ impl EngineActor {
             return Err("model source is required".to_string());
         }
         crate::model_registry::ensure_cpu_model_supported(Path::new(&request.source))?;
-        let spec = LoadSpec {
-            source: request.source.clone(),
-            projector_source: request.projector_source.clone(),
-            quantize: request.quantize.map(Into::into),
-        };
+        let spec = request.load_spec();
+        // The runtime's own refusal (an unsupported weight format, its load admission) is the
+        // error surfaced to the caller verbatim: ChatWorks keeps no estimator of its own.
         let provider = (self.loader)(&spec).map_err(|error| error.to_string())?;
         let descriptor = provider.descriptor().clone();
+        let load_report = provider.load_report().map(LoadReportPayload::from);
         self.loaded = Some(LoadedModel {
             source: request.source,
             display_name: request.display_name,
             quantize: request.quantize,
+            cuda_graphs: request.cuda_graphs,
             projector_source: request.projector_source,
             provider,
             descriptor,
+            load_report,
+            last_decode: None,
         });
         Ok(self.status())
     }
@@ -247,6 +250,17 @@ impl EngineActor {
         if let Ok(mut slot) = self.cancel.lock() {
             *slot = None;
         }
+        // The status view shows the decode path of the most recent generation, as the runtime
+        // measured it; a failed request clears it rather than leaving an older run's path readable
+        // as if it described this one (the runtime's own record behaves the same way).
+        let decode = result
+            .as_ref()
+            .ok()
+            .and_then(|output| output.decode.clone())
+            .map(DecodeReportPayload::from);
+        if let Some(loaded) = self.loaded.as_mut() {
+            loaded.last_decode = decode.clone();
+        }
         let output = result?;
         Ok(GenerateResponse {
             text: output.text,
@@ -264,6 +278,7 @@ impl EngineActor {
                 .to_string(),
             mtp: output.mtp.map(MtpStatsPayload::from),
             timings: output.timings.map(GenerationTimingsPayload::from),
+            decode,
         })
     }
 
@@ -271,6 +286,9 @@ impl EngineActor {
         EngineStatus {
             loaded: self.loaded.as_ref().map(LoadedModel::status),
             execution_backend: crate::inference_runtime::execution_backend(),
+            backend_capabilities: BackendCapabilitiesPayload::from(
+                crate::inference_runtime::backend_capabilities(),
+            ),
             providers: crate::inference_runtime::textllms()
                 .map(|registration| ProviderSummary::from((registration.descriptor)()))
                 .collect(),
@@ -282,9 +300,12 @@ struct LoadedModel {
     source: String,
     display_name: Option<String>,
     quantize: Option<QuantizeRequest>,
+    cuda_graphs: Option<bool>,
     projector_source: Option<String>,
     provider: Box<dyn TextLlm>,
     descriptor: TextLlmDescriptor,
+    load_report: Option<LoadReportPayload>,
+    last_decode: Option<DecodeReportPayload>,
 }
 
 impl LoadedModel {
@@ -296,8 +317,11 @@ impl LoadedModel {
                 .clone()
                 .unwrap_or_else(|| model_name(&self.source)),
             quantize: self.quantize,
+            cuda_graphs: self.cuda_graphs,
             projector_source: self.projector_source.clone(),
             provider: ProviderSummary::from(self.descriptor.clone()),
+            load_report: self.load_report.clone(),
+            last_decode: self.last_decode.clone(),
         }
     }
 }
@@ -313,13 +337,47 @@ pub struct LoadModelRequest {
     /// artifact; an omitted value deliberately keeps a packed GGUF text-only.
     #[serde(default)]
     pub projector_source: Option<String>,
+    /// The runtime's load-time CUDA-graph switch (`LoadSpec::cuda_graphs`, sc-24139). `None`
+    /// keeps the runtime default; the CUDA runtime settles the model's stream at load, so a
+    /// change applies to the next load.
+    #[serde(default)]
+    pub cuda_graphs: Option<bool>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+impl LoadModelRequest {
+    /// The runtime load request: the weight format (`bf16` = none, `q4`, `q8`, `nvfp4`) and the
+    /// CUDA-graph switch reach the runtime's `LoadSpec` unchanged.
+    pub(crate) fn load_spec(&self) -> LoadSpec {
+        LoadSpec {
+            source: self.source.clone(),
+            projector_source: self.projector_source.clone(),
+            quantize: self.quantize.map(Into::into),
+            cuda_graphs: self.cuda_graphs,
+        }
+    }
+}
+
+/// The load-time weight format. `None` keeps the checkpoint's own encoding (dense bf16 for a
+/// safetensors snapshot).
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum QuantizeRequest {
     Q4,
     Q8,
+    /// NVFP4, quantized at load on a compute capability >= sm_120 GPU (Candle CUDA). The runtime
+    /// refuses it elsewhere with a typed reason, which `EngineStatus.backend_capabilities` reports
+    /// before any load.
+    Nvfp4,
+}
+
+impl QuantizeRequest {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Q4 => "q4",
+            Self::Q8 => "q8",
+            Self::Nvfp4 => "nvfp4",
+        }
+    }
 }
 
 impl From<QuantizeRequest> for Quantize {
@@ -327,6 +385,17 @@ impl From<QuantizeRequest> for Quantize {
         match value {
             QuantizeRequest::Q4 => Quantize::Q4,
             QuantizeRequest::Q8 => Quantize::Q8,
+            QuantizeRequest::Nvfp4 => Quantize::Nvfp4,
+        }
+    }
+}
+
+impl From<Quantize> for QuantizeRequest {
+    fn from(value: Quantize) -> Self {
+        match value {
+            Quantize::Q4 => Self::Q4,
+            Quantize::Q8 => Self::Q8,
+            Quantize::Nvfp4 => Self::Nvfp4,
         }
     }
 }
@@ -1430,6 +1499,9 @@ impl SamplingRequest {
 pub struct EngineStatus {
     pub loaded: Option<LoadedModelStatus>,
     pub execution_backend: &'static str,
+    /// What the runtime can serve on this host before any load (NVFP4, CUDA graphs), each
+    /// unavailable feature with the runtime's reason (sc-24139).
+    pub backend_capabilities: BackendCapabilitiesPayload,
     pub providers: Vec<ProviderSummary>,
 }
 
@@ -1438,9 +1510,168 @@ pub struct LoadedModelStatus {
     pub source: String,
     pub name: String,
     pub quantize: Option<QuantizeRequest>,
+    /// The CUDA-graph switch this model was loaded with (`None` = the runtime default).
+    pub cuda_graphs: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub projector_source: Option<String>,
     pub provider: ProviderSummary,
+    /// What the load produced, as the runtime reports it (`None` when it does not).
+    pub load_report: Option<LoadReportPayload>,
+    /// The decode path of the most recent generation, as the runtime measured it.
+    pub last_decode: Option<DecodeReportPayload>,
+}
+
+/// One optional runtime feature: available, or unavailable with the runtime's reason.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct FeatureSupportPayload {
+    pub supported: bool,
+    pub reason: Option<String>,
+}
+impl From<&FeatureSupport> for FeatureSupportPayload {
+    fn from(value: &FeatureSupport) -> Self {
+        Self {
+            supported: value.supported,
+            reason: value.reason.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BackendCapabilitiesPayload {
+    pub backend: String,
+    pub device: String,
+    /// `sm_<major><minor>` of the CUDA load device; `None` off CUDA.
+    pub compute_capability: Option<String>,
+    pub nvfp4: FeatureSupportPayload,
+    pub cuda_graphs: FeatureSupportPayload,
+}
+impl From<&BackendCapabilities> for BackendCapabilitiesPayload {
+    fn from(value: &BackendCapabilities) -> Self {
+        Self {
+            backend: value.backend.clone(),
+            device: value.device.clone(),
+            compute_capability: value
+                .compute_capability
+                .map(|(major, minor)| format!("sm_{major}{minor}")),
+            nvfp4: FeatureSupportPayload::from(&value.nvfp4),
+            cuda_graphs: FeatureSupportPayload::from(&value.cuda_graphs),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ProjectionReportPayload {
+    pub kind: String,
+    pub count: u64,
+    pub params: u64,
+    pub resident_bytes: u64,
+}
+
+impl From<ProjectionReport> for ProjectionReportPayload {
+    fn from(value: ProjectionReport) -> Self {
+        Self {
+            kind: value.kind,
+            count: value.count,
+            params: value.params,
+            resident_bytes: value.resident_bytes,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LoadReportPayload {
+    /// The weight format the load requested (`None` = the checkpoint's own encoding).
+    pub requested: Option<QuantizeRequest>,
+    /// Resident projection kinds, as the runtime counted them after the load.
+    pub projections: Vec<ProjectionReportPayload>,
+}
+impl From<LoadReport> for LoadReportPayload {
+    fn from(value: LoadReport) -> Self {
+        Self {
+            requested: value.requested.map(QuantizeRequest::from),
+            projections: value
+                .projections
+                .into_iter()
+                .map(ProjectionReportPayload::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PathReportPayload {
+    pub path: String,
+    pub reason: Option<String>,
+}
+impl From<PathReport> for PathReportPayload {
+    fn from(value: PathReport) -> Self {
+        Self {
+            path: value.path,
+            reason: value.reason,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CudaGraphsReportPayload {
+    pub enabled: bool,
+    pub path: String,
+    pub replayed: u64,
+    pub eager: u64,
+    pub captured: u64,
+    pub fallback_reason: Option<String>,
+}
+impl From<CudaGraphsReport> for CudaGraphsReportPayload {
+    fn from(value: CudaGraphsReport) -> Self {
+        Self {
+            enabled: value.enabled,
+            path: value.path,
+            replayed: value.replayed,
+            eager: value.eager,
+            captured: value.captured,
+            fallback_reason: value.fallback_reason,
+        }
+    }
+}
+
+/// Which decode path served a generation (sc-24139, epic E2): the runtime's own labels, so a
+/// fallback is always named.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DecodeReportPayload {
+    pub path: String,
+    /// `none` | `mtp` | `ngram` | `draft`.
+    pub proposer: String,
+    pub draft_tokens: Option<u32>,
+    /// `device` | `host:<reason>` | `none`.
+    pub sampler: String,
+    pub kv_cache: String,
+    pub attention: String,
+    pub cuda_graphs: CudaGraphsReportPayload,
+    pub nvfp4_projections: PathReportPayload,
+    pub fused_primitives: PathReportPayload,
+    pub target_forwards: u64,
+    pub proposed_tokens: u64,
+    pub accepted_tokens: u64,
+    pub replay_forwards: u64,
+}
+impl From<DecodeReport> for DecodeReportPayload {
+    fn from(value: DecodeReport) -> Self {
+        Self {
+            path: value.path,
+            proposer: value.proposer.label().to_string(),
+            draft_tokens: value.draft_tokens,
+            sampler: value.sampler,
+            kv_cache: value.kv_cache,
+            attention: value.attention,
+            cuda_graphs: CudaGraphsReportPayload::from(value.cuda_graphs),
+            nvfp4_projections: PathReportPayload::from(value.nvfp4_projections),
+            fused_primitives: PathReportPayload::from(value.fused_primitives),
+            target_forwards: value.target_forwards,
+            proposed_tokens: value.proposed_tokens,
+            accepted_tokens: value.accepted_tokens,
+            replay_forwards: value.replay_forwards,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1607,6 +1838,9 @@ pub struct GenerateResponse {
     pub mtp: Option<MtpStatsPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timings: Option<GenerationTimingsPayload>,
+    /// Which decode path served this generation, when the runtime reports one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode: Option<DecodeReportPayload>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1716,6 +1950,7 @@ mod tests {
                 display_name: None,
                 quantize: None,
                 projector_source: None,
+                cuda_graphs: None,
             })
             .unwrap();
         assert_eq!(status.loaded.unwrap().name, "fake-model");
@@ -1831,6 +2066,7 @@ mod tests {
                 display_name: None,
                 quantize: None,
                 projector_source: None,
+                cuda_graphs: None,
             })
             .unwrap();
         let err = engine.generate(request, |_| {}).unwrap_err();
@@ -1988,6 +2224,170 @@ mod tests {
         server.join().unwrap();
     }
 
+    fn hello_request() -> GenerateRequest {
+        GenerateRequest {
+            messages: vec![GenerateMessage {
+                role: "user".to_string(),
+                content: "hello".to_string(),
+                images: Vec::new(),
+                videos: Vec::new(),
+                media: Vec::new(),
+                tool_calls: Vec::new(),
+                thinking: None,
+            }],
+            sampling: SamplingRequest::default(),
+            max_new_tokens: 8,
+            seed: None,
+            stop: Vec::new(),
+            thinking: ThinkingRequest::Auto,
+            enable_thinking: None,
+            disable_thinking: None,
+            reasoning_effort: None,
+            preserve_thinking: None,
+            mtp: MtpRequest::Auto,
+            constraint: None,
+            tools: Vec::new(),
+        }
+    }
+
+    /// AC2 + AC3 (sc-24139): the weight format (bf16 | Q8 | NVFP4) and the CUDA-graph switch in
+    /// ChatWorks' load request reach the runtime's `LoadSpec` unchanged.
+    #[test]
+    fn weight_format_and_graph_switch_reach_the_runtime_load_request() {
+        use crate::test_support::{recorded_load_specs, recording_loader};
+        let engine = EngineHandle::spawn_with_loader(recording_loader);
+        for (source, quantize, cuda_graphs, expected) in [
+            ("/tmp/sc-24139-bf16", None, None, None),
+            (
+                "/tmp/sc-24139-q8",
+                Some(QuantizeRequest::Q8),
+                Some(false),
+                Some(Quantize::Q8),
+            ),
+            (
+                "/tmp/sc-24139-nvfp4",
+                Some(QuantizeRequest::Nvfp4),
+                Some(true),
+                Some(Quantize::Nvfp4),
+            ),
+        ] {
+            let status = engine
+                .load_model(LoadModelRequest {
+                    source: source.to_string(),
+                    display_name: None,
+                    quantize,
+                    projector_source: None,
+                    cuda_graphs,
+                })
+                .unwrap();
+            assert_eq!(
+                recorded_load_specs().lock().unwrap().get(source).copied(),
+                Some((expected, cuda_graphs)),
+                "{source}"
+            );
+            let loaded = status.loaded.unwrap();
+            assert_eq!(loaded.quantize, quantize);
+            assert_eq!(loaded.cuda_graphs, cuda_graphs);
+            let report = loaded.load_report.expect("the runtime's load report");
+            assert_eq!(report.requested, quantize);
+        }
+        // The wire names of the three formats.
+        assert_eq!(
+            serde_json::to_value(QuantizeRequest::Nvfp4).unwrap(),
+            "nvfp4"
+        );
+        let decoded: LoadModelRequest = serde_json::from_value(serde_json::json!({
+            "source": "/tmp/m", "quantize": "nvfp4", "cuda_graphs": true
+        }))
+        .unwrap();
+        let spec = decoded.load_spec();
+        assert_eq!(spec.quantize, Some(Quantize::Nvfp4));
+        assert_eq!(spec.cuda_graphs, Some(true));
+        let omitted: LoadModelRequest =
+            serde_json::from_value(serde_json::json!({ "source": "/tmp/m" })).unwrap();
+        assert_eq!(omitted.load_spec().cuda_graphs, None);
+    }
+
+    /// AC3 (sc-24139): the runtime's decode report reaches the generate response and the model
+    /// status (proposer, graph path + fallback reason, NVFP4 projection path, sampler path), and
+    /// the load report reaches the status.
+    #[test]
+    fn the_decode_path_reaches_the_response_and_the_model_status() {
+        use crate::test_support::recording_loader;
+        let engine = EngineHandle::spawn_with_loader(recording_loader);
+        let status = engine
+            .load_model(LoadModelRequest {
+                source: "/tmp/sc-24139-status".to_string(),
+                display_name: None,
+                quantize: Some(QuantizeRequest::Nvfp4),
+                projector_source: None,
+                cuda_graphs: Some(true),
+            })
+            .unwrap();
+        let loaded = status.loaded.unwrap();
+        assert!(loaded.last_decode.is_none(), "no generation yet");
+        assert_eq!(loaded.load_report.unwrap().projections[0].kind, "nvfp4");
+        // The runtime's capability report is part of every status.
+        assert_eq!(
+            status.backend_capabilities.backend,
+            crate::inference_runtime::execution_backend()
+        );
+
+        let output = engine.generate(hello_request(), |_| {}).unwrap();
+        let decode = output.decode.expect("the runtime reported its decode path");
+        assert_eq!(decode.proposer, "mtp");
+        assert_eq!(decode.draft_tokens, Some(2));
+        assert_eq!(decode.sampler, "device");
+        assert!(decode.cuda_graphs.enabled);
+        assert_eq!(decode.cuda_graphs.path, "eager");
+        assert_eq!(
+            decode.cuda_graphs.fallback_reason.as_deref(),
+            Some("deltanet_state_unstable")
+        );
+        assert_eq!(decode.nvfp4_projections.path, "mixed");
+        let status = engine.status().unwrap();
+        assert_eq!(status.loaded.unwrap().last_decode, Some(decode));
+
+        // A failed request clears the status' decode path rather than leaving the previous one.
+        let mut failing = hello_request();
+        failing.max_new_tokens = 9_999;
+        assert!(engine.generate(failing, |_| {}).is_err());
+        assert!(engine
+            .status()
+            .unwrap()
+            .loaded
+            .unwrap()
+            .last_decode
+            .is_none());
+    }
+
+    /// E6 (sc-24139): ChatWorks keeps no memory estimator of its own; the runtime's load
+    /// admission refusal (which prices NVFP4, static KV, checkpoints and the graph workspace)
+    /// reaches the caller verbatim.
+    #[test]
+    fn the_runtime_admission_refusal_is_surfaced_verbatim() {
+        fn refusing_loader(_: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
+            Err(crate::core_llm::Error::Load(
+                "request needs 61.2 GiB but only 40.0 GiB is available".to_string(),
+            ))
+        }
+        let engine = EngineHandle::spawn_with_loader(refusing_loader);
+        let error = engine
+            .load_model(LoadModelRequest {
+                source: "/tmp/sc-24139-refused".to_string(),
+                display_name: None,
+                quantize: Some(QuantizeRequest::Nvfp4),
+                projector_source: None,
+                cuda_graphs: Some(true),
+            })
+            .unwrap_err();
+        assert!(
+            error.contains("request needs 61.2 GiB but only 40.0 GiB is available"),
+            "{error}"
+        );
+        assert!(engine.status().unwrap().loaded.is_none());
+    }
+
     /// cancel() returns false when nothing is in flight and true once a generation's flag is
     /// installed. Because FakeProvider.generate runs synchronously to completion, we can't observe
     /// a mid-stream cancel end-to-end here, but we can confirm the handle exposes the cancel path
@@ -2003,6 +2403,7 @@ mod tests {
                 display_name: None,
                 quantize: None,
                 projector_source: None,
+                cuda_graphs: None,
             })
             .unwrap();
         engine

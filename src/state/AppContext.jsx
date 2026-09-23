@@ -20,6 +20,9 @@ export const DEFAULT_APP_SETTINGS = {
     maxTokens: 512,
     disableThinking: true,
   },
+  runtime: {
+    cudaGraphs: false,
+  },
 };
 
 export const VIEWS = {

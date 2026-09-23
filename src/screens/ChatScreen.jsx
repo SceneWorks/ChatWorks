@@ -19,6 +19,7 @@ import { sampleVideoAttachment } from "../media/video";
 import { MessageActions } from "../components/MessageActions";
 import { MessageContent } from "../components/MessageContent";
 import { GenerationControls } from "../components/GenerationControls";
+import { DecodePathStatus } from "../components/DecodePathStatus.js";
 import { formatToolArguments, ToolCallList, ToolResult } from "../components/ToolCallList";
 import { appendAttachmentPlaceholders, settleAttachment, registerPreparation } from "../state/attachments.js";
 import { applySamplingPreset } from "../state/generation.js";
@@ -315,6 +316,8 @@ export function ChatScreen() {
     } finally {
       abortRef.current = null;
       setBusy(false);
+      // Pick up the decode path the runtime reported for this generation (sc-24139).
+      refreshEngineStatus();
     }
   }
 
@@ -708,6 +711,7 @@ export function ChatScreen() {
         ) : null}
         <GenerationControls params={params} onChange={updateParam}
           capabilities={engineStatus?.loaded?.provider?.capabilities ?? {}} />
+        <DecodePathStatus engineStatus={engineStatus} />
         {toolsCapable ? (
           <label className="toggle-row">
             <input

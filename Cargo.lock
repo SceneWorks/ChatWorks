@@ -405,14 +405,16 @@ dependencies = [
 [[package]]
 name = "candle-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.0#431b4e19c4651ad2e56d1e3dacf999678eac23a2"
+source = "git+https://github.com/SceneWorks/inference?rev=dbda066a079173380e544b690cfa455dee9b77b4#dbda066a079173380e544b690cfa455dee9b77b4"
 dependencies = [
  "candle-core",
  "candle-flash-attn",
  "candle-nn",
+ "candle-quant-kernels",
  "core-llm",
  "serde_json",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -428,6 +430,17 @@ dependencies = [
  "safetensors 0.7.0",
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "candle-quant-kernels"
+version = "0.0.0"
+source = "git+https://github.com/SceneWorks/inference?rev=dbda066a079173380e544b690cfa455dee9b77b4#dbda066a079173380e544b690cfa455dee9b77b4"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "float8",
+ "half",
 ]
 
 [[package]]
@@ -681,7 +694,7 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.0#431b4e19c4651ad2e56d1e3dacf999678eac23a2"
+source = "git+https://github.com/SceneWorks/inference?rev=dbda066a079173380e544b690cfa455dee9b77b4#dbda066a079173380e544b690cfa455dee9b77b4"
 dependencies = [
  "minijinja",
  "minijinja-contrib",
@@ -1259,7 +1272,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2803,7 +2816,7 @@ dependencies = [
 [[package]]
 name = "mlx-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.0#431b4e19c4651ad2e56d1e3dacf999678eac23a2"
+source = "git+https://github.com/SceneWorks/inference?rev=dbda066a079173380e544b690cfa455dee9b77b4#dbda066a079173380e544b690cfa455dee9b77b4"
 dependencies = [
  "core-llm",
  "half",
@@ -3023,7 +3036,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 2.0.2",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -3936,7 +3949,7 @@ dependencies = [
 [[package]]
 name = "runtime-catalog"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.0#431b4e19c4651ad2e56d1e3dacf999678eac23a2"
+source = "git+https://github.com/SceneWorks/inference?rev=dbda066a079173380e544b690cfa455dee9b77b4#dbda066a079173380e544b690cfa455dee9b77b4"
 dependencies = [
  "core-llm",
  "sceneworks-gen-core",
@@ -3946,7 +3959,7 @@ dependencies = [
 [[package]]
 name = "runtime-cpu"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.0#431b4e19c4651ad2e56d1e3dacf999678eac23a2"
+source = "git+https://github.com/SceneWorks/inference?rev=dbda066a079173380e544b690cfa455dee9b77b4#dbda066a079173380e544b690cfa455dee9b77b4"
 dependencies = [
  "candle-llm",
  "runtime-catalog",
@@ -3955,7 +3968,7 @@ dependencies = [
 [[package]]
 name = "runtime-cuda"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.0#431b4e19c4651ad2e56d1e3dacf999678eac23a2"
+source = "git+https://github.com/SceneWorks/inference?rev=dbda066a079173380e544b690cfa455dee9b77b4#dbda066a079173380e544b690cfa455dee9b77b4"
 dependencies = [
  "candle-llm",
  "runtime-catalog",
@@ -3964,7 +3977,7 @@ dependencies = [
 [[package]]
 name = "runtime-macos"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.0#431b4e19c4651ad2e56d1e3dacf999678eac23a2"
+source = "git+https://github.com/SceneWorks/inference?rev=dbda066a079173380e544b690cfa455dee9b77b4#dbda066a079173380e544b690cfa455dee9b77b4"
 dependencies = [
  "mlx-llm",
  "runtime-catalog",
@@ -3995,7 +4008,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4078,7 +4091,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core"
 version = "0.1.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.0#431b4e19c4651ad2e56d1e3dacf999678eac23a2"
+source = "git+https://github.com/SceneWorks/inference?rev=dbda066a079173380e544b690cfa455dee9b77b4#dbda066a079173380e544b690cfa455dee9b77b4"
 dependencies = [
  "core-llm",
  "exr",
@@ -5857,7 +5870,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -198,6 +198,10 @@ pub fn adopt_cached_hf_model(
         candidate.pack.as_deref(),
         request.quantize,
     )?;
+    ensure_weight_format_supported(
+        request.quantize,
+        crate::inference_runtime::backend_capabilities(),
+    )?;
     let model_ref = HfModelRef {
         repo: candidate.repo.clone(),
         revision: candidate.revision.clone(),
@@ -286,11 +290,24 @@ pub fn load_registered_model(
             .as_deref()
             .or(entry.projector_source.as_deref()),
     )?;
+    ensure_weight_format_supported(
+        entry.quantize,
+        crate::inference_runtime::backend_capabilities(),
+    )?;
+    // The CUDA-graph switch is a load option (the CUDA runtime settles the model's stream at
+    // load), so the saved setting is read here and a change applies on the next load.
+    let cuda_graphs_setting = crate::app_settings::load_app_settings(app)
+        .map(|settings| settings.runtime.cuda_graphs)
+        .unwrap_or(false);
     let status = engine.load_model(LoadModelRequest {
         source: entry.local_path.clone(),
         display_name: Some(entry.name.clone()),
         quantize: entry.quantize,
         projector_source: projector_source.clone(),
+        cuda_graphs: load_cuda_graphs(
+            cuda_graphs_setting,
+            crate::inference_runtime::backend_capabilities(),
+        ),
     })?;
     // A present empty string from the picker is an intentional "Text only" selection. Keep it
     // distinct from an omitted command argument, which preserves an existing association.
@@ -338,6 +355,11 @@ async fn import_hf_model_inner(
 ) -> Result<ModelRegistry, String> {
     let model_ref = HfModelRef::parse(&request.source_url)?;
     let projector_ref = parse_projector_ref(&model_ref, request.projector_source.as_deref())?;
+    // An unavailable weight format is refused before any download, with the runtime's reason.
+    ensure_weight_format_supported(
+        request.quantize,
+        crate::inference_runtime::backend_capabilities(),
+    )?;
     let data_dir = app_data_dir(app)?;
     let snapshots_dir = data_dir.join("models").join("snapshots");
     let snapshot_dir = snapshots_dir.join(snapshot_dir_name(&model_ref));
@@ -601,6 +623,31 @@ fn parse_projector_ref(
         );
     }
     Ok(Some(projector))
+}
+
+/// NVFP4 is a device capability, not a storage format: refuse it up front, with the runtime's own
+/// reason, where the runtime reports it unavailable (below sm_120, Candle CPU, MLX), rather than
+/// registering an entry that can never load (sc-24139).
+pub(crate) fn ensure_weight_format_supported(
+    quantize: Option<QuantizeRequest>,
+    capabilities: &crate::core_llm::BackendCapabilities,
+) -> Result<(), String> {
+    if quantize == Some(QuantizeRequest::Nvfp4) && !capabilities.nvfp4.supported {
+        return Err(capabilities.nvfp4.reason.clone().unwrap_or_else(|| {
+            "nvfp4: NVFP4 weights are not available on this runtime".to_string()
+        }));
+    }
+    Ok(())
+}
+
+/// The runtime load's CUDA-graph switch for the saved setting: sent explicitly (so the setting,
+/// not an environment default, decides) where the runtime honours the switch, and omitted where
+/// it reports the switch unavailable.
+pub(crate) fn load_cuda_graphs(
+    setting: bool,
+    capabilities: &crate::core_llm::BackendCapabilities,
+) -> Option<bool> {
+    capabilities.cuda_graphs.supported.then_some(setting)
 }
 
 fn validate_quantize_request(
@@ -1240,6 +1287,7 @@ fn matching_provider(path: &Path) -> Result<Option<crate::core_llm::TextLlmDescr
         source,
         projector_source: None,
         quantize: None,
+        cuda_graphs: None,
     };
     Ok(crate::inference_runtime::textllms()
         .find(|registration| (registration.can_load)(&spec))
@@ -1514,8 +1562,7 @@ fn emit_progress(app: &AppHandle, payload: ImportProgress) {
 
 fn model_id(model_ref: &HfModelRef, quantize: Option<QuantizeRequest>) -> String {
     let suffix = match quantize {
-        Some(QuantizeRequest::Q4) => "q4",
-        Some(QuantizeRequest::Q8) => "q8",
+        Some(format) => format.label(),
         None => "dense",
     };
     let base = format!(
@@ -1546,6 +1593,7 @@ fn model_name(model_ref: &HfModelRef, quantize: Option<QuantizeRequest>) -> Stri
     match quantize {
         Some(QuantizeRequest::Q4) => format!("{base}{source} Q4"),
         Some(QuantizeRequest::Q8) => format!("{base}{source} Q8"),
+        Some(QuantizeRequest::Nvfp4) => format!("{base}{source} NVFP4"),
         None => format!("{base}{source}"),
     }
 }
@@ -1721,6 +1769,83 @@ mod tests {
         );
         assert!(validate_quantize_request("gguf", None, Some(QuantizeRequest::Q4)).is_err());
         assert!(validate_quantize_request("gguf", None, None).is_ok());
+        assert!(
+            validate_quantize_request("gguf", None, Some(QuantizeRequest::Nvfp4)).is_err(),
+            "NVFP4 quantizes from a dense snapshot, never a GGUF"
+        );
+    }
+
+    fn capabilities(nvfp4: bool, graphs: bool) -> crate::core_llm::BackendCapabilities {
+        use crate::core_llm::FeatureSupport;
+        crate::core_llm::BackendCapabilities {
+            backend: "candle-cuda".to_string(),
+            device: "cuda:0".to_string(),
+            compute_capability: Some(if nvfp4 { (12, 0) } else { (8, 9) }),
+            nvfp4: if nvfp4 {
+                FeatureSupport::available()
+            } else {
+                FeatureSupport::unavailable(
+                    "nvfp4: NVFP4 projections need compute capability >= sm_120; this GPU is sm_89",
+                )
+            },
+            cuda_graphs: if graphs {
+                FeatureSupport::available()
+            } else {
+                FeatureSupport::unavailable("cuda_graphs: cuda_feature_off")
+            },
+        }
+    }
+
+    /// AC2 (sc-24139): NVFP4 is refused up front with the runtime's own reason where the runtime
+    /// reports it unavailable, and allowed on sm_120; every other format is unaffected.
+    #[test]
+    fn nvfp4_is_gated_on_the_runtime_capability_with_its_reason() {
+        let below = capabilities(false, true);
+        let error =
+            ensure_weight_format_supported(Some(QuantizeRequest::Nvfp4), &below).unwrap_err();
+        assert!(
+            error.starts_with("nvfp4: ") && error.contains("sm_89"),
+            "{error}"
+        );
+        for other in [None, Some(QuantizeRequest::Q4), Some(QuantizeRequest::Q8)] {
+            assert!(ensure_weight_format_supported(other, &below).is_ok());
+        }
+        let blackwell = capabilities(true, true);
+        assert!(ensure_weight_format_supported(Some(QuantizeRequest::Nvfp4), &blackwell).is_ok());
+        // The CPU runtime linked into this test build reports NVFP4 unavailable with a reason.
+        #[cfg(not(all(not(target_os = "macos"), feature = "cuda")))]
+        assert!(ensure_weight_format_supported(
+            Some(QuantizeRequest::Nvfp4),
+            crate::inference_runtime::backend_capabilities()
+        )
+        .unwrap_err()
+        .starts_with("nvfp4: "));
+    }
+
+    /// AC3 (sc-24139): the saved CUDA-graph setting is sent explicitly where the runtime honours
+    /// the switch, and omitted where the runtime reports it unavailable.
+    #[test]
+    fn the_cuda_graph_setting_maps_to_the_load_request() {
+        assert_eq!(
+            load_cuda_graphs(true, &capabilities(true, true)),
+            Some(true)
+        );
+        assert_eq!(
+            load_cuda_graphs(false, &capabilities(true, true)),
+            Some(false)
+        );
+        assert_eq!(load_cuda_graphs(true, &capabilities(true, false)), None);
+        assert_eq!(load_cuda_graphs(false, &capabilities(true, false)), None);
+    }
+
+    #[test]
+    fn nvfp4_entries_are_distinct_registry_models() {
+        let model_ref = HfModelRef::parse("Qwen/Qwen3.8-27B").unwrap();
+        let nvfp4 = model_id(&model_ref, Some(QuantizeRequest::Nvfp4));
+        assert!(nvfp4.ends_with("--nvfp4"), "{nvfp4}");
+        assert_ne!(nvfp4, model_id(&model_ref, None));
+        assert_ne!(nvfp4, model_id(&model_ref, Some(QuantizeRequest::Q8)));
+        assert!(model_name(&model_ref, Some(QuantizeRequest::Nvfp4)).ends_with(" NVFP4"));
     }
 
     #[test]

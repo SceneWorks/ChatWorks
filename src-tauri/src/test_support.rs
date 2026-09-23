@@ -10,10 +10,13 @@
 #![cfg(test)]
 
 use crate::core_llm::{
-    Channel, FinishReason, GenerationTimings, LoadSpec, MtpCapabilities, MtpStats, StreamEvent,
+    Channel, CudaGraphsReport, DecodeReport, FinishReason, GenerationTimings, LoadReport, LoadSpec,
+    MtpCapabilities, MtpStats, PathReport, ProjectionReport, ProposerKind, Quantize, StreamEvent,
     TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingMode,
     Usage,
 };
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 /// A weightless `TextLlm` that streams a reasoning token then a content token and finishes `Stop`.
@@ -21,11 +24,85 @@ use std::time::Duration;
 pub struct FakeProvider {
     pub descriptor: TextLlmDescriptor,
     pub emit_telemetry: bool,
+    /// The load report this fake returns (`None` = a provider that does not report one).
+    pub load_report: Option<LoadReport>,
+}
+
+/// The decode report the telemetry fake emits: native MTP under the load's CUDA-graph switch,
+/// with the graph runner falling back for a named reason, and NVFP4 projections served by the
+/// decode GEMV after a cuBLASLt prefill (sc-24139).
+pub fn fake_decode_report() -> DecodeReport {
+    DecodeReport {
+        path: "mtp".to_string(),
+        proposer: ProposerKind::Mtp,
+        draft_tokens: Some(2),
+        sampler: "device".to_string(),
+        kv_cache: "static".to_string(),
+        attention: "gqa".to_string(),
+        cuda_graphs: CudaGraphsReport {
+            enabled: true,
+            path: "eager".to_string(),
+            replayed: 0,
+            eager: 3,
+            captured: 0,
+            fallback_reason: Some("deltanet_state_unstable".to_string()),
+        },
+        nvfp4_projections: PathReport {
+            path: "mixed".to_string(),
+            reason: Some("rows".to_string()),
+        },
+        fused_primitives: PathReport {
+            path: "fused".to_string(),
+            reason: None,
+        },
+        target_forwards: 2,
+        proposed_tokens: 4,
+        accepted_tokens: 3,
+        replay_forwards: 0,
+    }
+}
+
+/// What a recording loader saw of one `LoadSpec`: the weight format and the CUDA-graph switch.
+pub type RecordedLoad = (Option<Quantize>, Option<bool>);
+
+/// Every `LoadSpec` a recording loader saw, keyed by source path, so a test can assert what
+/// reached the runtime's load request without sharing state with a concurrently running test.
+pub fn recorded_load_specs() -> &'static Mutex<HashMap<String, RecordedLoad>> {
+    static SPECS: OnceLock<Mutex<HashMap<String, RecordedLoad>>> = OnceLock::new();
+    SPECS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A telemetry fake that records the `LoadSpec` it was handed (see [`recorded_load_specs`]) and
+/// reports a load report naming the requested format.
+pub fn recording_loader(spec: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
+    recorded_load_specs()
+        .lock()
+        .unwrap()
+        .insert(spec.source.clone(), (spec.quantize, spec.cuda_graphs));
+    let mut provider = telemetry_provider();
+    provider.load_report = Some(LoadReport {
+        requested: spec.quantize,
+        projections: vec![ProjectionReport {
+            kind: if spec.quantize == Some(Quantize::Nvfp4) {
+                "nvfp4".to_string()
+            } else {
+                "dense".to_string()
+            },
+            count: 448,
+            params: 1_000,
+            resident_bytes: 562,
+        }],
+    });
+    Ok(Box::new(provider))
 }
 
 impl TextLlm for FakeProvider {
     fn descriptor(&self) -> &TextLlmDescriptor {
         &self.descriptor
+    }
+
+    fn load_report(&self) -> Option<LoadReport> {
+        self.load_report.clone()
     }
 
     fn validate(&self, req: &TextLlmRequest) -> crate::core_llm::Result<()> {
@@ -85,6 +162,7 @@ impl TextLlm for FakeProvider {
                 prefill: Duration::from_millis(12),
                 decode: Duration::from_millis(34),
             }),
+            decode: self.emit_telemetry.then(fake_decode_report),
             finish_reason: Some(FinishReason::Stop),
         })
     }
@@ -96,21 +174,27 @@ pub fn fake_loader(_: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
     Ok(Box::new(FakeProvider {
         descriptor: thinking_descriptor("fake", 8),
         emit_telemetry: false,
+        load_report: None,
     }))
 }
 
 /// A weightless MTP-capable fake that reports deterministic native output evidence. It validates
 /// the full HTTP/SSE telemetry path without loading model weights.
 pub fn fake_telemetry_loader(_: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
+    Ok(Box::new(telemetry_provider()))
+}
+
+fn telemetry_provider() -> FakeProvider {
     let mut descriptor = thinking_descriptor("fake-telemetry", 8);
     descriptor.capabilities.mtp = Some(MtpCapabilities {
         max_draft_tokens: 4,
         recommended_draft_tokens: 2,
     });
-    Ok(Box::new(FakeProvider {
+    FakeProvider {
         descriptor,
         emit_telemetry: true,
-    }))
+        load_report: None,
+    }
 }
 
 /// Build a descriptor for a thinking-capable fake with the given id + `max_new_tokens`.
@@ -172,6 +256,7 @@ impl TextLlm for FakeToolProvider {
             usage,
             mtp: None,
             timings: None,
+            decode: None,
             finish_reason: Some(FinishReason::Stop),
         })
     }

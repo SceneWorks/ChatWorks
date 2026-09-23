@@ -24,6 +24,7 @@ fn qwen35_tool_loop_over_openai_server() {
             display_name: None,
             quantize: None,
             projector_source: None,
+            cuda_graphs: None,
         })
         .expect("load 27B");
 
