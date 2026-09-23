@@ -155,16 +155,22 @@ pub fn list_registered_models(app: &AppHandle) -> Result<ModelRegistry, String> 
 }
 
 pub fn list_cached_hf_models() -> Result<Vec<CachedModelCandidate>, String> {
+    cached_candidates_in_dirs(&hf_cache_dirs())
+}
+
+fn cached_candidates_in_dirs(cache_dirs: &[PathBuf]) -> Result<Vec<CachedModelCandidate>, String> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
-    for cache_dir in hf_cache_dirs() {
-        for snapshot in cached_snapshot_dirs(&cache_dir)? {
+    for cache_dir in cache_dirs {
+        for snapshot in cached_snapshot_dirs(cache_dir)? {
             for source in cached_model_sources(&snapshot)? {
                 let key = source.to_string_lossy().to_string();
                 if !seen.insert(key) {
                     continue;
                 }
-                if let Some(candidate) = cached_model_candidate(&source)? {
+                // The HuggingFace cache may also contain partial downloads, LoRAs, and model
+                // families served by other apps. A bad entry must not hide usable candidates.
+                if let Ok(Some(candidate)) = cached_model_candidate(&source) {
                     candidates.push(candidate);
                 }
             }
@@ -2007,6 +2013,45 @@ mod tests {
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         assert_eq!(candidate.provider_id, "candle-llama");
         assert!(!candidate.supports_vision);
+    }
+
+    #[test]
+    fn cache_scan_keeps_valid_gguf_and_safetensors_when_another_snapshot_is_incomplete() {
+        let root = snapshot_dir("mixed-hf-cache");
+        let snapshot = |repo: &str| root.path().join(repo).join("snapshots").join("rev1");
+
+        let valid = snapshot("models--Qwen--Qwen3-0.6B");
+        fs::create_dir_all(&valid).unwrap();
+        write_snapshot_file(
+            &valid,
+            "config.json",
+            r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3","hidden_size":8}"#,
+        );
+        write_snapshot_file(&valid, "tokenizer.json", "{}");
+        write_snapshot_file(&valid, "model.safetensors", "weights");
+
+        let incomplete = snapshot("models--Other--partial-weights");
+        fs::create_dir_all(&incomplete).unwrap();
+        write_snapshot_file(&incomplete, "model.safetensors", "weights");
+        assert_eq!(
+            cached_model_candidate(&incomplete).unwrap_err(),
+            "downloaded snapshot is missing config.json"
+        );
+
+        let gguf = snapshot("models--prism-ml--Ternary-Bonsai-2-27B-gguf");
+        fs::create_dir_all(&gguf).unwrap();
+        let packed = gguf.join("PQ2_0.gguf");
+        write_minimal_prism_gguf(&packed);
+        write_snapshot_file(&gguf, "broken.gguf", "not GGUF");
+
+        let candidates = cached_candidates_in_dirs(&[root.path().to_path_buf()]).unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates
+            .iter()
+            .any(|model| model.local_path == valid.to_string_lossy()));
+        assert!(candidates
+            .iter()
+            .any(|model| model.local_path == packed.to_string_lossy()));
     }
 
     #[test]
