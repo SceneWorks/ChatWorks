@@ -11,6 +11,8 @@ function validateSelfHostedShells(source) {
   const bootstrap = job.indexOf('echo C:\\Program Files\\Git\\bin>>"%GITHUB_PATH%"');
   assert.ok(bootstrap >= 0 && bootstrap < job.indexOf('uses: dtolnay/rust-toolchain'), 'Git Bash must precede the Rust action');
   assert.match(job, /if not exist "C:\\Program Files\\Git\\bin\\bash.exe" exit \/b 1/);
+  assert.match(job, /name: Configure the Windows compiler\n        uses: ilammy\/msvc-dev-cmd@v1\n        with:\n          arch: x64\n          vsversion: '2022'/);
+  assert.match(job, /call "%VCVARS%"\n          if errorlevel 1 exit \/b 1\n          if \/i not "%VisualStudioVersion%"=="17\.0"/);
 }
 
 test('self-hosted Windows uses installed PowerShell and bootstraps Git Bash before Rust', () => {
@@ -33,6 +35,8 @@ test('workflow guards reject missing defaults, pwsh and missing Git Bash bootstr
     ['defaults:\n      run:\n        shell: powershell', 'defaults:\n      run:\n        shell: pwsh'],
     ['name: Select isolated CUDA build directory\n        shell: powershell', 'name: Select isolated CUDA build directory\n        shell: pwsh'],
     ['echo C:\\Program Files\\Git\\bin>>"%GITHUB_PATH%"', 'echo bootstrap omitted'],
+    ["vsversion: '2022'", "vsversion: '2026'"],
+    ['if /i not "%VisualStudioVersion%"=="17.0"', 'rem compiler guard omitted'],
   ]) {
     assert.ok(workflow.includes(before));
     assert.throws(() => validateSelfHostedShells(workflow.replace(before, after)));
