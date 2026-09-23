@@ -142,7 +142,10 @@ fn qwen3vl_tool_calling_with_image_over_openai_server() {
         );
 
         let call = &choice["message"]["tool_calls"][0];
-        assert_eq!(call["type"], "function", "tool call must be a function call");
+        assert_eq!(
+            call["type"], "function",
+            "tool call must be a function call"
+        );
         assert_eq!(
             call["function"]["name"], "log_color",
             "the model must call log_color ({want})"

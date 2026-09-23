@@ -336,7 +336,11 @@ async fn import_hf_model_inner(
     let snapshots_dir = data_dir.join("models").join("snapshots");
     let snapshot_dir = snapshots_dir.join(snapshot_dir_name(&model_ref));
     let manifest = registry_path(app)?;
-    let token = import_token(crate::profile::root()?.is_some(), read_hf_token(), env_hf_token)?;
+    let token = import_token(
+        crate::profile::root()?.is_some(),
+        read_hf_token(),
+        env_hf_token,
+    )?;
     let client = reqwest::Client::new();
 
     emit_progress(
@@ -1022,7 +1026,7 @@ fn is_packed_prism_gguf(path: &Path) -> bool {
         let width = match ty {
             0 | 1 | 7 => 1,
             2 | 3 => 2,
-            4 | 5 | 6 => 4,
+            4..=6 => 4,
             10..=12 => 8,
             8 => {
                 let len = read_u64(file)?;
@@ -1037,7 +1041,7 @@ fn is_packed_prism_gguf(path: &Path) -> bool {
                 let fixed_width: Option<u64> = match element_type {
                     0 | 1 | 7 => Some(1),
                     2 | 3 => Some(2),
-                    4 | 5 | 6 => Some(4),
+                    4..=6 => Some(4),
                     10..=12 => Some(8),
                     _ => None,
                 };

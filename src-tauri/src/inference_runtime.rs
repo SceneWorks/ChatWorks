@@ -58,7 +58,12 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_eq!(
             ids,
-            ["mlx-llama", "mlx-joycaption", "mlx-starvector-1b", "mlx-starvector-8b"]
+            [
+                "mlx-llama",
+                "mlx-joycaption",
+                "mlx-starvector-1b",
+                "mlx-starvector-8b"
+            ]
         );
 
         #[cfg(not(target_os = "macos"))]

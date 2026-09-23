@@ -46,7 +46,10 @@ impl AppSettings {
         if !matches!(self.sampling.mtp_mode.as_str(), "off" | "auto" | "enabled") {
             return Err("mtp mode must be off, auto, or enabled".to_string());
         }
-        if !matches!(self.sampling.reasoning_effort.as_deref(), None | Some("low" | "medium" | "xhigh")) {
+        if !matches!(
+            self.sampling.reasoning_effort.as_deref(),
+            None | Some("low" | "medium" | "xhigh")
+        ) {
             return Err("reasoning effort must be low, medium, or xhigh".to_string());
         }
         if self.sampling.mtp_draft_tokens == 0 {

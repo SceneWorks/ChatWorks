@@ -5,7 +5,7 @@ application: a Rust backend that loads models and runs inference, fronted by an
 OpenAI-compatible HTTP server and a web chat UI. The inference backend is selected per-platform
 at build time — Apple **MLX** on macOS, cross-platform **Candle** on Windows/Linux — through one
 immutable [`SceneWorks/inference`](https://github.com/SceneWorks/inference) runtime release. The
-current cutover pin is `runtime-2026.07.2`; the bundle re-exports the neutral `core-llm` contract
+current cutover pin is `runtime-2026.09.0`; the bundle re-exports the neutral `core-llm` contract
 and explicitly lists every available provider.
 
 - Running on Windows/Linux (Candle): see [WINDOWS.md](WINDOWS.md).
