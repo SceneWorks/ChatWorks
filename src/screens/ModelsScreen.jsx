@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { CompactSelector, StatusDot } from "@sceneworks/ui";
 import { useApp } from "../state/AppContext";
 import { useConversations } from "../state/ConversationsContext";
-import { formatBytes, isExactGgufUrl, modelSubtitle, unloadServedModel } from "../state/models.js";
+import { formatBytes, isExactGgufUrl, modelSubtitle, modelWeightLabel, unloadServedModel } from "../state/models.js";
 
 export const QUANTIZE_OPTIONS = [
   { id: "dense", label: "Dense (full precision)", value: null },
@@ -301,7 +301,7 @@ export function ModelsScreen() {
                   <div className="model-row-main">
                     <span className="model-row-name">{model.name}</span>
                     <span className="model-row-meta">
-                      {model.repo} · {model.providerFamily} · {model.pack === "bonsai2-packed" ? "Bonsai 2 packed" : model.format === "gguf" ? "GGUF" : "Dense"} · {model.supportsVision ? "Vision" : "Text"}
+                      {model.repo} · {model.modelFamily} · {modelWeightLabel(model)} · {model.supportsVision ? "Vision" : "Text"}
                     </span>
                     {model.unavailableReason ? <span className="model-row-meta">{model.unavailableReason}</span> : null}
                   </div>
