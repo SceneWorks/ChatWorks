@@ -43,6 +43,9 @@ case "$target" in
         exit 1
       fi
     done
+    if [[ "$target" == aarch64-apple-darwin ]]; then
+      node "$root/scripts/package-evidence.mjs" verify-mlx "$package" "$target_dir" "$root"
+    fi
     ;;
   x86_64-unknown-linux-gnu|aarch64-unknown-linux-gnu)
     package="$(find "$bundle_dir/deb" -maxdepth 1 -type f -name '*.deb' -print -quit)"

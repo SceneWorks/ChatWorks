@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 
 const workflow = fs.readFileSync(new URL('../.github/workflows/package-validation.yml', import.meta.url), 'utf8');
+const verifier = fs.readFileSync(new URL('../scripts/verify-tauri-package.sh', import.meta.url), 'utf8');
 function validateSelfHostedShells(source) {
   const job = source.split('  windows-cuda-package:')[1];
   assert.ok(job, 'CUDA packaging job exists');
@@ -34,6 +35,20 @@ function validateCudaSevenZip(source) {
   assert.ok(verification.includes('bash scripts/verify-tauri-package.sh'), 'shell verifier must use the same PATH');
 }
 
+function validateMlxPackage(source) {
+  const hosted = source.split('  windows-cuda-package:')[0];
+  const deployment = hosted.indexOf("run: echo 'MACOSX_DEPLOYMENT_TARGET=26.2' >> \"$GITHUB_ENV\"");
+  const build = hosted.indexOf('run: npm exec tauri -- build --ci --no-sign');
+  const stage = hosted.indexOf('run: node scripts/package-evidence.mjs stage-mlx "$GITHUB_WORKSPACE" "$CARGO_TARGET_DIR"');
+  const verify = hosted.indexOf('run: bash scripts/verify-tauri-package.sh');
+  assert.ok(deployment >= 0 && deployment < build && build < stage && stage < verify,
+    'MLX deployment target must precede build, followed by resource staging and verification');
+  assert.match(hosted, /name: Select the MLX Metal deployment target\n        if: matrix\.backend == 'mlx'/);
+  assert.match(hosted, /name: Stage the executable-linked MLX Metal library\n        if: matrix\.backend == 'mlx'/);
+  assert.equal((source.match(/tests\/mlx-metallib\.test\.mjs/g) ?? []).length, 2,
+    'both package jobs must run the MLX contract tests');
+}
+
 test('self-hosted Windows uses installed PowerShell and bootstraps Git Bash before Rust', () => {
   validateSelfHostedShells(workflow);
   const hosted = workflow.split('  windows-cuda-package:')[0];
@@ -47,6 +62,16 @@ test('six package lanes label Intel macOS CPU and Apple Silicon MLX', () => {
   assert.match(hosted, /runner: macos-26\n            target: aarch64-apple-darwin\n            bundle: app\n            backend: mlx/);
   assert.match(hosted, /runner: macos-26-intel\n            target: x86_64-apple-darwin\n            bundle: app\n            backend: cpu/);
   assert.match(workflow, /  windows-cuda-package:\n/);
+});
+
+test('Apple Silicon build stages and verifies its own Metal library before receipt collection', () => {
+  validateMlxPackage(workflow);
+  assert.match(verifier, /if \[\[ "\$target" == aarch64-apple-darwin \]\]; then\n      node "\$root\/scripts\/package-evidence\.mjs" verify-mlx "\$package" "\$target_dir" "\$root"/);
+  for (const [before, after] of [
+    ['MACOSX_DEPLOYMENT_TARGET=26.2', 'MACOSX_DEPLOYMENT_TARGET=14.0'],
+    ['stage-mlx "$GITHUB_WORKSPACE" "$CARGO_TARGET_DIR"', 'stage-mlx omitted'],
+    ["if: matrix.backend == 'mlx'", "if: matrix.backend == 'cpu'"],
+  ]) assert.throws(() => validateMlxPackage(workflow.replace(before, after)));
 });
 
 test('CUDA job gives shell and native Node a verified 7-Zip executable', () => {

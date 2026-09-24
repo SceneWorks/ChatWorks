@@ -95,7 +95,7 @@ jobs:
             xz
 
       - name: Test package evidence contract
-        run: node --test tests/package-evidence.test.mjs tests/package-workflow.test.mjs tests/verify-tauri-package.test.mjs
+        run: node --test tests/package-evidence.test.mjs tests/mlx-metallib.test.mjs tests/package-workflow.test.mjs tests/verify-tauri-package.test.mjs
 
       - name: Install frontend dependencies
         run: npm ci
@@ -110,8 +110,18 @@ jobs:
         shell: msys2 {0}
         run: bash scripts/provision-ffmpeg-sidecars.sh
 
+      - name: Select the MLX Metal deployment target
+        if: matrix.backend == 'mlx'
+        shell: bash
+        run: echo 'MACOSX_DEPLOYMENT_TARGET=26.2' >> "$GITHUB_ENV"
+
       - name: Build the native Tauri package
         run: npm exec tauri -- build --ci --no-sign --bundles ${{ matrix.bundle }} -- --locked
+
+      - name: Stage the executable-linked MLX Metal library
+        if: matrix.backend == 'mlx'
+        shell: bash
+        run: node scripts/package-evidence.mjs stage-mlx "$GITHUB_WORKSPACE" "$CARGO_TARGET_DIR"
 
       - name: Verify packaged sidecars
         if: runner.os != 'Windows'
@@ -199,7 +209,7 @@ jobs:
           arch: x64
           vsversion: '2022'
       - name: Test package evidence contract
-        run: node --test tests/package-evidence.test.mjs tests/package-workflow.test.mjs tests/verify-tauri-package.test.mjs
+        run: node --test tests/package-evidence.test.mjs tests/mlx-metallib.test.mjs tests/package-workflow.test.mjs tests/verify-tauri-package.test.mjs
 
       - name: Install frontend dependencies
         run: npm ci

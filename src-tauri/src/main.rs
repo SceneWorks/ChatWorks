@@ -338,6 +338,9 @@ fn start_server_from_settings(
 }
 
 fn main() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    chatworks::mlx_metallib::configure_before_app_start()
+        .expect("installed MLX package must contain its matching Metal library");
     let mut context = tauri::generate_context!();
     chatworks::profile::isolate_webviews(context.config_mut()).expect("invalid acceptance profile");
     tauri::Builder::default()
