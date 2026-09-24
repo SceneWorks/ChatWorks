@@ -75,6 +75,9 @@ pub struct ModelEntry {
     /// Weightless loader route selected by `can_load` for this exact snapshot.
     #[serde(default)]
     pub provider_id: Option<String>,
+    /// Quantization already stored in the source snapshot, independent of load-time Q4/Q8.
+    #[serde(default)]
+    pub source_bits: Option<u8>,
     /// User-selected, persisted companion projector for a GGUF language file. This is never
     /// populated implicitly from a directory containing several projector variants.
     #[serde(default)]
@@ -107,6 +110,9 @@ pub struct CachedModelCandidate {
     pub local_path: String,
     pub provider_id: String,
     pub provider_family: String,
+    /// Family from the validated source config, not the provider's weightless descriptor.
+    pub model_family: String,
+    pub source_bits: Option<u8>,
     pub supports_vision: bool,
     pub format: String,
     pub pack: Option<String>,
@@ -232,6 +238,7 @@ pub fn adopt_cached_hf_model(
         format: candidate.format,
         pack: candidate.pack,
         provider_id: Some(candidate.provider_id),
+        source_bits: candidate.source_bits,
         projector_source: projector_source.clone(),
         projector_sources: candidate.projector_sources,
     };
@@ -323,10 +330,16 @@ pub fn load_registered_model(
     Ok(status)
 }
 
-pub fn hf_token_status() -> HfTokenStatus {
-    HfTokenStatus {
-        present: read_hf_token().ok().flatten().is_some(),
-    }
+pub fn hf_token_status() -> Result<HfTokenStatus, String> {
+    hf_status_from_read(read_hf_token)
+}
+
+fn hf_status_from_read<E: std::fmt::Display>(
+    read: impl FnOnce() -> Result<Option<String>, E>,
+) -> Result<HfTokenStatus, String> {
+    Ok(HfTokenStatus {
+        present: read().map_err(|error| error.to_string())?.is_some(),
+    })
 }
 
 pub fn set_hf_token(request: SetHfTokenRequest) -> Result<HfTokenStatus, String> {
@@ -339,15 +352,14 @@ pub fn set_hf_token(request: SetHfTokenRequest) -> Result<HfTokenStatus, String>
     entry
         .set_password(token)
         .map_err(|error| error.to_string())?;
-    Ok(hf_token_status())
+    Ok(HfTokenStatus { present: true })
 }
 
 pub fn clear_hf_token() -> Result<HfTokenStatus, String> {
     let entry = crate::profile::credential(HF_KEYCHAIN_SERVICE, HF_KEYCHAIN_USER)
         .map_err(|error| error.to_string())?;
     match entry.delete_credential() {
-        Ok(()) => Ok(hf_token_status()),
-        Err(keyring::Error::NoEntry) => Ok(hf_token_status()),
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(HfTokenStatus { present: false }),
         Err(error) => Err(error.to_string()),
     }
 }
@@ -406,6 +418,7 @@ async fn import_hf_model_inner(
     // single weight shard is fetched.
     let files = config_first(files);
     ensure_snapshot_config_listed(&files, request.quantize)?;
+    preflight_cpu_import(&client, &model_ref, &files, token.as_deref()).await?;
     let total_bytes = sum_known_sizes(&files);
     fs::create_dir_all(&snapshot_dir).map_err(|error| error.to_string())?;
 
@@ -470,6 +483,7 @@ async fn import_hf_model_inner(
         unsupported_model_source_error(&source, "downloaded model is not supported")
     })?;
     let (format, pack) = recognized_model_format(&source)?;
+    let (_, source_bits) = source_model_metadata(&source)?;
     validate_quantize_request(&format, pack.as_deref(), request.quantize)?;
     let projector_source = projector_ref
         .as_ref()
@@ -495,6 +509,7 @@ async fn import_hf_model_inner(
         format,
         pack,
         provider_id: Some(provider.id),
+        source_bits,
         projector_source,
         projector_sources: if source.is_file() {
             sibling_projector_sources(&source)?
@@ -556,6 +571,89 @@ async fn fetch_hf_files(
     }
     files.sort_by(|a, b| a.rfilename.cmp(&b.rfilename));
     select_import_files(files, model_ref, projector_ref)
+}
+
+/// Resolve CPU capability before creating a snapshot or starting its file-download loop.
+/// A config request is small and lets renamed/fine-tuned safetensors use the same content
+/// identity as cache adoption; published packed GGUF has no config sidecar to inspect.
+async fn preflight_cpu_import(
+    client: &reqwest::Client,
+    model_ref: &HfModelRef,
+    files: &[HfSibling],
+    token: Option<&str>,
+) -> Result<(), String> {
+    if !cpu_build() {
+        return Ok(());
+    }
+    guard_cpu_import(model_ref, files, None, true)?;
+    if files
+        .iter()
+        .any(|file| file.rfilename.ends_with(".safetensors"))
+    {
+        let config = fetch_import_config(client, model_ref, token).await?;
+        return guard_cpu_import(model_ref, files, Some(&config), true);
+    }
+    guard_cpu_import(model_ref, files, None, true)
+}
+
+fn guard_cpu_import(
+    model_ref: &HfModelRef,
+    files: &[HfSibling],
+    config: Option<&serde_json::Value>,
+    cpu: bool,
+) -> Result<(), String> {
+    if !cpu {
+        return Ok(());
+    }
+    let unsupported_config = config.is_some_and(is_accelerator_only_config);
+    if unsupported_config
+        || (is_published_accelerator_only_repo(&model_ref.repo) && !files.is_empty())
+    {
+        return Err(CPU_MODEL_UNAVAILABLE.to_string());
+    }
+    Ok(())
+}
+
+fn is_published_accelerator_only_repo(repo: &str) -> bool {
+    [
+        "Qwen/Qwen3.8-27B",
+        "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit",
+        "prism-ml/Ternary-Bonsai-2-27B-gguf",
+    ]
+    .iter()
+    .any(|published| repo.eq_ignore_ascii_case(published))
+}
+
+async fn fetch_import_config(
+    client: &reqwest::Client,
+    model_ref: &HfModelRef,
+    token: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let url = format!(
+        "https://{}/{}/resolve/{}/config.json",
+        HF_HOST, model_ref.repo, model_ref.revision
+    );
+    let mut request = client.get(url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| format!("cannot inspect model config before import: {error}"))?;
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| error.to_string())?;
+        if body.len().saturating_add(chunk.len()) > 1024 * 1024 {
+            return Err("model config is too large to inspect before import".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body)
+        .map_err(|error| format!("cannot inspect model config before import: {error}"))
 }
 
 /// Import one direct GGUF at a time. This prevents a repo that publishes PQ2, PTQ1, and projector
@@ -926,7 +1024,7 @@ fn is_loadable_model_file(name: &str) -> bool {
         || name == "special_tokens_map.json"
         || name == "generation_config.json"
         || name == "hadamard.json"
-        || name == "PACK-RUNTIME"
+        || matches!(name, "PACK-RUNTIME" | "PACK-RUNTIME.md")
         || name.ends_with(".safetensors")
         || name.ends_with(".safetensors.index.json")
         || name.ends_with(".gguf")
@@ -1018,12 +1116,46 @@ fn recognized_model_format(path: &Path) -> Result<(String, Option<String>), Stri
         };
     }
     let hadamard = path.join("hadamard.json").is_file();
-    let runtime = path.join("PACK-RUNTIME").is_file();
+    let runtime = has_prism_runtime_marker(path);
     match (hadamard, runtime) {
         (false, false) => Ok((default_model_format(), None)),
         (true, true) => Ok(("hf-safetensors".to_string(), Some("bonsai2-packed".to_string()))),
-        _ => Err("Prism/Bonsai snapshot has incomplete packing sidecars (need hadamard.json and PACK-RUNTIME)".to_string()),
+        _ => Err("Prism/Bonsai snapshot has incomplete packing sidecars (need hadamard.json and PACK-RUNTIME.md)".to_string()),
     }
+}
+
+fn has_prism_runtime_marker(path: &Path) -> bool {
+    path.join("PACK-RUNTIME.md").is_file() || path.join("PACK-RUNTIME").is_file()
+}
+
+fn source_model_metadata(path: &Path) -> Result<(String, Option<u8>), String> {
+    if path.is_file() {
+        let gguf = gguf_identity(path);
+        return Ok((
+            match gguf {
+                Some((ref architecture, true)) if architecture == "qwen35" => {
+                    "prism_hadamard_qwen35".to_string()
+                }
+                Some((architecture, _)) => architecture,
+                None => "unknown".to_string(),
+            },
+            None,
+        ));
+    }
+    let body = fs::read_to_string(path.join("config.json")).map_err(|error| error.to_string())?;
+    let config: serde_json::Value =
+        serde_json::from_str(&body).map_err(|error| error.to_string())?;
+    let family = config["model_type"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+    let bits = config["quantization_config"]["bits"]
+        .as_u64()
+        .or_else(|| config["quantization"]["bits"].as_u64())
+        .filter(|bits| (1..=8).contains(bits))
+        .and_then(|bits| u8::try_from(bits).ok());
+    Ok((family, bits))
 }
 
 fn imported_model_source(snapshot_dir: &Path, model_ref: &HfModelRef) -> Result<PathBuf, String> {
@@ -1137,6 +1269,10 @@ fn is_qwen38_parent_config(config: &serde_json::Value) -> bool {
         && text["vocab_size"] == 248320
 }
 
+fn is_accelerator_only_config(config: &serde_json::Value) -> bool {
+    is_qwen38_parent_config(config) || config["model_type"] == "prism_hadamard_qwen35"
+}
+
 fn is_accelerator_only_model(path: &Path) -> Result<bool, String> {
     if !path.exists() {
         return Ok(false);
@@ -1149,15 +1285,14 @@ fn is_accelerator_only_model(path: &Path) -> Result<bool, String> {
     let body = fs::read_to_string(path.join("config.json")).map_err(|error| error.to_string())?;
     let config: serde_json::Value =
         serde_json::from_str(&body).map_err(|error| error.to_string())?;
-    Ok(is_qwen38_parent_config(&config)
-        || (path.join("hadamard.json").is_file()
-            && path.join("PACK-RUNTIME").is_file()
-            && config["model_type"] == "prism_hadamard_qwen35"))
+    // This config is checked as soon as it is downloaded, before the sidecars arrive.
+    // The exact Prism model type is sufficient for a protective CPU rejection.
+    Ok(is_accelerator_only_config(&config))
 }
 
-/// Reads only GGUF metadata and tensor directory; no weight bytes are touched. A malformed
-/// header is left to the provider's ordinary validation path rather than labeled Bonsai.
-fn is_packed_prism_gguf(path: &Path) -> bool {
+/// Reads only GGUF metadata and, for Qwen35, its tensor directory. Weight bytes are never read.
+/// A malformed header is left to the provider's ordinary validation path.
+fn gguf_identity(path: &Path) -> Option<(String, bool)> {
     fn read_u32(file: &mut fs::File) -> std::io::Result<u32> {
         let mut bytes = [0; 4];
         file.read_exact(&mut bytes)?;
@@ -1224,58 +1359,66 @@ fn is_packed_prism_gguf(path: &Path) -> bool {
         };
         skip(file, width, file_len)
     }
-    fn probe(path: &Path) -> std::io::Result<bool> {
+    fn probe(path: &Path) -> std::io::Result<(String, bool)> {
         let mut file = fs::File::open(path)?;
         let file_len = file.metadata()?.len();
         if read_u32(&mut file)? != u32::from_le_bytes(*b"GGUF")
             || !matches!(read_u32(&mut file)?, 2 | 3)
         {
-            return Ok(false);
+            return Err(std::io::ErrorKind::InvalidData.into());
         }
         let tensors = read_u64(&mut file)?;
         let metadata = read_u64(&mut file)?;
         if tensors > 1_000_000 || metadata > 1_000_000 {
-            return Ok(false);
+            return Err(std::io::ErrorKind::InvalidData.into());
         }
-        let mut qwen35 = false;
+        let mut architecture = None;
         for _ in 0..metadata {
             let key = read_string(&mut file, file_len)?;
             let ty = read_u32(&mut file)?;
             if key == "general.architecture" && ty == 8 {
-                qwen35 = read_string(&mut file, file_len)? == "qwen35";
+                architecture = Some(read_string(&mut file, file_len)?);
             } else {
                 skip_value(&mut file, ty, file_len)?;
             }
         }
-        if !qwen35 {
-            return Ok(false);
+        let architecture = architecture.ok_or(std::io::ErrorKind::InvalidData)?;
+        if architecture != "qwen35" {
+            return Ok((architecture, false));
         }
         let mut packed = false;
         for _ in 0..tensors {
             let _name = read_string(&mut file, file_len)?;
             let rank = read_u32(&mut file)?;
             if !(1..=4).contains(&rank) {
-                return Ok(false);
+                return Err(std::io::ErrorKind::InvalidData.into());
             }
             skip(&mut file, u64::from(rank) * 8, file_len)?;
             let ty = read_u32(&mut file)?;
             skip(&mut file, 8, file_len)?; // tensor data offset
             packed |= matches!(ty, 142 | 143);
         }
-        Ok(packed)
+        Ok((architecture, packed))
     }
-    probe(path).unwrap_or(false)
+    probe(path).ok()
+}
+
+fn is_packed_prism_gguf(path: &Path) -> bool {
+    gguf_identity(path).is_some_and(|(architecture, packed)| architecture == "qwen35" && packed)
 }
 
 const CPU_MODEL_UNAVAILABLE: &str = "Qwen3.8-27B and Bonsai 2 inference require Apple MLX or Candle CUDA; this ChatWorks build uses Candle CPU";
 
 fn cpu_model_unavailable_reason(path: &Path) -> Result<Option<&'static str>, String> {
-    let cpu = cfg!(all(
+    cpu_model_unavailable_reason_for(path, cpu_build())
+}
+
+fn cpu_build() -> bool {
+    cfg!(all(
         not(all(target_os = "macos", target_arch = "aarch64")),
         feature = "cpu",
         not(feature = "cuda")
-    ));
-    cpu_model_unavailable_reason_for(path, cpu)
+    ))
 }
 
 fn cpu_model_unavailable_reason_for(
@@ -1308,6 +1451,7 @@ fn validate_text_snapshot_config(path: &Path) -> Result<(), String> {
         && !is_joycaption_config(&config)
         && !is_qwen35_vision_config(&config)
         && !is_qwen3vl_vision_config(&config)
+        && config["model_type"] != "prism_hadamard_qwen35"
     {
         let model_type = config
             .get("model_type")
@@ -1364,6 +1508,7 @@ fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, S
     let file_count = snapshot_file_count(path)?;
     let size_bytes = snapshot_size_bytes(path);
     let (format, pack) = recognized_model_format(path)?;
+    let (model_family, source_bits) = source_model_metadata(path)?;
     Ok(Some(CachedModelCandidate {
         id: model_id(&model_ref, None),
         name: model_name(&model_ref, None),
@@ -1372,13 +1517,16 @@ fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, S
         local_path: path.to_string_lossy().to_string(),
         provider_id: provider.id,
         provider_family: provider.family,
+        model_family,
+        source_bits,
         // The static provider descriptor is weightless, so the `mlx-llama` Qwen3.6/Qwen3-VL VLM
         // advertises vision only once loaded; detect it from the snapshot config so the UI offers
         // image input before load.
         supports_vision: path.is_dir()
             && (provider.capabilities.supports_vision
                 || is_qwen35_vision_snapshot(path)?
-                || is_qwen3vl_vision_snapshot(path)?),
+                || is_qwen3vl_vision_snapshot(path)?
+                || provider_weightless_vision(path)),
         format,
         pack,
         file_count,
@@ -1403,6 +1551,19 @@ fn matching_provider(path: &Path) -> Result<Option<crate::core_llm::TextLlmDescr
     Ok(crate::inference_runtime::textllms()
         .find(|registration| (registration.can_load)(&spec))
         .map(|registration| (registration.descriptor)()))
+}
+
+fn provider_weightless_vision(path: &Path) -> bool {
+    let spec = LoadSpec {
+        source: path.to_string_lossy().to_string(),
+        projector_source: None,
+        quantize: None,
+        cuda_graphs: None,
+    };
+    crate::inference_runtime::textllms()
+        .find(|registration| (registration.can_load)(&spec))
+        .and_then(|registration| registration.weightless_vision)
+        .is_some_and(|probe| probe(&spec))
 }
 
 fn is_joycaption_snapshot(path: &Path) -> Result<bool, String> {
@@ -1559,7 +1720,8 @@ fn snapshot_size_bytes(path: &Path) -> Option<u64> {
     }
     let mut total = 0_u64;
     for entry in fs::read_dir(path).ok()?.filter_map(Result::ok) {
-        let metadata = entry.metadata().ok()?;
+        // Hugging Face snapshots link files into the repository's blobs directory.
+        let metadata = fs::metadata(entry.path()).ok()?;
         if metadata.is_file() {
             total = total.checked_add(metadata.len())?;
         }
@@ -1580,7 +1742,18 @@ fn read_registry(path: &Path) -> Result<ModelRegistry, String> {
         return Ok(ModelRegistry::default());
     }
     let body = fs::read_to_string(path).map_err(|error| error.to_string())?;
-    serde_json::from_str(&body).map_err(|error| error.to_string())
+    let mut registry: ModelRegistry =
+        serde_json::from_str(&body).map_err(|error| error.to_string())?;
+    for model in &mut registry.models {
+        if model.source_bits.is_none() && model.format == "hf-safetensors" {
+            // Older manifests lack this field. Refresh it from a local config for display,
+            // without rewriting the manifest or changing the selected load quantization.
+            if let Ok((_, bits)) = source_model_metadata(Path::new(&model.local_path)) {
+                model.source_bits = bits;
+            }
+        }
+    }
+    Ok(registry)
 }
 
 fn write_registry(path: &Path, registry: &ModelRegistry) -> Result<(), String> {
@@ -1649,7 +1822,13 @@ fn import_token(
         })
     } else {
         // Preserve the ordinary profile's existing Keychain/environment precedence.
-        Ok(scoped.ok().flatten().or_else(environment))
+        match scoped {
+            Ok(Some(token)) => Ok(Some(token)),
+            Ok(None) => Ok(environment()),
+            Err(error) => environment()
+                .ok_or_else(|| format!("could not read HuggingFace credential: {error}"))
+                .map(Some),
+        }
     }
 }
 
@@ -2105,6 +2284,7 @@ mod tests {
             format: default_model_format(),
             pack: None,
             provider_id: None,
+            source_bits: None,
             projector_source: None,
             projector_sources: Vec::new(),
         };
@@ -2181,6 +2361,21 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_gguf_family_comes_from_bounded_header_metadata() {
+        let dir = snapshot_dir("gguf-family");
+        let source = dir.path().join("ordinary.gguf");
+        write_gguf_with_tensor_type(&source, "qwen2", 0);
+        assert_eq!(
+            source_model_metadata(&source).unwrap(),
+            ("qwen2".to_string(), None)
+        );
+        assert!(!is_packed_prism_gguf(&source));
+        let malformed = dir.path().join("malformed.gguf");
+        fs::write(&malformed, b"GGUF").unwrap();
+        assert_eq!(source_model_metadata(&malformed).unwrap().0, "unknown");
+    }
+
+    #[test]
     fn projector_must_be_an_explicit_same_snapshot_gguf() {
         let dir = snapshot_dir("projector-association");
         let model = dir.path().join("PQ2_0.gguf");
@@ -2204,13 +2399,19 @@ mod tests {
         );
         write_snapshot_file(&dir, "hadamard.json", "{}");
         assert!(recognized_model_format(dir.path()).is_err());
-        write_snapshot_file(&dir, "PACK-RUNTIME", "ptq1");
+        write_snapshot_file(&dir, "PACK-RUNTIME.md", "published runtime instructions");
         assert_eq!(
             recognized_model_format(dir.path()).unwrap().1.as_deref(),
             Some("bonsai2-packed")
         );
         assert!(is_loadable_model_file("hadamard.json"));
-        assert!(is_loadable_model_file("PACK-RUNTIME"));
+        assert!(is_loadable_model_file("PACK-RUNTIME.md"));
+        fs::remove_file(dir.path().join("PACK-RUNTIME.md")).unwrap();
+        write_snapshot_file(&dir, "PACK-RUNTIME", "legacy marker");
+        assert_eq!(
+            recognized_model_format(dir.path()).unwrap().1.as_deref(),
+            Some("bonsai2-packed")
+        );
     }
 
     #[test]
@@ -2234,9 +2435,85 @@ mod tests {
 
         let bonsai = serde_json::json!({"model_type": "prism_hadamard_qwen35"});
         write_snapshot_file(&root, "config.json", &bonsai.to_string());
+        // Import checks config.json before either packing sidecar has downloaded.
+        assert!(cpu_model_unavailable_reason_for(root.path(), true)
+            .unwrap()
+            .is_some());
         write_snapshot_file(&root, "hadamard.json", "{}");
-        write_snapshot_file(&root, "PACK-RUNTIME", "ptq1");
+        write_snapshot_file(&root, "PACK-RUNTIME.md", "published runtime instructions");
         assert!(is_accelerator_only_model(root.path()).unwrap());
+        assert!(cpu_model_unavailable_reason_for(root.path(), true)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn cpu_import_preflight_rejects_before_any_selected_file_is_downloadable() {
+        let qwen = HfModelRef::parse("Qwen/Qwen3.8-27B").unwrap();
+        // The first selected file is the one that previously started downloading before
+        // config.json could reach the in-loop CPU guard.
+        let files = vec![
+            HfSibling {
+                rfilename: "chat_template.jinja".to_string(),
+                size: Some(8_700),
+            },
+            HfSibling {
+                rfilename: "config.json".to_string(),
+                size: Some(2_000),
+            },
+            HfSibling {
+                rfilename: "model-00001-of-00002.safetensors".to_string(),
+                size: Some(26_000_000_000),
+            },
+        ];
+        let parent = serde_json::json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "vision_config": {"model_type": "qwen3_5"},
+            "text_config": {"model_type": "qwen3_5_text", "hidden_size": 5120,
+                            "num_hidden_layers": 64, "vocab_size": 248320,
+                            "mtp_num_hidden_layers": 1}
+        });
+        assert_eq!(
+            guard_cpu_import(&qwen, &files, None, true).unwrap_err(),
+            CPU_MODEL_UNAVAILABLE
+        );
+        let alias = HfModelRef::parse("someone/renamed-qwen-parent").unwrap();
+        assert_eq!(
+            guard_cpu_import(&alias, &files, Some(&parent), true).unwrap_err(),
+            CPU_MODEL_UNAVAILABLE
+        );
+        assert!(guard_cpu_import(&alias, &files, Some(&parent), false).is_ok());
+
+        // A compatible flat text fine-tune must still reach the ordinary CPU import path.
+        assert!(guard_cpu_import(&alias, &files, Some(&parent["text_config"]), true).is_ok());
+        assert!(guard_cpu_import(
+            &alias,
+            &files,
+            Some(&serde_json::json!({"model_type": "prism_hadamard_qwen35"})),
+            true
+        )
+        .is_err());
+
+        let bonsai = HfModelRef::parse("https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf/blob/main/Ternary-Bonsai-2-27B-PQ2_0.gguf").unwrap();
+        let packed = vec![HfSibling {
+            rfilename: "Ternary-Bonsai-2-27B-PQ2_0.gguf".to_string(),
+            size: Some(6_700_000_000),
+        }];
+        assert_eq!(
+            guard_cpu_import(&bonsai, &packed, None, true).unwrap_err(),
+            CPU_MODEL_UNAVAILABLE
+        );
+        assert!(guard_cpu_import(&bonsai, &packed, None, false).is_ok());
+        let ptq = vec![HfSibling {
+            rfilename: "Ternary-Bonsai-2-27B-PTQ1_0.gguf".to_string(),
+            size: Some(5_500_000_000),
+        }];
+        assert!(guard_cpu_import(&bonsai, &ptq, None, true).is_err());
+        let bonsai_mlx = HfModelRef::parse("prism-ml/Ternary-Bonsai-2-27B-mlx-2bit").unwrap();
+        assert!(guard_cpu_import(&bonsai_mlx, &files, None, true).is_err());
+        let ordinary = HfModelRef::parse("someone/ordinary-gguf").unwrap();
+        assert!(guard_cpu_import(&ordinary, &packed, None, true).is_ok());
     }
 
     #[test]
@@ -2437,6 +2714,82 @@ mod tests {
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
         assert_eq!(candidate.provider_id, "candle-llama");
         assert!(!candidate.supports_vision);
+        assert_eq!(candidate.model_family, "qwen3");
+        assert_eq!(candidate.source_bits, None);
+    }
+
+    #[test]
+    fn cached_quantized_snapshot_uses_config_bits_and_symlink_target_size() {
+        let root = snapshot_dir("hf-quantized-symlink");
+        let model_dir = root.path().join("models--mlx-community--Qwen3-1.7B-4bit");
+        let snapshot = model_dir.join("snapshots").join("rev1");
+        fs::create_dir_all(&snapshot).unwrap();
+        write_snapshot_file(
+            &snapshot,
+            "config.json",
+            r#"{"architectures":["Qwen3ForCausalLM"],"model_type":"qwen3","quantization":{"bits":4,"group_size":64},"quantization_config":{"bits":4,"group_size":64}}"#,
+        );
+        write_snapshot_file(&snapshot, "tokenizer.json", "{}");
+        let blobs = model_dir.join("blobs");
+        fs::create_dir_all(&blobs).unwrap();
+        fs::write(blobs.join("weights"), vec![0_u8; 4096]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../../blobs/weights", snapshot.join("model.safetensors"))
+            .unwrap();
+        #[cfg(not(unix))]
+        fs::copy(blobs.join("weights"), snapshot.join("model.safetensors")).unwrap();
+
+        let candidate = cached_model_candidate(&snapshot).unwrap().unwrap();
+        assert_eq!(candidate.model_family, "qwen3");
+        assert_eq!(candidate.source_bits, Some(4));
+        assert!(candidate.size_bytes.unwrap() >= 4096);
+    }
+
+    #[test]
+    fn published_prism_vision_snapshot_is_discoverable_and_cpu_guarded() {
+        let root = snapshot_dir("hf-published-prism");
+        let snapshot = root
+            .path()
+            .join("models--prism-ml--Ternary-Bonsai-2-27B-mlx-2bit")
+            .join("snapshots")
+            .join("3f926b4");
+        fs::create_dir_all(&snapshot).unwrap();
+        write_snapshot_file(
+            &snapshot,
+            "config.json",
+            r#"{"schema_version":2,"model_type":"prism_hadamard_qwen35","base_model_type":"qwen3_5","components":{"text":true,"vision":true,"mtp":false},"quantization":{"bits":2,"group_size":128,"mode":"affine"},"vision_config":{"model_type":"qwen3_5"},"text_config":{"model_type":"qwen3_5_text"}}"#,
+        );
+        write_snapshot_file(&snapshot, "tokenizer.json", "{}");
+        write_snapshot_file(&snapshot, "model.safetensors", "weights");
+        write_snapshot_file(&snapshot, "hadamard.json", "{}");
+        write_snapshot_file(
+            &snapshot,
+            "PACK-RUNTIME.md",
+            "published runtime instructions",
+        );
+
+        assert!(validate_snapshot(&snapshot).is_ok());
+        assert_eq!(
+            recognized_model_format(&snapshot).unwrap().1.as_deref(),
+            Some("bonsai2-packed")
+        );
+        assert!(cpu_model_unavailable_reason_for(&snapshot, true)
+            .unwrap()
+            .is_some());
+        assert!(cpu_model_unavailable_reason_for(&snapshot, false)
+            .unwrap()
+            .is_none());
+        let candidate = cached_model_candidate(&snapshot).unwrap().unwrap();
+        assert_eq!(candidate.model_family, "prism_hadamard_qwen35");
+        assert_eq!(candidate.source_bits, Some(2));
+        assert_eq!(candidate.pack.as_deref(), Some("bonsai2-packed"));
+        assert!(candidate.supports_vision);
+        assert_eq!(
+            cached_candidates_in_dirs(&[root.path().to_path_buf()])
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -2582,6 +2935,7 @@ mod tests {
                 format: default_model_format(),
                 pack: None,
                 provider_id: None,
+                source_bits: None,
                 projector_source: None,
                 projector_sources: Vec::new(),
             },
@@ -2602,6 +2956,7 @@ mod tests {
                 format: default_model_format(),
                 pack: None,
                 provider_id: None,
+                source_bits: None,
                 projector_source: Some("/tmp/mmproj-F16.gguf".to_string()),
                 projector_sources: vec!["/tmp/mmproj-F16.gguf".to_string()],
             },
@@ -2621,6 +2976,63 @@ mod tests {
         assert_eq!(
             restored.models[0].projector_sources,
             vec!["/tmp/mmproj-F16.gguf"]
+        );
+    }
+
+    #[test]
+    fn legacy_registry_enriches_source_bits_without_changing_load_settings_or_manifest() {
+        let dir = snapshot_dir("legacy-source-bits");
+        let snapshot = dir.path().join("snapshot");
+        fs::create_dir_all(&snapshot).unwrap();
+        write_snapshot_file(
+            &snapshot,
+            "config.json",
+            r#"{"model_type":"qwen3","quantization_config":{"bits":4,"group_size":64}}"#,
+        );
+        let manifest = dir.path().join("manifest.json");
+        let entry = ModelEntry {
+            id: "legacy".to_string(),
+            name: "Qwen 4-bit".to_string(),
+            repo: "mlx-community/Qwen3-1.7B-4bit".to_string(),
+            revision: "rev1".to_string(),
+            source_url: "https://huggingface.co/mlx-community/Qwen3-1.7B-4bit".to_string(),
+            local_path: snapshot.to_string_lossy().to_string(),
+            quantize: Some(QuantizeRequest::Q8),
+            imported_at: 42,
+            file_count: 3,
+            size_bytes: Some(4096),
+            format: "hf-safetensors".to_string(),
+            pack: None,
+            provider_id: Some("mlx-llama".to_string()),
+            source_bits: None,
+            projector_source: None,
+            projector_sources: Vec::new(),
+        };
+        let mut value = serde_json::to_value(ModelRegistry {
+            models: vec![entry],
+            selected_id: Some("legacy".to_string()),
+        })
+        .unwrap();
+        value["models"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("sourceBits");
+        let original = serde_json::to_string(&value).unwrap();
+        fs::write(&manifest, &original).unwrap();
+
+        let loaded = read_registry(&manifest).unwrap();
+        assert_eq!(loaded.models[0].source_bits, Some(4));
+        assert!(matches!(
+            loaded.models[0].quantize,
+            Some(QuantizeRequest::Q8)
+        ));
+        assert_eq!(loaded.selected_id.as_deref(), Some("legacy"));
+        assert_eq!(fs::read_to_string(&manifest).unwrap(), original);
+
+        fs::remove_file(snapshot.join("config.json")).unwrap();
+        assert_eq!(
+            read_registry(&manifest).unwrap().models[0].source_bits,
+            None
         );
     }
 
@@ -2673,6 +3085,12 @@ mod tests {
 #[cfg(test)]
 mod profile_import_tests {
     use super::*;
+
+    #[test]
+    fn hf_status_keeps_read_errors_distinct_from_missing_tokens() {
+        assert!(!hf_status_from_read(|| Ok::<_, &str>(None)).unwrap().present);
+        assert!(hf_status_from_read(|| Err::<Option<String>, _>("denied")).is_err());
+    }
 
     #[test]
     fn isolated_import_never_inherits_either_environment_credential() {
@@ -2734,5 +3152,8 @@ mod profile_import_tests {
             .unwrap(),
             Some("environment".into())
         );
+        assert!(import_token(false, Err(keyring::Error::NoEntry), || None)
+            .unwrap_err()
+            .contains("could not read HuggingFace credential"));
     }
 }

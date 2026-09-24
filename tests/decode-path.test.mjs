@@ -98,7 +98,8 @@ test("the weight format submitted is bf16 | Q8 | NVFP4 and never a disabled choi
   assert.equal(selectedWeightFormat(weightFormatOptions(SM120), "dense").value, null);
   assert.equal(selectedWeightFormat(weightFormatOptions(SM89), "nvfp4").value, null,
     "a stale NVFP4 selection on an unsupported device falls back to bf16");
-  assert.equal(modelSubtitle({ quantize: "nvfp4" }), "NVFP4");
+  // main (sc-23935) labels a load-time format after its source: "Safetensors · Q8 load".
+  assert.equal(modelSubtitle({ quantize: "nvfp4" }), "Safetensors · NVFP4 load");
 });
 
 test("the CUDA-graph toggle is gated on the runtime and flags a pending reload", () => {
