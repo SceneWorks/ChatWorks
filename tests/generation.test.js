@@ -238,3 +238,27 @@ test("browser video metadata wait aborts and releases its decoder source", async
     assert.ok(actions.includes("load"));
   } finally { globalThis.document = previous; }
 });
+
+test("local video decoder failure names the file without a remote CORS explanation", async () => {
+  const { sampleVideoAttachment } = await import("../src/media/video.js");
+  const previousDocument = globalThis.document;
+  const previousCreate = URL.createObjectURL;
+  const previousRevoke = URL.revokeObjectURL;
+  const revoked = [];
+  const video = {
+    pause() {}, removeAttribute() {}, load() {},
+    set src(value) { if (value) queueMicrotask(() => this.onerror?.()); },
+  };
+  globalThis.document = { createElement: () => video };
+  URL.createObjectURL = () => "blob:chatworks-local-fixture";
+  URL.revokeObjectURL = (value) => revoked.push(value);
+  try {
+    await assert.rejects(sampleVideoAttachment({ name: "clip with space.mp4" }), (error) =>
+      error.message.includes("clip with space.mp4") && !error.message.includes("CORS"));
+    assert.deepEqual(revoked, ["blob:chatworks-local-fixture"]);
+  } finally {
+    globalThis.document = previousDocument;
+    URL.createObjectURL = previousCreate;
+    URL.revokeObjectURL = previousRevoke;
+  }
+});
