@@ -16,6 +16,7 @@ export function modelSubtitle(model) {
   else if (model.format === "gguf") parts.push("GGUF");
   else if (model.quantize === "q4") parts.push("Q4");
   else if (model.quantize === "q8") parts.push("Q8");
+  else if (model.quantize === "nvfp4") parts.push("NVFP4");
   else parts.push("Dense");
   if (model.sizeBytes) parts.push(formatBytes(model.sizeBytes));
   return parts.join(" · ");

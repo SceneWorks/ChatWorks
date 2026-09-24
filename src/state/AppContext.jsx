@@ -1,7 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { DEFAULT_ACCENT, Icon } from "@sceneworks/ui";
 import { generationParams } from "./generation.js";
+import { applyDecodeEvent } from "./decodePath.js";
 
 export const AppContext = createContext(null);
 
@@ -19,6 +21,13 @@ export const DEFAULT_APP_SETTINGS = {
     topP: 0.9,
     maxTokens: 512,
     disableThinking: true,
+  },
+  runtime: {
+    cudaGraphs: false,
+  },
+  notices: {
+    speculativeOffCarriedOver: false,
+    speculativeNoticeDismissed: false,
   },
 };
 
@@ -116,6 +125,28 @@ export function AppProvider({ children }) {
     refreshAppSettings();
   }, [refreshAppSettings, refreshEngineStatus]);
 
+  // Every finished generation — this window's or an API client's — pushes the served model's
+  // decode status, so the decode-path view updates without polling (sc-24139).
+  useEffect(() => {
+    const unlistenPromise = listen("engine://decode", (event) => {
+      setEngineStatus((current) => applyDecodeEvent(current, event.payload));
+    });
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
+  }, []);
+
+  /// Save a settings change made outside the Settings form (the speculative notice's actions),
+  /// keeping the API token as it is.
+  const updateAppSettings = useCallback(async (transform) => {
+    const [nextSettings] = await invoke("save_app_settings", {
+      settings: transform(appSettings),
+      apiAuthToken: null,
+    });
+    setAppSettings(nextSettings);
+    return nextSettings;
+  }, [appSettings]);
+
   const value = useMemo(
     () => ({
       activeView,
@@ -128,11 +159,12 @@ export function AppProvider({ children }) {
       refreshEngineStatus,
       appSettings,
       setAppSettings,
+      updateAppSettings,
       apiAuthToken,
       setApiAuthToken,
       refreshAppSettings,
     }),
-    [accent, activeView, apiAuthToken, appSettings, engineStatus, refreshAppSettings, refreshEngineStatus, theme],
+    [accent, activeView, apiAuthToken, appSettings, engineStatus, refreshAppSettings, refreshEngineStatus, theme, updateAppSettings],
   );
 
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;

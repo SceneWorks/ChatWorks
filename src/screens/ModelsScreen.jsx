@@ -5,15 +5,18 @@ import { CompactSelector, StatusDot } from "@sceneworks/ui";
 import { useApp } from "../state/AppContext";
 import { useConversations } from "../state/ConversationsContext";
 import { formatBytes, isExactGgufUrl, modelSubtitle, unloadServedModel } from "../state/models.js";
-
-export const QUANTIZE_OPTIONS = [
-  { id: "dense", label: "Dense (full precision)", value: null },
-  { id: "q4", label: "Quantize Q4", value: "q4" },
-  { id: "q8", label: "Quantize Q8", value: "q8" },
-];
+import {
+  dismissSpeculativeNotice,
+  enableSpeculativeAuto,
+  graphsReloadPending,
+  selectedWeightFormat,
+  serveAction,
+  weightFormatOptions,
+} from "../state/decodePath.js";
+import { DecodePathStatus } from "../components/DecodePathStatus.js";
 
 export function ModelsScreen() {
-  const { engineStatus, refreshEngineStatus } = useApp();
+  const { engineStatus, refreshEngineStatus, appSettings, updateAppSettings } = useApp();
   const { busy: generationBusy } = useConversations();
   const [unloading, setUnloading] = useState(false);
   const [registry, setRegistry] = useState({ models: [], selectedId: null });
@@ -33,6 +36,18 @@ export function ModelsScreen() {
   const [loadingId, setLoadingId] = useState("");
 
   const loadedSource = engineStatus?.loaded?.source ?? null;
+  // The weight formats this runtime can load; NVFP4 is disabled with the runtime's own reason
+  // unless it reports a compute capability >= sm_120 CUDA device (sc-24139).
+  const weightFormats = weightFormatOptions(engineStatus?.backend_capabilities);
+  const unavailableFormats = weightFormats.filter((option) => option.disabled);
+  const formatNotes = weightFormats.filter((option) => option.note && !option.disabled);
+  // The served model runs under a CUDA-graph switch other than the saved setting: its row offers
+  // "Reload" (graphs are a load option).
+  const reloadPending = graphsReloadPending(
+    engineStatus?.backend_capabilities,
+    appSettings?.runtime?.cudaGraphs,
+    engineStatus?.loaded,
+  );
   const selectedModel = registry.models.find((model) => model.id === registry.selectedId) ?? null;
   const exactGgufImport = isExactGgufUrl(sourceUrl);
 
@@ -71,7 +86,7 @@ export function ModelsScreen() {
     setError(null);
     setNotice(null);
     setProgress(null);
-    const option = QUANTIZE_OPTIONS.find((item) => item.id === quantizeId) ?? QUANTIZE_OPTIONS[0];
+    const option = selectedWeightFormat(weightFormats, quantizeId);
     try {
       const next = await invoke("import_hf_model", {
         request: {
@@ -112,7 +127,7 @@ export function ModelsScreen() {
     setAdoptingPath(candidate.localPath);
     setError(null);
     setNotice(null);
-    const option = QUANTIZE_OPTIONS.find((item) => item.id === quantizeId) ?? QUANTIZE_OPTIONS[0];
+    const option = selectedWeightFormat(weightFormats, quantizeId);
     const storedEncoding = candidate.pack === "bonsai2-packed" || candidate.format?.startsWith("gguf");
     try {
       const next = await invoke("adopt_cached_hf_model", {
@@ -238,23 +253,35 @@ export function ModelsScreen() {
           </div>
         ) : null}
         <div className="field">
-          <span className="field-label">Conversion</span>
+          <span className="field-label">Weight format</span>
           {exactGgufImport ? <p className="view-copy">Existing GGUF encoding (conversion unavailable)</p> : null}
-          <div className="segmented" role="radiogroup" aria-label="Quantization">
-            {QUANTIZE_OPTIONS.map((option) => (
+          <div className="segmented" role="radiogroup" aria-label="Weight format">
+            {weightFormats.map((option) => (
               <button
                 aria-checked={quantizeId === option.id}
                 className={quantizeId === option.id ? "segmented-item active" : "segmented-item"}
-                disabled={busy || exactGgufImport}
+                disabled={busy || exactGgufImport || option.disabled}
                 key={option.id}
                 onClick={() => setQuantizeId(option.id)}
                 role="radio"
+                title={option.reason ?? undefined}
                 type="button"
               >
                 {option.label}
               </button>
             ))}
           </div>
+          {formatNotes.map((option) => (
+            <small className="field-note lossy" key={`${option.id}-note`}>
+              {option.note}
+            </small>
+          ))}
+          {unavailableFormats.map((option) => (
+            <small className="field-note" key={option.id}>
+              {option.label} unavailable: {option.reason}
+            </small>
+          ))}
+          <small className="field-note">Applied when the model loads; the same choice applies to cached models you add below.</small>
         </div>
         <div className="panel-actions">
           <button className="primary-btn" disabled={busy || !sourceUrl.trim()} type="submit">
@@ -360,6 +387,7 @@ export function ModelsScreen() {
                 model.localPath === loadedSource &&
                 (model.quantize ?? null) === (engineStatus?.loaded?.quantize ?? null) &&
                 (selectedProjector || null) === (engineStatus?.loaded?.projector_source ?? null);
+              const action = serveAction(Boolean(isServed), reloadPending);
               return (
                 <li className={isServed ? "model-row served" : "model-row"} key={model.id}>
                   <div className="model-row-main">
@@ -383,11 +411,12 @@ export function ModelsScreen() {
                   ) : null}
                   <button
                     className="ghost-btn"
-                    disabled={Boolean(loadingId) || isServed}
+                    disabled={Boolean(loadingId) || action.disabled}
                     onClick={() => handleSelect(model)}
+                    title={action.label === "Reload" ? "Reload with the saved CUDA-graph setting" : undefined}
                     type="button"
                   >
-                    {loadingId === model.id ? "Loading…" : isServed ? "Serving" : "Serve"}
+                    {loadingId === model.id ? "Loading…" : action.label}
                   </button>
                 </li>
               );
@@ -401,6 +430,16 @@ export function ModelsScreen() {
             Selected: <strong>{selectedModel.name}</strong> ({selectedModel.repo})
           </p>
         ) : null}
+        <DecodePathStatus
+          engineStatus={engineStatus}
+          title="Served model decode path"
+          notice={{
+            appSettings,
+            executionBackend: engineStatus?.execution_backend,
+            onEnableAuto: () => updateAppSettings(enableSpeculativeAuto).catch((cause) => setError(String(cause))),
+            onDismiss: () => updateAppSettings(dismissSpeculativeNotice).catch((cause) => setError(String(cause))),
+          }}
+        />
       </div>
 
       <div className="panel">

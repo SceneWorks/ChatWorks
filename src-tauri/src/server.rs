@@ -495,6 +495,7 @@ fn stream_chat_completion(
                     NativeTelemetry {
                         mtp: response.mtp,
                         timings: response.timings,
+                        decode: response.decode,
                     },
                 );
                 let _ = tx.blocking_send(Ok(sse_json(&finish)));
@@ -1319,6 +1320,10 @@ struct OpenAiChatResponse {
     /// ChatWorks extension: synchronized backend phase timings, absent when unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     chatworks_timings: Option<crate::engine::GenerationTimingsPayload>,
+    /// ChatWorks extension: which decode path served the generation (proposer, sampler, CUDA
+    /// graphs, NVFP4 projection path), absent when the runtime does not report one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chatworks_decode: Option<crate::engine::DecodeReportPayload>,
 }
 
 impl OpenAiChatResponse {
@@ -1331,6 +1336,7 @@ impl OpenAiChatResponse {
             finish_reason,
             mtp,
             timings,
+            decode,
         } = response;
         let has_tool_calls = !tool_calls.is_empty();
         // A tool-call turn finishes with `tool_calls`, overriding the engine's stop/length reason.
@@ -1365,6 +1371,7 @@ impl OpenAiChatResponse {
             usage: OpenAiUsage::from(usage),
             chatworks_mtp: mtp,
             chatworks_timings: timings,
+            chatworks_decode: decode,
         }
     }
 }
@@ -1373,6 +1380,7 @@ impl OpenAiChatResponse {
 struct NativeTelemetry {
     mtp: Option<crate::engine::MtpStatsPayload>,
     timings: Option<crate::engine::GenerationTimingsPayload>,
+    decode: Option<crate::engine::DecodeReportPayload>,
 }
 
 #[derive(Serialize)]
@@ -1390,6 +1398,10 @@ struct OpenAiChatChunk {
     /// ChatWorks extension: synchronized backend phase timings, emitted only on the terminal stream chunk.
     #[serde(skip_serializing_if = "Option::is_none")]
     chatworks_timings: Option<crate::engine::GenerationTimingsPayload>,
+    /// ChatWorks extension: the decode path that served the generation, emitted only on the
+    /// terminal stream chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chatworks_decode: Option<crate::engine::DecodeReportPayload>,
 }
 
 impl OpenAiChatChunk {
@@ -1412,6 +1424,7 @@ impl OpenAiChatChunk {
             usage: None,
             chatworks_mtp: None,
             chatworks_timings: None,
+            chatworks_decode: None,
         }
     }
 
@@ -1434,6 +1447,7 @@ impl OpenAiChatChunk {
             usage: None,
             chatworks_mtp: None,
             chatworks_timings: None,
+            chatworks_decode: None,
         }
     }
 
@@ -1464,6 +1478,7 @@ impl OpenAiChatChunk {
             usage,
             chatworks_mtp: telemetry.mtp,
             chatworks_timings: telemetry.timings,
+            chatworks_decode: telemetry.decode,
         }
     }
 }
@@ -1668,6 +1683,7 @@ mod tests {
                 usage,
                 mtp: None,
                 timings: None,
+                decode: None,
                 finish_reason: Some(if request.cancel.is_cancelled() {
                     FinishReason::Cancelled
                 } else {
@@ -1700,6 +1716,7 @@ mod tests {
                 display_name: Some("fake-model".to_string()),
                 quantize: None,
                 projector_source: None,
+                cuda_graphs: None,
             })
             .unwrap();
         engine
@@ -1713,6 +1730,7 @@ mod tests {
                 display_name: Some("fake-telemetry".to_string()),
                 quantize: None,
                 projector_source: None,
+                cuda_graphs: None,
             })
             .unwrap();
         engine
@@ -1726,6 +1744,7 @@ mod tests {
                 display_name: Some("fake-tools".to_string()),
                 quantize: None,
                 projector_source: None,
+                cuda_graphs: None,
             })
             .unwrap();
         engine
@@ -1838,11 +1857,19 @@ mod tests {
                     prefill_ms: 12,
                     decode_ms: 34,
                 }),
+                decode: Some(crate::engine::DecodeReportPayload::from(
+                    crate::test_support::fake_decode_report(),
+                )),
             },
         );
         let json = serde_json::to_value(response).unwrap();
         assert_eq!(json["chatworks_mtp"]["accepted_tokens"], 3);
         assert_eq!(json["chatworks_timings"]["prefill_ms"], 12);
+        assert_eq!(json["chatworks_decode"]["proposer"], "mtp");
+        assert_eq!(
+            json["chatworks_decode"]["cuda_graphs"]["fallback_reason"],
+            "deltanet_state_unstable"
+        );
     }
 
     #[test]
@@ -1868,11 +1895,19 @@ mod tests {
                     prefill_ms: 12,
                     decode_ms: 34,
                 }),
+                decode: Some(crate::engine::DecodeReportPayload::from(
+                    crate::test_support::fake_decode_report(),
+                )),
             },
         );
         let json = serde_json::to_value(response).unwrap();
         assert_eq!(json["chatworks_mtp"]["accepted_tokens"], 3);
         assert_eq!(json["chatworks_timings"]["decode_ms"], 34);
+        assert_eq!(json["chatworks_decode"]["sampler"], "device");
+        assert_eq!(
+            json["chatworks_decode"]["nvfp4_projections"]["path"],
+            "mixed"
+        );
     }
 
     #[test]
@@ -2501,6 +2536,7 @@ mod tests {
                 display_name: Some("blocking".to_string()),
                 quantize: None,
                 projector_source: None,
+                cuda_graphs: None,
             })
             .unwrap();
         let request = |prompt| {
@@ -2623,6 +2659,9 @@ mod tests {
             "\"chatworks_mtp\":{\"proposed_tokens\":4,\"accepted_tokens\":3,\"target_forwards\":2}"
         ));
         assert!(response.contains("\"chatworks_timings\":{\"prefill_ms\":12,\"decode_ms\":34}"));
+        // The decode path reaches API clients on the terminal chunk (sc-24139).
+        assert!(response.contains("\"chatworks_decode\":{\"path\":\"mtp\",\"proposer\":\"mtp\""));
+        assert!(response.contains("\"fallback_reason\":\"deltanet_state_unstable\""));
         assert!(response.contains("data: [DONE]"));
         server.stop().unwrap();
     }
