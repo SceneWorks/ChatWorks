@@ -22,9 +22,23 @@ export function modelWeightLabel(model) {
   if (model.format === "gguf") return "GGUF";
   const sourceBits = Number.isInteger(model.sourceBits) && model.sourceBits >= 1 && model.sourceBits <= 8
     ? model.sourceBits : null;
-  const loadQuantization = { q4: "Q4 load", q8: "Q8 load", nvfp4: "NVFP4 load" }[model.quantize] ?? null;
+  const loadQuantization = { q4: "Q4 load", q8: "Q8 load", nvfp4: "NVFP4 load (lossy)" }[model.quantize] ?? null;
   if (loadQuantization) return `${sourceBits ? `${sourceBits}-bit source` : "Safetensors"} · ${loadQuantization}`;
   return sourceBits ? `${sourceBits}-bit` : "Safetensors";
+}
+
+/// The Models screen's notice after a load. A load that had to unload the served model first
+/// (the engine's `load_transition`: a reload of the same model, or one that did not fit beside
+/// it) says so (sc-24140 feature-end review).
+export function loadNotice(modelName, status) {
+  const transition = status?.load_transition;
+  if (transition?.reason === "reload") {
+    return `${modelName} reloaded. The served copy was unloaded first, so two copies never had to fit in memory.`;
+  }
+  if (transition?.reason === "memory") {
+    return `${modelName} is now the served model. ${transition.released} was unloaded first because both did not fit in memory.`;
+  }
+  return `${modelName} is now the served model.`;
 }
 
 export function isExactGgufUrl(value) {

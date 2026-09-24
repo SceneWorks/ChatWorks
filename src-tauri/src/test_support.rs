@@ -280,3 +280,107 @@ pub fn fake_tool_loader(_: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm
         },
     }))
 }
+
+/// What a [`resident_loader`] has seen, keyed by namespace (the source's first path segment) so
+/// concurrently running tests never see each other's providers.
+#[derive(Default)]
+pub struct ResidentLedger {
+    /// Providers alive per namespace.
+    pub alive: HashMap<String, usize>,
+    /// Every load the loader was asked for: the source, and how many providers of its namespace
+    /// were alive when that load started.
+    pub loads: Vec<(String, usize)>,
+    /// Namespaces whose next load is refused (then cleared).
+    pub fail_next: std::collections::HashSet<String>,
+}
+
+impl ResidentLedger {
+    /// The providers alive at the start of each load of `namespace`, in order.
+    pub fn alive_at_load(&self, namespace: &str) -> Vec<usize> {
+        self.loads
+            .iter()
+            .filter(|(source, _)| resident_namespace(source) == namespace)
+            .map(|(_, alive)| *alive)
+            .collect()
+    }
+}
+
+pub fn resident_ledger() -> &'static Mutex<ResidentLedger> {
+    static LEDGER: OnceLock<Mutex<ResidentLedger>> = OnceLock::new();
+    LEDGER.get_or_init(|| Mutex::new(ResidentLedger::default()))
+}
+
+fn resident_namespace(source: &str) -> String {
+    source
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A [`FakeProvider`] whose lifetime the [`resident_ledger`] tracks: it stands in for a model
+/// holding device memory until it is dropped.
+pub struct ResidentProvider {
+    inner: FakeProvider,
+    namespace: String,
+}
+
+impl Drop for ResidentProvider {
+    fn drop(&mut self) {
+        if let Ok(mut ledger) = resident_ledger().lock() {
+            if let Some(alive) = ledger.alive.get_mut(&self.namespace) {
+                *alive -= 1;
+            }
+        }
+    }
+}
+
+impl TextLlm for ResidentProvider {
+    fn descriptor(&self) -> &TextLlmDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn validate(&self, req: &TextLlmRequest) -> crate::core_llm::Result<()> {
+        self.inner.validate(req)
+    }
+
+    fn generate(
+        &self,
+        req: &TextLlmRequest,
+        on_event: &mut dyn FnMut(StreamEvent),
+    ) -> crate::core_llm::Result<TextLlmOutput> {
+        self.inner.generate(req, on_event)
+    }
+}
+
+/// A loader of [`ResidentProvider`]s. A namespace in `fail_next` has its next load refused; a
+/// `one-fits` namespace is refused the way the runtime's load admission refuses a model that does
+/// not fit (`core_llm::admit_request_memory`) while another of its providers is resident.
+pub fn resident_loader(spec: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
+    let namespace = resident_namespace(&spec.source);
+    let mut ledger = resident_ledger().lock().unwrap();
+    let alive = ledger.alive.get(&namespace).copied().unwrap_or(0);
+    ledger.loads.push((spec.source.clone(), alive));
+    if ledger.fail_next.remove(&namespace) {
+        return Err(crate::core_llm::Error::Load(
+            "fixture refuses this load".to_string(),
+        ));
+    }
+    if namespace == "one-fits" && alive > 0 {
+        return Err(crate::core_llm::Error::InvalidRequest(
+            "request requires an estimated 2 bytes of native workspace but only 1 bytes are \
+             available; reduce prompt/media length or max_new_tokens"
+                .to_string(),
+        ));
+    }
+    *ledger.alive.entry(namespace.clone()).or_default() += 1;
+    Ok(Box::new(ResidentProvider {
+        inner: FakeProvider {
+            descriptor: thinking_descriptor("fake-resident", 8),
+            emit_telemetry: false,
+            load_report: None,
+        },
+        namespace,
+    }))
+}

@@ -9,6 +9,22 @@ export async function loadAppCredentialState(invoke) {
   }
 }
 
+/// The settings the UI starts from: the saved ones, or, when they cannot be read, this build's
+/// defaults as the backend reports them (`default_app_settings`). Never UI constants: the
+/// speculative-decoding default differs by build (sc-24140 feature-end review).
+export async function loadAppSettingsOrDefaults(invoke) {
+  try {
+    return await loadAppCredentialState(invoke);
+  } catch (cause) {
+    const error = `Could not load settings: ${String(cause)}`;
+    try {
+      return { settings: await invoke("default_app_settings"), token: null, error };
+    } catch {
+      return { settings: null, token: null, error };
+    }
+  }
+}
+
 export async function saveAppCredentialState(invoke, settings, token) {
   const [savedSettings, status, savedToken] = await invoke("save_app_settings", {
     settings,

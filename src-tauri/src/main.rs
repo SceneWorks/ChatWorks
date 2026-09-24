@@ -132,6 +132,14 @@ fn load_app_settings(app: AppHandle) -> Result<AppSettings, String> {
     load_app_settings_inner(&app)
 }
 
+/// This build's default settings (speculative decoding `auto` on Candle CUDA, `off` on MLX and
+/// Candle CPU). The UI falls back to these, never to constants of its own, when the saved
+/// settings cannot be read (sc-24140 feature-end review).
+#[tauri::command]
+fn default_app_settings() -> AppSettings {
+    AppSettings::default()
+}
+
 fn save_with_credential_change(
     settings: &mut AppSettings,
     provided_token: &str,
@@ -383,6 +391,7 @@ fn main() {
             stop_openai_server,
             openai_server_status,
             load_app_settings,
+            default_app_settings,
             save_app_settings,
             api_auth_token,
             list_registered_models,
