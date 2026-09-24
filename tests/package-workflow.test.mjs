@@ -4,6 +4,14 @@ import fs from 'node:fs';
 
 const workflow = fs.readFileSync(new URL('../.github/workflows/package-validation.yml', import.meta.url), 'utf8');
 const verifier = fs.readFileSync(new URL('../scripts/verify-tauri-package.sh', import.meta.url), 'utf8');
+
+test('packaged CSP permits local blob video without enabling remote browser media', () => {
+  const config = JSON.parse(fs.readFileSync(new URL('../src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
+  const directives = Object.fromEntries(config.app.security.csp.split(';').map(part => part.trim().split(/\s+/))
+    .filter(([name]) => name).map(([name, ...sources]) => [name, sources]));
+  assert.deepEqual(directives['media-src'], ["'self'", 'blob:']);
+  assert.deepEqual(directives['default-src'], ["'self'"]);
+});
 function validateSelfHostedShells(source) {
   const job = source.split('  windows-cuda-package:')[1];
   assert.ok(job, 'CUDA packaging job exists');
