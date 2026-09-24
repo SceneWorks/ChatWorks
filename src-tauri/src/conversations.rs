@@ -17,8 +17,11 @@ const PREVIEW_MAX_CHARS: usize = 80;
 const META_SUFFIX: &str = ".meta";
 const JSON_SUFFIX: &str = ".json";
 
+/// A conversation that carries no speculative mode (saved before it existed, or by a UI that did
+/// not know one) takes this build's default, like a settings file without one
+/// ([`crate::app_settings::default_mtp_mode`]), never a hard-coded `off` (sc-24140).
 fn default_mtp_mode() -> String {
-    "off".to_string()
+    crate::app_settings::default_mtp_mode()
 }
 fn default_mtp_draft_tokens() -> u32 {
     3
@@ -385,6 +388,20 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// sc-24140 feature-end review: params without a speculative mode take this build's default
+    /// (`auto` on Candle CUDA, `off` on MLX and Candle CPU), not a hard-coded `off`.
+    #[test]
+    fn params_without_a_speculative_mode_take_the_builds_default() {
+        let params: ConversationParams = serde_json::from_str("{}").unwrap();
+        assert_eq!(params.mtp_mode, crate::app_settings::default_mtp_mode());
+        assert_eq!(
+            ConversationParams::default().mtp_mode,
+            crate::app_settings::default_mtp_mode()
+        );
+        let chosen: ConversationParams = serde_json::from_str(r#"{"mtpMode":"off"}"#).unwrap();
+        assert_eq!(chosen.mtp_mode, "off");
+    }
     use crate::fsutil::{TempDir, TEMP_FILE_SUFFIX};
     use serde_json::json;
 

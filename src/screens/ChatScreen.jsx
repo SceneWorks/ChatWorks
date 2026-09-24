@@ -20,7 +20,7 @@ import { MessageActions } from "../components/MessageActions";
 import { MessageContent } from "../components/MessageContent";
 import { GenerationControls } from "../components/GenerationControls";
 import { DecodePathStatus } from "../components/DecodePathStatus.js";
-import { dismissSpeculativeNotice, enableSpeculativeAuto } from "../state/decodePath.js";
+import { dismissSpeculativeNotice, enableSpeculativeAuto, lossyWeightsBadge } from "../state/decodePath.js";
 import { formatToolArguments, ToolCallList, ToolResult } from "../components/ToolCallList";
 import { appendAttachmentPlaceholders, settleAttachment, registerPreparation } from "../state/attachments.js";
 import { applySamplingPreset } from "../state/generation.js";
@@ -43,6 +43,8 @@ function matchesHttpUrl(url) {
 
 export function ChatScreen() {
   const { engineStatus, refreshEngineStatus, appSettings, updateAppSettings, apiAuthToken } = useApp();
+  // NVFP4 weights are lossy: the served model's name carries a badge that says so (sc-24140).
+  const lossyBadge = lossyWeightsBadge(engineStatus?.loaded);
   const { activeConversationId, persistConversation, startNewChat, busy, setBusy } = useConversations();
   const {
     messages,
@@ -417,7 +419,10 @@ export function ChatScreen() {
         <div className="panel-head chat-head">
           <div>
             <p className="eyebrow">Streaming chat</p>
-            <h2>{engineStatus?.loaded ? engineStatus.loaded.name : "Load a model to chat"}</h2>
+            <h2>
+              {engineStatus?.loaded ? engineStatus.loaded.name : "Load a model to chat"}
+              {lossyBadge ? <span className="lossy-badge" title={lossyBadge.title}>{lossyBadge.label}</span> : null}
+            </h2>
             <p className="view-copy">Dogfoods {apiBase}/v1/chat/completions over SSE.</p>
           </div>
           <span className={serverStatus?.running ? "status-pill" : "status-pill warning"}>

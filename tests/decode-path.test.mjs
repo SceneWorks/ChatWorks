@@ -13,6 +13,7 @@ import {
   enableSpeculativeAuto,
   graphsReloadPending,
   LAST_GENERATION,
+  lossyWeightsBadge,
   NVFP4_LOSSY_NOTE,
   selectedWeightFormat,
   serveAction,
@@ -99,7 +100,7 @@ test("the weight format submitted is bf16 | Q8 | NVFP4 and never a disabled choi
   assert.equal(selectedWeightFormat(weightFormatOptions(SM89), "nvfp4").value, null,
     "a stale NVFP4 selection on an unsupported device falls back to bf16");
   // main (sc-23935) labels a load-time format after its source: "Safetensors · Q8 load".
-  assert.equal(modelSubtitle({ quantize: "nvfp4" }), "Safetensors · NVFP4 load");
+  assert.equal(modelSubtitle({ quantize: "nvfp4" }), "Safetensors · NVFP4 load (lossy)");
 });
 
 test("the CUDA-graph toggle is gated on the runtime and flags a pending reload", () => {
@@ -130,8 +131,8 @@ test("the status rows name the proposer, graph fallback, NVFP4 path, and sampler
   };
   const rows = Object.fromEntries(decodePathRows(status(SM120, loaded)).map((row) => [row.key, row]));
   assert.equal(rows.backend.value, "candle-cuda · cuda:0 · sm_120");
-  assert.equal(rows.weights.value, "NVFP4");
-  assert.equal(rows.weights.detail, "Resident projections: nvfp4 × 448, dense × 2");
+  assert.equal(rows.weights.value, "NVFP4 (lossy)");
+  assert.equal(rows.weights.detail, `Resident projections: nvfp4 × 448, dense × 2 · ${NVFP4_LOSSY_NOTE}`);
   assert.equal(rows.proposer.value, "mtp · 3 drafts");
   assert.equal(rows.proposer.detail, "Accepted 6 of 9 drafts in 5 forwards");
   assert.equal(rows.cuda_graphs.value, "eager");
@@ -285,8 +286,8 @@ test("the Rust wire shape renders: the view reads tests/engine-status-wire.json 
   const wire = JSON.parse(await readFile(new URL("engine-status-wire.json", import.meta.url)));
   const rows = Object.fromEntries(decodePathRows(wire).map((row) => [row.key, row]));
   assert.equal(rows.backend.value, "candle-cuda · cuda:0 · sm_120");
-  assert.equal(rows.weights.value, "NVFP4");
-  assert.equal(rows.weights.detail, "Resident projections: nvfp4 × 448");
+  assert.equal(rows.weights.value, "NVFP4 (lossy)");
+  assert.equal(rows.weights.detail, `Resident projections: nvfp4 × 448 · ${NVFP4_LOSSY_NOTE}`);
   assert.equal(rows.graph_switch.value, "on");
   assert.equal(rows.implementation.value, "mtp");
   assert.equal(rows.proposer.value, "mtp · 2 drafts");
@@ -366,4 +367,27 @@ test("the notice renders in the decode-path panel with its action and dismiss bu
     appSettings: dismissSpeculativeNotice(CARRIED_OVER),
   }));
   assert.equal(hidden, "");
+});
+
+test("resident NVFP4 weights are labelled lossy beside the served model's name and in the Weights row", () => {
+  const nvfp4 = {
+    name: "Qwen3.8-27B NVFP4",
+    quantize: "nvfp4",
+    load_report: { requested: "nvfp4", projections: [{ kind: "nvfp4", count: 448, params: 1, resident_bytes: 1 }] },
+  };
+  assert.deepEqual(lossyWeightsBadge(nvfp4), { label: "NVFP4 · lossy", title: NVFP4_LOSSY_NOTE });
+  // Without a load report, the requested format decides.
+  assert.deepEqual(lossyWeightsBadge({ quantize: "nvfp4" }), { label: "NVFP4 · lossy", title: NVFP4_LOSSY_NOTE });
+  const dense = {
+    name: "Qwen3.8-27B",
+    quantize: null,
+    load_report: { requested: null, projections: [{ kind: "dense", count: 505, params: 1, resident_bytes: 1 }] },
+  };
+  assert.equal(lossyWeightsBadge(dense), null);
+  assert.equal(lossyWeightsBadge(null), null);
+  const weights = (loaded) => decodePathRows(status(SM120, loaded)).find((row) => row.key === "weights");
+  assert.equal(weights(dense).value, "checkpoint encoding");
+  assert.equal(weights(dense).detail, "Resident projections: dense × 505");
+  assert.equal(weights({ ...nvfp4, load_report: null }).value, "NVFP4 (lossy)");
+  assert.equal(weights({ ...nvfp4, load_report: null }).detail, NVFP4_LOSSY_NOTE);
 });

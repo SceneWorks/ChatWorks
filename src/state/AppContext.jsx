@@ -4,10 +4,12 @@ import { listen } from "@tauri-apps/api/event";
 import { DEFAULT_ACCENT, Icon } from "@sceneworks/ui";
 import { generationParams } from "./generation.js";
 import { applyDecodeEvent } from "./decodePath.js";
-import { loadAppCredentialState, saveAppCredentialState } from "./credentials.js";
+import { loadAppSettingsOrDefaults, saveAppCredentialState } from "./credentials.js";
 
 export const AppContext = createContext(null);
 
+/// A placeholder until the backend answers: it carries no speculative mode, so nothing saved from
+/// it can pin one (the backend fills in this build's default).
 export const DEFAULT_APP_SETTINGS = {
   server: {
     host: "127.0.0.1",
@@ -79,18 +81,12 @@ export function AppProvider({ children }) {
   const [apiAuthError, setApiAuthError] = useState(null);
 
   const refreshAppSettings = useCallback(() => {
-    return loadAppCredentialState(invoke)
-      .then(({ settings, token, error }) => {
-        setAppSettings(settings);
-        setApiAuthToken(token);
-        setApiAuthError(error);
-        return settings;
-      })
-      .catch((cause) => {
-        setApiAuthToken(null);
-        setApiAuthError(`Could not load settings: ${String(cause)}`);
-        return DEFAULT_APP_SETTINGS;
-      });
+    return loadAppSettingsOrDefaults(invoke).then(({ settings, token, error }) => {
+      if (settings) setAppSettings(settings);
+      setApiAuthToken(token);
+      setApiAuthError(error);
+      return settings ?? DEFAULT_APP_SETTINGS;
+    });
   }, []);
 
   const refreshEngineStatus = useCallback(() => {

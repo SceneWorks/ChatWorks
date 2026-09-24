@@ -82,12 +82,31 @@ export function cudaGraphsControl(capabilities, savedSetting, loaded) {
 
 const FORMAT_NAMES = { q4: "Q4", q8: "Q8", nvfp4: "NVFP4" };
 
+/// Whether the served model holds NVFP4 weights: its resident projections as the runtime counted
+/// them, else (no load report) the format the load requested.
+function holdsNvfp4(loaded) {
+  const projections = loaded?.load_report?.projections ?? [];
+  return projections.length
+    ? projections.some((item) => item.kind === "nvfp4")
+    : loaded?.quantize === "nvfp4";
+}
+
+/// The badge beside the served model's name when its weights are NVFP4, which is lossy
+/// (sc-24140 feature-end review); `null` otherwise.
+export function lossyWeightsBadge(loaded) {
+  return holdsNvfp4(loaded) ? { label: "NVFP4 · lossy", title: NVFP4_LOSSY_NOTE } : null;
+}
+
 function weightsValue(loaded) {
   const requested = loaded.quantize ? FORMAT_NAMES[loaded.quantize] ?? loaded.quantize : "checkpoint encoding";
+  const lossy = holdsNvfp4(loaded);
+  const value = lossy ? `${loaded.quantize === "nvfp4" ? requested : "NVFP4"} (lossy)` : requested;
   const projections = loaded.load_report?.projections ?? [];
-  if (!projections.length) return { value: requested, detail: null };
-  const resident = projections.map((item) => `${item.kind} × ${item.count}`).join(", ");
-  return { value: requested, detail: `Resident projections: ${resident}` };
+  const resident = projections.length
+    ? `Resident projections: ${projections.map((item) => `${item.kind} × ${item.count}`).join(", ")}`
+    : null;
+  const detail = [resident, lossy ? NVFP4_LOSSY_NOTE : null].filter(Boolean).join(" · ") || null;
+  return { value, detail };
 }
 
 function graphSwitchValue(loaded) {

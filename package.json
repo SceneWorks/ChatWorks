@@ -9,7 +9,7 @@
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1",
     "lint": "eslint src",
-    "test": "node --test src/state/*.test.js",
+    "test": "node --test src/state/*.test.js tests/*.test.js tests/*.test.mjs",
     "tauri:dev": "tauri dev",
     "provision:media": "bash scripts/provision-ffmpeg-sidecars.sh",
     "tauri:build": "npm run provision:media && tauri build",

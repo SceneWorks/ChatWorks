@@ -309,17 +309,12 @@ pub fn load_registered_model(
         crate::inference_runtime::backend_capabilities(),
     )?;
     // The CUDA-graph switch is a load option (the CUDA runtime settles the model's stream at
-    // load), so the saved setting is read here and a change applies on the next load. A settings
-    // file that cannot be read is an error, never a silent "graphs off".
-    let settings = crate::app_settings::load_app_settings(app).map_err(|error| {
-        format!("settings could not be read, so the saved CUDA-graph setting is unknown: {error}")
+    // load), so the saved setting is read here, where the runtime honours the switch, and a change
+    // applies on the next load.
+    let request = app_load_request(&entry, projector_source.clone(), || {
+        crate::app_settings::load_app_settings(app)
     })?;
-    let status = engine.load_model(load_request_for(
-        &entry,
-        projector_source.clone(),
-        &settings,
-        crate::inference_runtime::backend_capabilities(),
-    ))?;
+    let status = engine.load_model(request)?;
     // A present empty string from the picker is an intentional "Text only" selection. Keep it
     // distinct from an omitted command argument, which preserves an existing association.
     if requested_projector.is_some() {
@@ -841,22 +836,52 @@ pub(crate) fn load_cuda_graphs(
     capabilities.cuda_graphs.supported.then_some(setting)
 }
 
-/// The engine load request for a registered entry under the saved settings (sc-24139): the
-/// entry's weight format and projector, and the saved CUDA-graph setting as the runtime's
-/// load-time switch where the runtime honours it ([`load_cuda_graphs`]).
+/// The engine load request the app sends when it serves `entry` on this build's runtime:
+/// `load_request_for` with the linked runtime's own backend capabilities deciding whether the
+/// saved settings are read at all. Public so the end-to-end harness (sc-24140) loads a model
+/// exactly as the Models screen does.
+pub fn app_load_request(
+    entry: &ModelEntry,
+    projector_source: Option<String>,
+    read_settings: impl FnOnce() -> Result<crate::app_settings::AppSettings, String>,
+) -> Result<LoadModelRequest, String> {
+    load_request_for(
+        entry,
+        projector_source,
+        read_settings,
+        crate::inference_runtime::backend_capabilities(),
+    )
+}
+
+/// The engine load request for a registered entry (sc-24139): the entry's weight format and
+/// projector, and the saved CUDA-graph setting as the runtime's load-time switch where the runtime
+/// honours it ([`load_cuda_graphs`]). The settings are read only there: the switch is their one
+/// load-time value, so an unreadable settings file cannot block a load on a runtime without it
+/// (MLX, Candle CPU). Where the switch applies, an unreadable file is an error, never a silent
+/// "graphs off" (sc-24140 feature-end review).
 pub(crate) fn load_request_for(
     entry: &ModelEntry,
     projector_source: Option<String>,
-    settings: &crate::app_settings::AppSettings,
+    read_settings: impl FnOnce() -> Result<crate::app_settings::AppSettings, String>,
     capabilities: &crate::core_llm::BackendCapabilities,
-) -> LoadModelRequest {
-    LoadModelRequest {
+) -> Result<LoadModelRequest, String> {
+    let cuda_graphs = if capabilities.cuda_graphs.supported {
+        let settings = read_settings().map_err(|error| {
+            format!(
+                "settings could not be read, so the saved CUDA-graph setting is unknown: {error}"
+            )
+        })?;
+        load_cuda_graphs(settings.runtime.cuda_graphs, capabilities)
+    } else {
+        None
+    };
+    Ok(LoadModelRequest {
         source: entry.local_path.clone(),
         display_name: Some(entry.name.clone()),
         quantize: entry.quantize,
         projector_source,
-        cuda_graphs: load_cuda_graphs(settings.runtime.cuda_graphs, capabilities),
-    }
+        cuda_graphs,
+    })
 }
 
 fn validate_quantize_request(
@@ -2290,12 +2315,17 @@ mod tests {
         };
         let mut settings = crate::app_settings::AppSettings::default();
         settings.runtime.cuda_graphs = true;
+        let read = |settings: &crate::app_settings::AppSettings| {
+            let settings = settings.clone();
+            move || Ok(settings)
+        };
         let request = load_request_for(
             &entry,
             Some("/snapshots/mmproj.gguf".to_string()),
-            &settings,
+            read(&settings),
             &capabilities(true, true),
-        );
+        )
+        .unwrap();
         assert_eq!(request.source, "/snapshots/qwen3.8-27b");
         assert_eq!(request.display_name.as_deref(), Some("Qwen3.8-27B NVFP4"));
         assert_eq!(request.quantize, Some(QuantizeRequest::Nvfp4));
@@ -2306,14 +2336,58 @@ mod tests {
         assert_eq!(request.cuda_graphs, Some(true));
         settings.runtime.cuda_graphs = false;
         assert_eq!(
-            load_request_for(&entry, None, &settings, &capabilities(true, true)).cuda_graphs,
+            load_request_for(&entry, None, read(&settings), &capabilities(true, true))
+                .unwrap()
+                .cuda_graphs,
             Some(false)
         );
         // Where the runtime reports the switch unavailable it is not sent at all.
         settings.runtime.cuda_graphs = true;
         assert_eq!(
-            load_request_for(&entry, None, &settings, &capabilities(true, false)).cuda_graphs,
+            load_request_for(&entry, None, read(&settings), &capabilities(true, false))
+                .unwrap()
+                .cuda_graphs,
             None
+        );
+    }
+
+    /// sc-24140 feature-end review: an unreadable settings file blocks a load only where the
+    /// saved CUDA-graph switch is used. On a runtime without the switch (MLX, Candle CPU) the
+    /// settings are not read at all.
+    #[test]
+    fn unreadable_settings_block_a_load_only_where_the_graph_switch_applies() {
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "id": "qwen3-8b",
+            "name": "Qwen3-8B",
+            "repo": "Qwen/Qwen3-8B",
+            "revision": "main",
+            "sourceUrl": "https://huggingface.co/Qwen/Qwen3-8B",
+            "localPath": "/snapshots/qwen3-8b",
+            "importedAt": 1,
+            "fileCount": 5,
+        }))
+        .unwrap();
+        let read = std::cell::Cell::new(false);
+        let unreadable = || {
+            read.set(true);
+            Err("settings.json: expected value at line 1".to_string())
+        };
+        let request = load_request_for(&entry, None, unreadable, &capabilities(false, false))
+            .expect("a runtime without the switch loads without reading the settings");
+        assert_eq!(request.cuda_graphs, None);
+        assert!(
+            !read.get(),
+            "the settings were read although the switch is unused"
+        );
+
+        let error = load_request_for(&entry, None, unreadable, &capabilities(true, true))
+            .expect_err("where the switch applies an unreadable file is an error");
+        assert!(read.get());
+        assert!(
+            error.starts_with(
+                "settings could not be read, so the saved CUDA-graph setting is unknown"
+            ) && error.contains("expected value at line 1"),
+            "{error}"
         );
     }
 

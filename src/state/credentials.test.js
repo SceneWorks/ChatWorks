@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { checkHfCredentialStatus, loadAppCredentialState, saveAppCredentialState } from "./credentials.js";
+import {
+  checkHfCredentialStatus, loadAppCredentialState, loadAppSettingsOrDefaults, saveAppCredentialState,
+} from "./credentials.js";
 
 test("disabled API auth loads without a credential request", async () => {
   const calls = [];
@@ -53,4 +55,30 @@ test("HuggingFace status is requested only on an explicit check and preserves re
   assert.deepEqual(calls, []);
   await assert.rejects(checkHfCredentialStatus(invoke), /credential denied/);
   assert.deepEqual(calls, ["hf_token_status"]);
+});
+
+test("unreadable settings fall back to the backend's defaults for this build, not UI constants", async () => {
+  const calls = [];
+  const state = await loadAppSettingsOrDefaults(async (command) => {
+    calls.push(command);
+    if (command === "load_app_settings") throw new Error("settings.json: expected value at line 1");
+    if (command === "default_app_settings") return { server: { authEnabled: false }, sampling: { mtpMode: "auto" } };
+    throw new Error(`unexpected ${command}`);
+  });
+  assert.deepEqual(calls, ["load_app_settings", "default_app_settings"]);
+  assert.equal(state.settings.sampling.mtpMode, "auto");
+  assert.equal(state.token, null);
+  assert.match(state.error, /^Could not load settings: .*expected value at line 1/);
+});
+
+test("readable settings never ask for the defaults", async () => {
+  const calls = [];
+  const state = await loadAppSettingsOrDefaults(async (command) => {
+    calls.push(command);
+    if (command === "load_app_settings") return { server: { authEnabled: false }, sampling: { mtpMode: "off" } };
+    throw new Error(`unexpected ${command}`);
+  });
+  assert.deepEqual(calls, ["load_app_settings"]);
+  assert.equal(state.settings.sampling.mtpMode, "off");
+  assert.equal(state.error, null);
 });

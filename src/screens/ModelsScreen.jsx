@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { CompactSelector, StatusDot } from "@sceneworks/ui";
 import { useApp } from "../state/AppContext";
 import { useConversations } from "../state/ConversationsContext";
-import { formatBytes, isExactGgufUrl, modelSubtitle, modelWeightLabel, unloadServedModel } from "../state/models.js";
+import { formatBytes, isExactGgufUrl, loadNotice, modelSubtitle, modelWeightLabel, unloadServedModel } from "../state/models.js";
 import { checkHfCredentialStatus } from "../state/credentials.js";
 import {
   dismissSpeculativeNotice,
@@ -160,15 +160,17 @@ export function ModelsScreen() {
     setError(null);
     setNotice(null);
     try {
-      await invoke("load_registered_model", {
+      const status = await invoke("load_registered_model", {
         modelId: model.id,
         projectorSource: projectorSelections[model.id] ?? model.projectorSource ?? null,
       });
       await refreshRegistry();
       await refreshEngineStatus();
-      setNotice(`${model.name} is now the served model.`);
+      setNotice(loadNotice(model.name, status));
     } catch (cause) {
       setError(String(cause));
+      // A failed reload may already have unloaded the served model: show what is served now.
+      await refreshEngineStatus();
     } finally {
       setLoadingId("");
     }

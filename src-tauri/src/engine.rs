@@ -104,7 +104,11 @@ impl EngineHandle {
         self.generate_with_cancel(request, CancelFlag::new(), on_event)
     }
 
-    pub(crate) fn generate_with_cancel(
+    /// [`generate`](Self::generate) under a caller-owned [`CancelFlag`]: tripping it (from the
+    /// event callback, another thread, or a closed HTTP stream) asks the provider to stop, and the
+    /// response comes back with the finish reason `cancelled`. The OpenAI server's streaming path
+    /// cancels this way; the end-to-end harness (sc-24140) drives it directly.
+    pub fn generate_with_cancel(
         &self,
         request: GenerateRequest,
         cancel: CancelFlag,
@@ -225,9 +229,31 @@ impl EngineActor {
         }
         crate::model_registry::ensure_cpu_model_supported(Path::new(&request.source))?;
         let spec = request.load_spec();
+        // Loading the served source again (the Models screen's "Reload" after a load-option
+        // change, or the same snapshot in another weight format) releases the resident copy
+        // FIRST: two copies of a large model never have to fit on the device at once (Qwen3.8-27B
+        // bf16 is ~54 GB of a 96 GB card, sc-24140 feature-end review).
+        let mut transition = None;
+        if self
+            .loaded
+            .as_ref()
+            .is_some_and(|loaded| same_source(&loaded.source, &request.source))
+        {
+            transition = self.release_for_load(LoadTransitionReason::Reload);
+        }
         // The runtime's own refusal (an unsupported weight format, its load admission) is the
-        // error surfaced to the caller verbatim: ChatWorks keeps no estimator of its own.
-        let provider = (self.loader)(&spec).map_err(|error| error.to_string())?;
+        // error surfaced to the caller verbatim: ChatWorks keeps no estimator of its own. A
+        // different model loads beside the served one, so a failed switch keeps serving it, unless
+        // the runtime refuses the load for memory: then the served model is released and the load
+        // tried once more.
+        let provider = match (self.loader)(&spec) {
+            Ok(provider) => provider,
+            Err(error) if self.loaded.is_some() && is_memory_refusal(&error) => {
+                transition = self.release_for_load(LoadTransitionReason::Memory);
+                (self.loader)(&spec).map_err(|error| failed_after_release(&transition, error))?
+            }
+            Err(error) => return Err(failed_after_release(&transition, error)),
+        };
         let descriptor = provider.descriptor().clone();
         let load_report = provider.load_report().map(LoadReportPayload::from);
         self.loaded = Some(LoadedModel {
@@ -241,7 +267,22 @@ impl EngineActor {
             last_decode: None,
             decode_reported: None,
         });
-        Ok(self.status())
+        let mut status = self.status();
+        status.load_transition = transition;
+        Ok(status)
+    }
+
+    /// Drop the served model before a load, so its device memory is free when the load starts,
+    /// and describe what was released for the load's reply.
+    fn release_for_load(&mut self, reason: LoadTransitionReason) -> Option<LoadTransitionPayload> {
+        let released = self.loaded.take()?;
+        let transition = LoadTransitionPayload {
+            released: released.status().name,
+            released_source: released.source.clone(),
+            reason,
+        };
+        drop(released);
+        Some(transition)
     }
 
     fn generate(
@@ -322,6 +363,7 @@ impl EngineActor {
     fn status(&self) -> EngineStatus {
         EngineStatus {
             loaded: self.loaded.as_ref().map(LoadedModel::status),
+            load_transition: None,
             execution_backend: crate::inference_runtime::execution_backend(),
             backend_capabilities: BackendCapabilitiesPayload::from(
                 crate::inference_runtime::backend_capabilities(),
@@ -330,6 +372,48 @@ impl EngineActor {
                 .map(|registration| ProviderSummary::from((registration.descriptor)()))
                 .collect(),
         }
+    }
+}
+
+/// Whether two load sources name the same model files (the same snapshot directory or file).
+fn same_source(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    if a == b {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Whether a load was refused because the model does not fit in the memory left beside the served
+/// one: the runtime's load admission (`core_llm::admit_request_memory`: "... only N bytes are
+/// available ..."), typed request exhaustion, or a device allocation failure.
+fn is_memory_refusal(error: &crate::core_llm::Error) -> bool {
+    if matches!(error, crate::core_llm::Error::RequestResourceExhausted(_)) {
+        return true;
+    }
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("bytes are available") || message.contains("out of memory")
+}
+
+/// A load's error, saying so when the served model was already released for it: the caller then
+/// knows nothing is served any more.
+fn failed_after_release(
+    transition: &Option<LoadTransitionPayload>,
+    error: impl std::fmt::Display,
+) -> String {
+    match transition {
+        None => error.to_string(),
+        Some(transition) => format!(
+            "{} was unloaded {}, but the load failed: {error}. No model is loaded now.",
+            transition.released,
+            match transition.reason {
+                LoadTransitionReason::Reload => "to load it again",
+                LoadTransitionReason::Memory => "because the new model did not fit beside it",
+            }
+        ),
     }
 }
 
@@ -1552,11 +1636,35 @@ impl SamplingRequest {
 #[derive(Clone, Debug, Serialize)]
 pub struct EngineStatus {
     pub loaded: Option<LoadedModelStatus>,
+    /// Set only on a load's reply when the load released the model served before it (see
+    /// [`LoadTransitionPayload`]); absent from every other status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_transition: Option<LoadTransitionPayload>,
     pub execution_backend: &'static str,
     /// What the runtime can serve on this host before any load (NVFP4, CUDA graphs), each
     /// unavailable feature with the runtime's reason (sc-24139).
     pub backend_capabilities: BackendCapabilitiesPayload,
     pub providers: Vec<ProviderSummary>,
+}
+
+/// A load that had to release the served model before it could run (sc-24140 feature-end
+/// review): the same model loaded again, or a model that did not fit beside the served one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct LoadTransitionPayload {
+    /// The released model's display name.
+    pub released: String,
+    /// The released model's source.
+    pub released_source: String,
+    pub reason: LoadTransitionReason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoadTransitionReason {
+    /// The served source was loaded again (for example under another CUDA-graph switch).
+    Reload,
+    /// The runtime refused the new model for memory while the served one was resident.
+    Memory,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2066,6 +2174,147 @@ mod tests {
         assert!(status.loaded.is_none());
     }
 
+    fn resident_request(source: &str) -> LoadModelRequest {
+        LoadModelRequest {
+            source: source.to_string(),
+            display_name: None,
+            quantize: None,
+            projector_source: None,
+            cuda_graphs: None,
+        }
+    }
+
+    /// sc-24140 feature-end review: the Models screen's "Reload" loads the served source again.
+    /// The resident copy must be dropped BEFORE the new load starts (two bf16 Qwen3.8-27B copies do
+    /// not fit on a 96 GB card), and the reply says what was released.
+    #[test]
+    fn reloading_the_served_source_releases_it_before_the_load_starts() {
+        use crate::test_support::{resident_ledger, resident_loader};
+        let engine = EngineHandle::spawn_with_loader(resident_loader);
+        engine
+            .load_model(resident_request("/reload-same/qwen"))
+            .unwrap();
+        let status = engine
+            .load_model(resident_request("/reload-same/qwen"))
+            .unwrap();
+        {
+            let ledger = resident_ledger().lock().unwrap();
+            assert_eq!(
+                ledger.alive_at_load("reload-same"),
+                vec![0, 0],
+                "the reload must start with no copy of the model resident"
+            );
+            assert_eq!(ledger.alive.get("reload-same"), Some(&1));
+        }
+        assert_eq!(status.loaded.unwrap().source, "/reload-same/qwen");
+        assert_eq!(
+            status.load_transition,
+            Some(LoadTransitionPayload {
+                released: "qwen".to_string(),
+                released_source: "/reload-same/qwen".to_string(),
+                reason: LoadTransitionReason::Reload,
+            })
+        );
+        // The transition describes that one load's reply, never a later status.
+        assert!(engine.status().unwrap().load_transition.is_none());
+    }
+
+    /// A different model loads beside the served one, so a switch that fails for any reason but
+    /// memory keeps serving the old model.
+    #[test]
+    fn a_failed_switch_to_another_model_keeps_the_served_one() {
+        use crate::test_support::{resident_ledger, resident_loader};
+        let engine = EngineHandle::spawn_with_loader(resident_loader);
+        engine
+            .load_model(resident_request("/switch-keep/a"))
+            .unwrap();
+        resident_ledger()
+            .lock()
+            .unwrap()
+            .fail_next
+            .insert("switch-keep".to_string());
+        let error = engine
+            .load_model(resident_request("/switch-keep/b"))
+            .unwrap_err();
+        assert!(!error.contains("No model is loaded"), "{error}");
+        assert_eq!(
+            engine.status().unwrap().loaded.unwrap().source,
+            "/switch-keep/a"
+        );
+        let status = engine
+            .load_model(resident_request("/switch-keep/b"))
+            .unwrap();
+        assert!(status.load_transition.is_none());
+        let ledger = resident_ledger().lock().unwrap();
+        assert_eq!(ledger.alive_at_load("switch-keep"), vec![0, 1, 1]);
+        assert_eq!(ledger.alive.get("switch-keep"), Some(&1));
+    }
+
+    /// A model the runtime refuses for memory while another is served loads once the served model
+    /// is released, and the reply names what was released and why.
+    #[test]
+    fn a_model_that_does_not_fit_beside_the_served_one_loads_after_releasing_it() {
+        use crate::test_support::{resident_ledger, resident_loader};
+        let engine = EngineHandle::spawn_with_loader(resident_loader);
+        engine.load_model(resident_request("/one-fits/a")).unwrap();
+        let status = engine.load_model(resident_request("/one-fits/b")).unwrap();
+        assert_eq!(status.loaded.unwrap().source, "/one-fits/b");
+        let transition = status.load_transition.unwrap();
+        assert_eq!(transition.released, "a");
+        assert_eq!(transition.reason, LoadTransitionReason::Memory);
+        let ledger = resident_ledger().lock().unwrap();
+        assert_eq!(ledger.alive_at_load("one-fits"), vec![0, 1, 0]);
+        assert_eq!(ledger.alive.get("one-fits"), Some(&1));
+    }
+
+    /// A reload that fails after the served copy was released says that nothing is served now,
+    /// and the status agrees.
+    #[test]
+    fn a_failed_reload_reports_that_no_model_is_loaded() {
+        use crate::test_support::{resident_ledger, resident_loader};
+        let engine = EngineHandle::spawn_with_loader(resident_loader);
+        engine
+            .load_model(resident_request("/reload-fails/qwen"))
+            .unwrap();
+        resident_ledger()
+            .lock()
+            .unwrap()
+            .fail_next
+            .insert("reload-fails".to_string());
+        let error = engine
+            .load_model(resident_request("/reload-fails/qwen"))
+            .unwrap_err();
+        assert!(
+            error.starts_with("qwen was unloaded to load it again, but the load failed: ")
+                && error.ends_with("No model is loaded now."),
+            "{error}"
+        );
+        assert!(engine.status().unwrap().loaded.is_none());
+        assert_eq!(
+            resident_ledger().lock().unwrap().alive.get("reload-fails"),
+            Some(&0)
+        );
+    }
+
+    #[test]
+    fn memory_refusals_are_told_apart_from_other_load_errors() {
+        use crate::core_llm::Error;
+        assert!(is_memory_refusal(&Error::InvalidRequest(
+            "request requires an estimated 69453758470 bytes of native workspace but only \
+             41000000000 bytes are available; reduce prompt/media length or max_new_tokens"
+                .to_string()
+        )));
+        assert!(is_memory_refusal(&Error::Msg(
+            "DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")".to_string()
+        )));
+        assert!(!is_memory_refusal(&Error::Load(
+            "config.json is missing".to_string()
+        )));
+        assert!(!is_memory_refusal(&Error::Unsupported(
+            "nvfp4: needs sm_120".to_string()
+        )));
+    }
+
     #[test]
     fn generate_requires_loaded_model() {
         let engine = EngineHandle::spawn_with_loader(fake_loader);
@@ -2502,6 +2751,7 @@ mod tests {
         let loaded = engine.status().unwrap().loaded.unwrap();
         let status = EngineStatus {
             loaded: Some(loaded),
+            load_transition: None,
             execution_backend: "candle-cuda",
             backend_capabilities: BackendCapabilitiesPayload::from(&BackendCapabilities {
                 backend: "candle-cuda".to_string(),
