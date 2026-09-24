@@ -257,8 +257,18 @@ pub fn save_app_settings(app: &AppHandle, settings: &AppSettings) -> Result<(), 
     write_settings(&path, settings)
 }
 
-pub fn api_auth_token_present() -> bool {
-    read_api_auth_token().ok().flatten().is_some()
+pub fn resolve_api_auth_token<E: std::fmt::Display>(
+    auth_enabled: bool,
+    read: impl FnOnce() -> Result<Option<String>, E>,
+) -> Result<Option<String>, String> {
+    if !auth_enabled {
+        return Ok(None);
+    }
+    read()
+        .map_err(|error| format!("could not read API auth token: {error}"))?
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| "API auth token must be saved before enabling auth".to_string())
+        .map(Some)
 }
 
 pub fn read_api_auth_token() -> Result<Option<String>, keyring::Error> {
@@ -351,6 +361,44 @@ fn default_mtp_draft_tokens() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enabled_auth_requires_a_readable_token_for_every_local_file_policy() {
+        for allow_local_files in [false, true] {
+            let mut settings = AppSettings::default();
+            settings.server.auth_enabled = true;
+            settings.server.allow_local_files = allow_local_files;
+            let settings = settings.normalized().unwrap();
+            assert!(
+                resolve_api_auth_token(settings.server.auth_enabled, || Ok::<_, &str>(None))
+                    .is_err()
+            );
+            assert!(
+                resolve_api_auth_token(settings.server.auth_enabled, || Err::<Option<String>, _>(
+                    "denied"
+                ))
+                .is_err()
+            );
+            assert_eq!(
+                resolve_api_auth_token(settings.server.auth_enabled, || Ok::<_, &str>(Some(
+                    "secret".into()
+                )))
+                .unwrap(),
+                Some("secret".into())
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_auth_never_reads_credentials() {
+        assert_eq!(
+            resolve_api_auth_token(false, || -> Result<Option<String>, &str> {
+                panic!("credential read")
+            })
+            .unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn normalizes_and_validates_settings() {
