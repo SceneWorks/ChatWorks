@@ -8,6 +8,7 @@ import { isExactGgufUrl, modelSubtitle, unloadServedModel } from "../src/state/m
 import { prepareRemoteMedia } from "../src/state/media.js";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 
 const capabilities = {
   supports_thinking: true,
@@ -237,4 +238,36 @@ test("browser video metadata wait aborts and releases its decoder source", async
     assert.ok(actions.includes("remove:src"));
     assert.ok(actions.includes("load"));
   } finally { globalThis.document = previous; }
+});
+
+test("installed CSP permits local blob video without enabling remote browser media", () => {
+  const config = JSON.parse(readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8"));
+  const directives = Object.fromEntries(config.app.security.csp.split(";").map((part) => part.trim().split(/\s+/))
+    .filter(([name]) => name).map(([name, ...sources]) => [name, sources]));
+  assert.deepEqual(directives["media-src"], ["'self'", "blob:"]);
+  assert.deepEqual(directives["default-src"], ["'self'"]);
+});
+
+test("local video decoder failure names the file without a remote CORS explanation", async () => {
+  const { sampleVideoAttachment } = await import("../src/media/video.js");
+  const previousDocument = globalThis.document;
+  const previousCreate = URL.createObjectURL;
+  const previousRevoke = URL.revokeObjectURL;
+  const revoked = [];
+  const video = {
+    pause() {}, removeAttribute() {}, load() {},
+    set src(value) { if (value) queueMicrotask(() => this.onerror?.()); },
+  };
+  globalThis.document = { createElement: () => video };
+  URL.createObjectURL = () => "blob:chatworks-local-fixture";
+  URL.revokeObjectURL = (value) => revoked.push(value);
+  try {
+    await assert.rejects(sampleVideoAttachment({ name: "clip with space.mp4" }), (error) =>
+      error.message.includes("clip with space.mp4") && !error.message.includes("CORS"));
+    assert.deepEqual(revoked, ["blob:chatworks-local-fixture"]);
+  } finally {
+    globalThis.document = previousDocument;
+    URL.createObjectURL = previousCreate;
+    URL.revokeObjectURL = previousRevoke;
+  }
 });

@@ -36,7 +36,9 @@ export async function sampleVideoAttachment(source, signal) {
   const ready = new Promise((resolve, reject) => {
     rejectPending = reject;
     video.onloadedmetadata = () => resolve();
-    video.onerror = () => reject(new Error(`Could not decode ${name}. Remote video URLs must allow CORS for frame sampling.`));
+    video.onerror = () => reject(new Error(remote
+      ? `Could not decode ${name}. Remote video URLs must allow CORS for frame sampling.`
+      : `Could not load or decode local video ${name}. Check that its format is supported by this WebView.`));
   });
 
   try {
