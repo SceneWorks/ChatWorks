@@ -32,6 +32,7 @@ pub mod conversations;
 pub mod engine;
 pub mod fsutil;
 mod inference_runtime;
+pub mod mlx_metallib;
 pub mod model_registry;
 pub mod profile;
 pub mod server;

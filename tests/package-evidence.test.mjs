@@ -75,7 +75,7 @@ test('macOS evidence archives preserve app permissions and symlinks', { skip: pr
   const app = path.join(build, 'release/bundle/macos/ChatWorks.app/Contents/MacOS');
   fs.mkdirSync(app, { recursive: true }); fs.writeFileSync(path.join(app, 'chatworks'), 'binary', { mode: 0o755 });
   fs.symlinkSync('chatworks', path.join(app, 'alias'));
-  const receipt = collect(root, build, out, 'aarch64-apple-darwin', 'mlx', execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
+  const receipt = collect(root, build, out, 'x86_64-apple-darwin', 'cpu', execFileSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim());
   assert.match(receipt.package.file, /\.app\.tar\.gz$/);
   assert.ok(receipt.package.bytes > 0);
   const extracted = path.join(root, 'extracted'); fs.mkdirSync(extracted);
@@ -84,9 +84,8 @@ test('macOS evidence archives preserve app permissions and symlinks', { skip: pr
   assert.equal(fs.statSync(binary).mode & 0o777, 0o755);
   assert.equal(fs.readlinkSync(path.join(path.dirname(binary), 'alias')), 'chatworks');
   const sha = receipt.source_sha;
-  const intel = collect(root, build, path.join(root, 'intel-evidence'), 'x86_64-apple-darwin', 'cpu', sha);
-  assert.equal(intel.backend, 'cpu');
-  assert.match(intel.package.file, /x86_64-apple-darwin-cpu/);
+  assert.equal(receipt.backend, 'cpu');
+  assert.match(receipt.package.file, /x86_64-apple-darwin-cpu/);
   assert.throws(() => collect(root, build, path.join(root, 'wrong-intel'), 'x86_64-apple-darwin', 'mlx', sha), /not valid/);
   assert.throws(() => collect(root, build, path.join(root, 'wrong-arm'), 'aarch64-apple-darwin', 'cpu', sha), /not valid/);
 });

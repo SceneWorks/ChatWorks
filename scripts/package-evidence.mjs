@@ -18,6 +18,108 @@ const hash = file => {
   return digest.digest('hex');
 };
 const row = file => ({ file: path.basename(file), bytes: fs.statSync(file).size, sha256: hash(file) });
+const mlxResource = 'Contents/Resources/mlx.metallib';
+const mlxProvenanceFile = 'mlx-metallib-provenance.json';
+
+function macosApp(targetDir) {
+  const bundle = path.join(targetDir, 'release/bundle/macos');
+  const apps = fs.readdirSync(bundle).filter(name => name.endsWith('.app'));
+  if (apps.length !== 1) throw new Error(`Expected exactly one macOS app; found ${apps.length}`);
+  return path.join(bundle, apps[0]);
+}
+
+function mlxRevision(root) {
+  const lock = fs.readFileSync(path.join(root, 'Cargo.lock'), 'utf8');
+  const block = lock.split('[[package]]').find(section => /\bname = "pmetal-mlx-sys"\n/.test(section));
+  const source = block?.match(/^source = "([^"]+)"$/m)?.[1];
+  const match = source?.match(/^git\+https:\/\/github\.com\/michaeltrefry\/mlx-rs\?rev=([a-f0-9]{40})#([a-f0-9]{40})$/);
+  if (!match || match[1] !== match[2]) throw new Error('Cargo.lock lacks an exact pinned pmetal-mlx-sys revision');
+  return match[1];
+}
+
+function mlxManifest(file) {
+  const values = Object.fromEntries(fs.readFileSync(file, 'utf8').split(/\r?\n/)
+    .filter(line => line.includes('=')).map(line => {
+      const split = line.indexOf('=');
+      return [line.slice(0, split), line.slice(split + 1)];
+    }));
+  if (values.schema !== '1' || values.target !== 'aarch64-apple-darwin'
+      || values.deployment_target !== '26.2' || values.build_type !== 'Release'
+      || values.features !== 'accelerate,metal' || !/^[a-f0-9]{64}$/.test(values.fingerprint ?? '')) {
+    throw new Error('MLX build manifest does not match the Apple Silicon release contract');
+  }
+  return values;
+}
+
+function linkedMlxBuild(root, targetDir, app) {
+  const executable = path.join(app, 'Contents/MacOS/chatworks');
+  const binary = fs.readFileSync(executable);
+  const buildDir = path.join(targetDir, 'release/build');
+  const matches = [];
+  for (const name of fs.readdirSync(buildDir).filter(name => /^pmetal-mlx-sys-[a-f0-9]+$/.test(name))) {
+    const output = path.join(buildDir, name, 'output');
+    if (!fs.existsSync(output)) continue;
+    const sources = [...fs.readFileSync(output, 'utf8').matchAll(/^cargo:metallib=(.+)$/gm)];
+    if (sources.length !== 1) continue;
+    const source = sources[0][1].trim();
+    const expected = path.join(buildDir, name, 'out/build/lib/mlx.metallib');
+    if (source !== expected || !fs.existsSync(source) || !fs.statSync(source).isFile()) continue;
+    const kernels = path.join(buildDir, name, 'out/build/_deps/mlx-build/mlx/backend/metal/kernels');
+    if (![`${kernels}/mlx.metallib`, `${kernels}//mlx.metallib`]
+      .some(value => binary.includes(Buffer.from(value)))) continue;
+    matches.push({ output, source, compiled: path.join(kernels, 'mlx.metallib') });
+  }
+  if (matches.length !== 1) throw new Error(`Expected one linked MLX metallib build; found ${matches.length}`);
+  const { output, source, compiled } = matches[0];
+  if (!fs.existsSync(compiled) || hash(source) !== hash(compiled)) {
+    throw new Error('MLX metadata library differs from the executable-linked Metal kernels');
+  }
+  const manifestFile = path.join(path.dirname(source), 'pmetal-mlx-prebuilt.txt');
+  const manifest = mlxManifest(manifestFile);
+  return { output, source, manifestFile, manifest, revision: mlxRevision(root) };
+}
+
+export function stageMlxMetallib(root, targetDir) {
+  const app = macosApp(targetDir);
+  const { output, source, manifestFile, manifest, revision } = linkedMlxBuild(root, targetDir, app);
+  const destination = path.join(app, mlxResource);
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  fs.copyFileSync(source, destination);
+  const provenance = {
+    schema_version: 1,
+    mlx_rs_revision: revision,
+    build_script_output: path.relative(targetDir, output),
+    build_manifest: manifest,
+    build_manifest_sha256: hash(manifestFile),
+    metallib: { ...row(destination), file: mlxResource },
+  };
+  fs.writeFileSync(path.join(targetDir, 'release', mlxProvenanceFile), JSON.stringify(provenance, null, 2));
+  return provenance;
+}
+
+export function verifyMlxMetallib(app, targetDir, root) {
+  if (!root) throw new Error('MLX package verification requires the pinned source root');
+  const provenance = JSON.parse(fs.readFileSync(path.join(targetDir, 'release', mlxProvenanceFile), 'utf8'));
+  const resource = path.join(app, mlxResource);
+  const matches = fs.readdirSync(app, { recursive: true, withFileTypes: true })
+    .filter(entry => entry.name === 'mlx.metallib');
+  if (matches.length !== 1 || !fs.existsSync(resource) || !fs.lstatSync(resource).isFile()) {
+    throw new Error('macOS MLX package must contain exactly one regular Contents/Resources/mlx.metallib');
+  }
+  const actual = { ...row(resource), file: mlxResource };
+  if (JSON.stringify(actual) !== JSON.stringify(provenance.metallib)) {
+    throw new Error('packaged MLX metallib bytes or SHA-256 differ from build provenance');
+  }
+  const linked = linkedMlxBuild(root, targetDir, app);
+  if (provenance.schema_version !== 1 || provenance.mlx_rs_revision !== linked.revision
+      || provenance.build_script_output !== path.relative(targetDir, linked.output)
+      || provenance.build_manifest_sha256 !== hash(linked.manifestFile)
+      || JSON.stringify(provenance.build_manifest) !== JSON.stringify(linked.manifest)
+      || actual.sha256 !== hash(linked.source)) {
+    throw new Error('packaged MLX metallib provenance differs from the executable-linked build');
+  }
+  return provenance;
+}
 
 export function stageCuda(root, toolkit, output) {
   const version = JSON.parse(fs.readFileSync(path.join(toolkit, 'version.json'), 'utf8'));
@@ -101,6 +203,7 @@ export function collect(root, targetDir, output, target, backend, sha, cudaStage
   const files = fs.readdirSync(bundle).filter(name => name.endsWith(suffix));
   if (files.length !== 1) throw new Error(`Expected exactly one ${kind} package; found ${files.length}`);
   const source = path.join(bundle, files[0]);
+  const mlxMetallib = backend === 'mlx' ? verifyMlxMetallib(source, targetDir, root) : null;
   const destination = path.join(output, `chatworks-${target}-${backend}-${files[0]}${kind === 'macos' ? '.tar.gz' : ''}`);
   if (kind === 'macos') execFileSync('tar', ['-czf', destination, '-C', bundle, files[0]]);
   else fs.copyFileSync(source, destination);
@@ -118,6 +221,10 @@ export function collect(root, targetDir, output, target, backend, sha, cudaStage
     receipt.cuda_runtime = JSON.parse(fs.readFileSync(runtime, 'utf8'));
     fs.copyFileSync(runtime, path.join(output, 'cuda-runtime.json'));
   }
+  if (mlxMetallib) {
+    receipt.mlx_metallib = mlxMetallib;
+    fs.copyFileSync(path.join(targetDir, 'release', mlxProvenanceFile), path.join(output, mlxProvenanceFile));
+  }
   fs.writeFileSync(path.join(output, 'package-evidence.json'), JSON.stringify(receipt, null, 2));
   fs.writeFileSync(path.join(output, 'SHA256SUMS'), `${receipt.package.sha256}  ${receipt.package.file}\n`);
   return receipt;
@@ -128,5 +235,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   if (command === 'stage-cuda') stageCuda(...args);
   else if (command === 'collect') collect(...args);
   else if (command === 'verify-cuda') verifyCudaPackage(...args);
-  else throw new Error('Expected stage-cuda or collect');
+  else if (command === 'stage-mlx') stageMlxMetallib(...args);
+  else if (command === 'verify-mlx') verifyMlxMetallib(...args);
+  else throw new Error('Expected stage-cuda, verify-cuda, stage-mlx, verify-mlx, or collect');
 }
