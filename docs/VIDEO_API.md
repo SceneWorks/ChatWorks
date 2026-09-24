@@ -80,8 +80,10 @@ notice in [`third_party/ffmpeg`](../third_party/ffmpeg). Development builds may 
 
 ## The ChatWorks frontend
 
-The frontend's "Video" attach button samples up to 8 evenly-spaced frames from a chosen local video
-client-side, downscales them, and sends them as a `video_url` part with derived timestamps. Public
+The frontend's "Video" attach button seeks up to 8 evenly-spaced points in a chosen local video,
+waits for a decoded frame to be presented, and sends downscaled, distinct frames with their actual
+presentation timestamps. Low-frame-rate clips can yield fewer than 8 unique frames. A WebView that
+cannot report presented frames rejects local video preparation instead of sending unverified pixels. Public
 image/video URLs instead pass through native bounded staging and decoding, so the remote server does
 not need WebView CORS headers and ChatWorks does not widen its CSP. The button is shown only when the
 loaded model advertises `supports_video`.
