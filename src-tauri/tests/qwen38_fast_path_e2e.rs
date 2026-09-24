@@ -412,7 +412,7 @@ fn qwen38_fast_path_end_to_end() {
     });
     check_cancelled(&mut rec, "4b", "generate_with_cancel", flagged, seen);
 
-    // (c) The desktop Stop button: `cancel_generation` calls `EngineHandle::cancel`.
+    // (c) The desktop Stop button: its `stop_generation` command calls `EngineHandle::cancel`.
     let stopper = engine.clone();
     let mut seen = 0_usize;
     let mut stop_hit = None;
@@ -1401,8 +1401,10 @@ impl Record {
             .collect()
     }
 
-    /// Write the record once: the SHA-256 of the record's compact JSON is stored beside it, the
-    /// file is created fresh (never overwritten) and left read-only.
+    /// Write the record once: the SHA-256 of the record's canonical JSON (compact, every object's
+    /// keys sorted) is stored beside it, the file is created fresh (never overwritten) and left
+    /// read-only. The record is written in that canonical key order too, so the seal can be checked
+    /// from the file alone, whichever `serde_json` map ordering the build links.
     fn seal(&mut self, outcome: &str) -> PathBuf {
         if self.sealed {
             return self.output.clone();
@@ -1425,11 +1427,12 @@ impl Record {
             "checks": self.checks,
             "observations": self.observations,
         });
+        let record = canonical(record);
         let digest = Sha256::digest(serde_json::to_vec(&record).expect("record JSON"));
         let sealed = json!({
             "seal": {
                 "sha256": digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
-                "over": "the compact serde_json serialization of `record` (keys sorted)",
+                "over": "the compact JSON of `record`, every object's keys sorted, non-ASCII unescaped",
             },
             "record": record,
         });
@@ -1453,6 +1456,26 @@ impl Record {
             ),
         }
         self.output.clone()
+    }
+}
+
+/// `value` with every object's keys in sorted order. A `serde_json` map keeps insertion order
+/// when a dependency enables its `preserve_order` feature (Tauri's graph does), so the seal sorts
+/// explicitly rather than relying on the map type.
+fn canonical(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, canonical(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(canonical).collect()),
+        other => other,
     }
 }
 

@@ -52,7 +52,7 @@ The record at `CHATWORKS_E2E_OUTPUT` has this shape:
 
 ```json
 {
-  "seal": { "sha256": "<sha256 of the compact JSON of `record`>", "over": "..." },
+  "seal": { "sha256": "<sha256 of the canonical compact JSON of `record`>", "over": "..." },
   "record": {
     "outcome": "complete | aborted | incomplete",
     "meta": {
@@ -70,10 +70,18 @@ The record at `CHATWORKS_E2E_OUTPUT` has this shape:
 }
 ```
 
-The file is created with `create_new` and then made read-only. To verify it, hash the compact
-serialization of `record` with its keys sorted, as `serde_json` writes it, and compare the result
-with `seal.sha256`. For the record run, the ChatWorks tree must be clean (`meta.chatworks.dirty`
-must be `false`).
+The file is created with `create_new` and then made read-only. The seal is the SHA-256 of
+`record` serialized as compact JSON, with every object's keys sorted and non-ASCII characters left
+unescaped. The harness writes the record in that same key order. To verify a record:
+
+```python
+import hashlib, json
+d = json.load(open("record.json", encoding="utf-8"))
+body = json.dumps(d["record"], sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+assert hashlib.sha256(body.encode()).hexdigest() == d["seal"]["sha256"]
+```
+
+For the record run, the ChatWorks tree must be clean (`meta.chatworks.dirty` must be `false`).
 
 ### Expected results at earlier pins
 
