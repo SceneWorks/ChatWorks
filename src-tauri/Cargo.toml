@@ -42,13 +42,13 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # Inference backend — exactly one explicit LLM composition is selected per platform. Disabling the
 # runtime bundle's default `media` feature keeps ChatWorks out of the unrelated media graph.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-runtime-macos = { git = "https://github.com/SceneWorks/inference", rev = "a400b2e833f516373967a9fa556a877e4019f5d5", default-features = false }
+runtime-macos = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.09.1", default-features = false }
 
 [target.'cfg(not(all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
-runtime-cpu = { git = "https://github.com/SceneWorks/inference", rev = "a400b2e833f516373967a9fa556a877e4019f5d5", default-features = false, optional = true }
+runtime-cpu = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.09.1", default-features = false, optional = true }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-runtime-cuda = { git = "https://github.com/SceneWorks/inference", rev = "a400b2e833f516373967a9fa556a877e4019f5d5", default-features = false, optional = true }
+runtime-cuda = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.09.1", default-features = false, optional = true }
 
 # The workspace forbids `unsafe` (workspace `unsafe_code = "forbid"`), but this crate must relax it to
 # `allow`: the Tauri framework's generated code (and some of its macro-expanded FFI) emits `unsafe`
