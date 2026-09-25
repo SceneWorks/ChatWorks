@@ -43,6 +43,7 @@ fn qwen35_vision_high_resolution_prefill_does_not_crash() {
             display_name: None,
             quantize: None,
             projector_source: None,
+            cuda_graphs: None,
         })
         .expect("load 27B");
 

@@ -1,7 +1,7 @@
 name: Supply chain
 
-# Ensures every platform bundle and resolved inference package comes from the one reviewed,
-# immutable SceneWorks/inference tag and resolved commit recorded in scripts/git-deps-pinned.csv.
+# Ensures every platform bundle and resolved inference package comes from the one reviewed pin
+# (a released runtime tag on main; an exact commit on a feature train) recorded in scripts/git-deps-pinned.csv.
 on:
   push:
     branches: [main]

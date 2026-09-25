@@ -10,10 +10,13 @@
 #![cfg(test)]
 
 use crate::core_llm::{
-    Channel, FinishReason, GenerationTimings, LoadSpec, MtpCapabilities, MtpStats, StreamEvent,
+    Channel, CudaGraphsReport, DecodeReport, FinishReason, GenerationTimings, LoadReport, LoadSpec,
+    MtpCapabilities, MtpStats, PathReport, ProjectionReport, ProposerKind, Quantize, StreamEvent,
     TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingMode,
     Usage,
 };
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 /// A weightless `TextLlm` that streams a reasoning token then a content token and finishes `Stop`.
@@ -21,11 +24,87 @@ use std::time::Duration;
 pub struct FakeProvider {
     pub descriptor: TextLlmDescriptor,
     pub emit_telemetry: bool,
+    /// The load report this fake returns (`None` = a provider that does not report one).
+    pub load_report: Option<LoadReport>,
+}
+
+/// The decode report the telemetry fake emits: native MTP under the load's CUDA-graph switch,
+/// with the graph runner falling back for a named reason, and NVFP4 projections served by the
+/// decode GEMV after a cuBLASLt prefill (sc-24139).
+pub fn fake_decode_report() -> DecodeReport {
+    DecodeReport {
+        path: "mtp".to_string(),
+        proposer: ProposerKind::Mtp,
+        draft_tokens: Some(2),
+        sampler: "device".to_string(),
+        kv_cache: "static".to_string(),
+        attention: "gqa".to_string(),
+        cuda_graphs: CudaGraphsReport {
+            enabled: true,
+            path: "eager".to_string(),
+            replayed: 0,
+            eager: 3,
+            captured: 0,
+            fallback_reason: Some("deltanet_state_unstable".to_string()),
+        },
+        nvfp4_projections: PathReport {
+            path: "mixed".to_string(),
+            reason: Some("rows".to_string()),
+        },
+        fused_primitives: PathReport {
+            path: "fused".to_string(),
+            reason: None,
+        },
+        target_forwards: 2,
+        proposed_tokens: 4,
+        accepted_tokens: 3,
+        replay_forwards: 0,
+    }
+}
+
+/// What a recording loader saw of one `LoadSpec`: the weight format and the CUDA-graph switch.
+pub type RecordedLoad = (Option<Quantize>, Option<bool>);
+
+/// Every `LoadSpec` a recording loader saw, keyed by source path, so a test can assert what
+/// reached the runtime's load request without sharing state with a concurrently running test.
+pub fn recorded_load_specs() -> &'static Mutex<HashMap<String, RecordedLoad>> {
+    static SPECS: OnceLock<Mutex<HashMap<String, RecordedLoad>>> = OnceLock::new();
+    SPECS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A telemetry fake that records the `LoadSpec` it was handed (see [`recorded_load_specs`]) and
+/// reports a load report naming the requested format.
+pub fn recording_loader(spec: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
+    recorded_load_specs()
+        .lock()
+        .unwrap()
+        .insert(spec.source.clone(), (spec.quantize, spec.cuda_graphs));
+    let mut provider = telemetry_provider();
+    provider.load_report = Some(LoadReport {
+        requested: spec.quantize,
+        projections: vec![ProjectionReport {
+            kind: if spec.quantize == Some(Quantize::Nvfp4) {
+                "nvfp4".to_string()
+            } else {
+                "dense".to_string()
+            },
+            count: 448,
+            params: 1_000,
+            resident_bytes: 562,
+        }],
+        // Settled like the Candle runtime: the request, else its default (off).
+        cuda_graphs: Some(spec.cuda_graphs.unwrap_or(false)),
+    });
+    Ok(Box::new(provider))
 }
 
 impl TextLlm for FakeProvider {
     fn descriptor(&self) -> &TextLlmDescriptor {
         &self.descriptor
+    }
+
+    fn load_report(&self) -> Option<LoadReport> {
+        self.load_report.clone()
     }
 
     fn validate(&self, req: &TextLlmRequest) -> crate::core_llm::Result<()> {
@@ -85,6 +164,7 @@ impl TextLlm for FakeProvider {
                 prefill: Duration::from_millis(12),
                 decode: Duration::from_millis(34),
             }),
+            decode: self.emit_telemetry.then(fake_decode_report),
             finish_reason: Some(FinishReason::Stop),
         })
     }
@@ -96,21 +176,27 @@ pub fn fake_loader(_: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
     Ok(Box::new(FakeProvider {
         descriptor: thinking_descriptor("fake", 8),
         emit_telemetry: false,
+        load_report: None,
     }))
 }
 
 /// A weightless MTP-capable fake that reports deterministic native output evidence. It validates
 /// the full HTTP/SSE telemetry path without loading model weights.
 pub fn fake_telemetry_loader(_: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
+    Ok(Box::new(telemetry_provider()))
+}
+
+fn telemetry_provider() -> FakeProvider {
     let mut descriptor = thinking_descriptor("fake-telemetry", 8);
     descriptor.capabilities.mtp = Some(MtpCapabilities {
         max_draft_tokens: 4,
         recommended_draft_tokens: 2,
     });
-    Ok(Box::new(FakeProvider {
+    FakeProvider {
         descriptor,
         emit_telemetry: true,
-    }))
+        load_report: None,
+    }
 }
 
 /// Build a descriptor for a thinking-capable fake with the given id + `max_new_tokens`.
@@ -172,6 +258,7 @@ impl TextLlm for FakeToolProvider {
             usage,
             mtp: None,
             timings: None,
+            decode: None,
             finish_reason: Some(FinishReason::Stop),
         })
     }
@@ -191,5 +278,109 @@ pub fn fake_tool_loader(_: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm
                 ..Default::default()
             },
         },
+    }))
+}
+
+/// What a [`resident_loader`] has seen, keyed by namespace (the source's first path segment) so
+/// concurrently running tests never see each other's providers.
+#[derive(Default)]
+pub struct ResidentLedger {
+    /// Providers alive per namespace.
+    pub alive: HashMap<String, usize>,
+    /// Every load the loader was asked for: the source, and how many providers of its namespace
+    /// were alive when that load started.
+    pub loads: Vec<(String, usize)>,
+    /// Namespaces whose next load is refused (then cleared).
+    pub fail_next: std::collections::HashSet<String>,
+}
+
+impl ResidentLedger {
+    /// The providers alive at the start of each load of `namespace`, in order.
+    pub fn alive_at_load(&self, namespace: &str) -> Vec<usize> {
+        self.loads
+            .iter()
+            .filter(|(source, _)| resident_namespace(source) == namespace)
+            .map(|(_, alive)| *alive)
+            .collect()
+    }
+}
+
+pub fn resident_ledger() -> &'static Mutex<ResidentLedger> {
+    static LEDGER: OnceLock<Mutex<ResidentLedger>> = OnceLock::new();
+    LEDGER.get_or_init(|| Mutex::new(ResidentLedger::default()))
+}
+
+fn resident_namespace(source: &str) -> String {
+    source
+        .trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A [`FakeProvider`] whose lifetime the [`resident_ledger`] tracks: it stands in for a model
+/// holding device memory until it is dropped.
+pub struct ResidentProvider {
+    inner: FakeProvider,
+    namespace: String,
+}
+
+impl Drop for ResidentProvider {
+    fn drop(&mut self) {
+        if let Ok(mut ledger) = resident_ledger().lock() {
+            if let Some(alive) = ledger.alive.get_mut(&self.namespace) {
+                *alive -= 1;
+            }
+        }
+    }
+}
+
+impl TextLlm for ResidentProvider {
+    fn descriptor(&self) -> &TextLlmDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn validate(&self, req: &TextLlmRequest) -> crate::core_llm::Result<()> {
+        self.inner.validate(req)
+    }
+
+    fn generate(
+        &self,
+        req: &TextLlmRequest,
+        on_event: &mut dyn FnMut(StreamEvent),
+    ) -> crate::core_llm::Result<TextLlmOutput> {
+        self.inner.generate(req, on_event)
+    }
+}
+
+/// A loader of [`ResidentProvider`]s. A namespace in `fail_next` has its next load refused; a
+/// `one-fits` namespace is refused the way the runtime's load admission refuses a model that does
+/// not fit (`core_llm::admit_request_memory`) while another of its providers is resident.
+pub fn resident_loader(spec: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
+    let namespace = resident_namespace(&spec.source);
+    let mut ledger = resident_ledger().lock().unwrap();
+    let alive = ledger.alive.get(&namespace).copied().unwrap_or(0);
+    ledger.loads.push((spec.source.clone(), alive));
+    if ledger.fail_next.remove(&namespace) {
+        return Err(crate::core_llm::Error::Load(
+            "fixture refuses this load".to_string(),
+        ));
+    }
+    if namespace == "one-fits" && alive > 0 {
+        return Err(crate::core_llm::Error::InvalidRequest(
+            "request requires an estimated 2 bytes of native workspace but only 1 bytes are \
+             available; reduce prompt/media length or max_new_tokens"
+                .to_string(),
+        ));
+    }
+    *ledger.alive.entry(namespace.clone()).or_default() += 1;
+    Ok(Box::new(ResidentProvider {
+        inner: FakeProvider {
+            descriptor: thinking_descriptor("fake-resident", 8),
+            emit_telemetry: false,
+            load_report: None,
+        },
+        namespace,
     }))
 }

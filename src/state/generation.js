@@ -1,9 +1,12 @@
 // Optional controls retain the model default until the user chooses an override.
+// An unknown speculative (MTP) mode is `""`, never a UI constant: requests then omit `mtp` (the
+// server applies the saved setting) and saved settings omit `mtpMode` (the backend fills in this
+// build's default: `auto` on Candle CUDA, `off` on MLX and Candle CPU) (sc-24140).
 export function generationParams(value = {}) {
   return {
     reasoningEffort: value.reasoningEffort ?? "",
     preserveThinking: value.preserveThinking == null ? "" : String(value.preserveThinking),
-    mtpMode: value.mtpMode ?? "off",
+    mtpMode: value.mtpMode ?? "",
     mtpDraftTokens: String(value.mtpDraftTokens ?? 3),
     topK: String(value.topK ?? ""),
     presencePenalty: String(value.presencePenalty ?? ""),
@@ -42,7 +45,8 @@ export function generationSettings(params) {
     reasoningEffort: params.reasoningEffort || null,
     preserveThinking: params.preserveThinking === "" || params.preserveThinking == null
       ? null : params.preserveThinking === true || params.preserveThinking === "true",
-    mtpMode: params.mtpMode ?? "off",
+    // Omitted (undefined) when unknown, so the backend's default applies instead of a UI guess.
+    mtpMode: params.mtpMode || undefined,
     mtpDraftTokens: optionalNumber(params.mtpDraftTokens) ?? 3,
     topK: optionalNumber(params.topK),
     presencePenalty: optionalNumber(params.presencePenalty),
@@ -65,7 +69,7 @@ export function generationOverrides(params, capabilities = {}) {
   if (capabilities.supports_preserve_thinking && values.preserveThinking != null) {
     body.preserve_thinking = values.preserveThinking;
   }
-  if (capabilities.mtp) {
+  if (capabilities.mtp && values.mtpMode) {
     body.mtp = values.mtpMode === "enabled"
       ? { mode: "enabled", draft_tokens: values.mtpDraftTokens }
       : { mode: values.mtpMode === "off" ? "off" : "auto" };

@@ -917,3 +917,103 @@
     transform: none;
   }
 }
+
+/* Runtime-reported weight formats and decode path (sc-24139) */
+.field-note {
+  display: block;
+  margin-top: 4px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.decode-path {
+  display: grid;
+  gap: var(--gap-1);
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-2);
+}
+
+.decode-path-rows {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+}
+
+.decode-path-row {
+  display: grid;
+  grid-template-columns: minmax(96px, 150px) minmax(0, 1fr);
+  gap: var(--gap-2);
+  font-size: 13px;
+}
+
+.decode-path-row dt {
+  color: var(--text-muted);
+  font-weight: 700;
+}
+
+.decode-path-row dd {
+  margin: 0;
+  color: var(--text);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.decode-path-row dd small {
+  display: block;
+  color: var(--text-muted);
+  font-family: inherit;
+}
+
+.decode-path-section {
+  margin: 6px 0 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.field-note.lossy {
+  color: var(--text);
+}
+
+/* NVFP4 weights are lossy: a badge beside the served model's name (sc-24140). */
+.lossy-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  vertical-align: middle;
+}
+
+.speculative-notice {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-1, var(--surface-2));
+}
+
+.speculative-notice p {
+  margin: 0;
+}
+
+.speculative-notice small {
+  display: block;
+  margin-top: 2px;
+  color: var(--text-muted);
+}
+
+.speculative-notice-actions {
+  display: flex;
+  gap: var(--gap-1);
+}

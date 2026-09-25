@@ -26,7 +26,8 @@ export function GenerationControls({ params, onChange, capabilities, prefix = "g
       {(defaults || capabilities.supports_preserve_thinking) && field("preserveThinking", "Prior reasoning",
         [["", "Model default"], ["true", "Keep in conversation"], ["false", "Omit from future prompts"]])}
       {(defaults || capabilities.mtp) && field("mtpMode", "Multi-token prediction",
-        [["off", "Off"], ["auto", "Automatic"], ["enabled", "Choose draft count"]])}
+        [["", defaults ? "Default for this build" : "App setting"], ["off", "Off"], ["auto", "Automatic"],
+          ["enabled", "Choose draft count"]])}
       {(defaults || capabilities.mtp) && params.mtpMode === "enabled" && (
         <div className="field">
           <label htmlFor={`${prefix}-mtp-drafts`}>Draft tokens</label>

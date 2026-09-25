@@ -25,9 +25,12 @@ function request(params, caps = capabilities) {
   });
 }
 
-test("model defaults remain omitted and MTP defaults off", () => {
+test("model defaults remain omitted and an unknown MTP mode is left to the backend", () => {
   const body = request({});
-  assert.deepEqual(body.mtp, { mode: "off" });
+  // No UI constant: the server applies the saved setting (the build's default: auto on CUDA).
+  assert.equal(Object.hasOwn(body, "mtp"), false);
+  assert.deepEqual(request({ mtpMode: "off" }).mtp, { mode: "off" });
+  assert.deepEqual(request({ mtpMode: "auto" }).mtp, { mode: "auto" });
   assert.deepEqual(body.model_defaults, ["reasoning_effort", "preserve_thinking"]);
   for (const field of ["reasoning_effort", "preserve_thinking", "top_k", "seed"]) {
     assert.equal(Object.hasOwn(body, field), false, field);
@@ -152,13 +155,20 @@ test("remote UI media is routed through native staging without browser fetch or 
   assert.equal(prepared.url, "data:image/jpeg;base64,AA==");
 });
 
-test("desktop wire fixture explicitly clears global controls and preserves Off after restore", async () => {
+test("desktop wire fixture explicitly clears global controls and leaves an unknown MTP mode to the backend after restore", async () => {
   const { readFile } = await import("node:fs/promises");
   const fixture = JSON.parse(await readFile(new URL("generation-wire.json", import.meta.url)));
-  const restored = paramsFromConversation(paramsToConversation({ ...generationParams(), disableThinking: true }));
+  const saved = paramsToConversation({ ...generationParams(), disableThinking: true });
+  // Nothing pins a speculative mode the user never chose: the backend's default fills it in.
+  assert.equal(Object.hasOwn(JSON.parse(JSON.stringify(saved)), "mtpMode"), false);
+  const restored = paramsFromConversation(saved);
   const body = request(restored);
-  assert.deepEqual({ model_defaults: body.model_defaults, mtp: body.mtp }, fixture);
+  const { model_defaults: modelDefaults, ...rest } = body;
+  assert.deepEqual({ model_defaults: modelDefaults, ...(Object.hasOwn(rest, "mtp") ? { mtp: rest.mtp } : {}) }, fixture);
   assert.equal(body.disable_thinking, true);
+  // An explicit Off survives persistence.
+  const off = paramsFromConversation(paramsToConversation({ ...generationParams(), mtpMode: "off" }));
+  assert.deepEqual(request(off).mtp, { mode: "off" });
 });
 
 test("cancel before native registration finishes never starts preparation", async () => {
