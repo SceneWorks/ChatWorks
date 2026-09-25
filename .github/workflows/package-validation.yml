@@ -95,7 +95,7 @@ jobs:
             xz
 
       - name: Test package evidence contract
-        run: node --test tests/package-evidence.test.mjs tests/mlx-metallib.test.mjs tests/package-workflow.test.mjs tests/verify-tauri-package.test.mjs
+        run: node --test tests/package-evidence.test.mjs tests/mlx-metallib.test.mjs tests/package-workflow.test.mjs tests/verify-tauri-package.test.mjs tests/video-capture.test.js
 
       - name: Install frontend dependencies
         run: npm ci
@@ -209,7 +209,7 @@ jobs:
           arch: x64
           vsversion: '2022'
       - name: Test package evidence contract
-        run: node --test tests/package-evidence.test.mjs tests/mlx-metallib.test.mjs tests/package-workflow.test.mjs tests/verify-tauri-package.test.mjs
+        run: node --test tests/package-evidence.test.mjs tests/mlx-metallib.test.mjs tests/package-workflow.test.mjs tests/verify-tauri-package.test.mjs tests/video-capture.test.js
 
       - name: Install frontend dependencies
         run: npm ci
