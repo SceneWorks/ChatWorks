@@ -299,9 +299,13 @@ async fn cors_preflight() -> StatusCode {
 /// ChatWorks webview itself. The app's chat screen uses a browser `fetch` from the webview to the
 /// local server, so without CORS these origins' preflight would fail and every in-app send would
 /// die with "Failed to fetch" (this is exactly the regression the first F-003 attempt introduced).
-/// `tauri://localhost` is the packaged webview origin; `http://127.0.0.1:5173` is the Vite dev
-/// server origin (see `tauri.conf.json` `devUrl`).
-const APP_WEBVIEW_ORIGINS: &[&str] = &["tauri://localhost", "http://127.0.0.1:5173"];
+/// Packaged webviews use `tauri://localhost` on macOS and `http://tauri.localhost` on Windows;
+/// `http://127.0.0.1:5173` is the Vite dev origin (see `tauri.conf.json` `devUrl`).
+const APP_WEBVIEW_ORIGINS: &[&str] = &[
+    "tauri://localhost",
+    "http://tauri.localhost",
+    "http://127.0.0.1:5173",
+];
 
 /// CORS policy for the OpenAI surface (code-review F-003).
 ///
@@ -2708,9 +2712,34 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 204 No Content"));
         assert!(response.contains("access-control-allow-origin: http://127.0.0.1:5173"));
         assert!(response.contains("access-control-allow-methods: GET, POST, OPTIONS"));
-        // The packaged webview origin.
+        // The packaged macOS webview origin.
         let response = http_options_with_origin(&addr, "/v1/chat/completions", "tauri://localhost");
         assert!(response.contains("access-control-allow-origin: tauri://localhost"));
+        // The packaged Windows WebView2 origin needs both a preflight grant and the actual
+        // response grant; otherwise its JSON fetch fails before reaching the chat handler.
+        let windows_origin = "http://tauri.localhost";
+        let response = http_options_with_origin(&addr, "/v1/chat/completions", windows_origin);
+        assert!(response.starts_with("HTTP/1.1 204 No Content"));
+        assert!(response.contains("access-control-allow-origin: http://tauri.localhost"));
+        assert!(response.contains("access-control-allow-methods: GET, POST, OPTIONS"));
+        assert!(response.contains("access-control-allow-headers: authorization, content-type"));
+        let body = json!({
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 8
+        })
+        .to_string();
+        let actual = http_request(
+            &addr,
+            format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nHost: {addr}\r\nOrigin: {windows_origin}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(actual.starts_with("HTTP/1.1 200 OK"), "{actual}");
+        assert!(actual.contains("access-control-allow-origin: http://tauri.localhost"));
+        let actual_body: Value = serde_json::from_str(response_body(&actual)).unwrap();
+        assert_eq!(actual_body["choices"][0]["message"]["content"], "ok");
         server.stop().unwrap();
     }
 
