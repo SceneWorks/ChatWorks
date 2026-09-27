@@ -893,6 +893,23 @@
   }
 }
 
+/* Keep the message field usable while the chat view still has its Sampling sidebar. */
+@media (max-width: 1280px) {
+  .composer {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .composer-actions {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: end;
+  }
+
+  .composer-url-input {
+    flex: 1 1 100%;
+  }
+}
+
 @media (max-width: 760px) {
   .field-inline,
   .model-row {
