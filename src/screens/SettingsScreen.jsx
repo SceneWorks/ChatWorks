@@ -297,11 +297,13 @@ export function SettingsScreen() {
         <SpeculativeNotice
           appSettings={appSettings}
           busy={busy}
-          executionBackend={engineStatus?.execution_backend}
+          speculativeDefault={engineStatus?.speculative_default}
           onDismiss={() => applyNotice(dismissSpeculativeNotice)}
           onEnableAuto={() => applyNotice(enableSpeculativeAuto)}
         />
-        <GenerationControls params={form} onChange={updateForm} prefix="default-generation" />
+        <GenerationControls params={form} onChange={updateForm} prefix="default-generation"
+          speculativeLimits={engineStatus?.loaded?.provider?.capabilities ?? null}
+          speculativeDefault={engineStatus?.speculative_default ?? null} />
 
         <div className="panel-head section-head">
           <p className="eyebrow">Runtime</p>

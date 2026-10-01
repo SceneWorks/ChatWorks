@@ -3,7 +3,8 @@
 use std::sync::OnceLock;
 
 use crate::core_llm::{
-    BackendCapabilities, FeatureSupport, LoadSpec, TextLlm, TextLlmRegistration, TextLlmRegistry,
+    BackendCapabilities, FeatureSupport, LoadSpec, Speculative, TextLlm, TextLlmRegistration,
+    TextLlmRegistry, TextLlmRequest,
 };
 
 #[cfg(all(
@@ -54,6 +55,14 @@ pub(crate) fn backend_capabilities() -> &'static BackendCapabilities {
 /// as NVFP4. ChatWorks keeps no model-family rule of its own.
 pub(crate) fn nvfp4_support(spec: &LoadSpec) -> FeatureSupport {
     platform_runtime::text_nvfp4_support(spec)
+}
+
+/// The speculative option a request that names none runs under, as the linked runtime resolves it
+/// (epic sc-24432 E5, sc-24445): the runtime's own resolution of an unset request option. This is
+/// the one place ChatWorks reads the default, so the runtime's per-backend defaults table
+/// (sc-24446) replaces it here and nowhere else.
+pub(crate) fn speculative_default() -> Speculative {
+    TextLlmRequest::default().speculative_mode()
 }
 
 pub(crate) const fn execution_backend() -> &'static str {

@@ -30,7 +30,8 @@ pub struct FakeProvider {
 
 /// The decode report the telemetry fake emits: native MTP under the load's CUDA-graph switch,
 /// with the graph runner falling back for a named reason, and NVFP4 projections served by the
-/// decode GEMV after a cuBLASLt prefill (sc-24139).
+/// decode GEMV after a cuBLASLt prefill (sc-24139): one prefill and two verify steps of two
+/// drafts each, three of the four accepted (a mean accepted length of 1.5, sc-24445).
 pub fn fake_decode_report() -> DecodeReport {
     DecodeReport {
         path: "mtp".to_string(),
@@ -55,10 +56,18 @@ pub fn fake_decode_report() -> DecodeReport {
             path: "fused".to_string(),
             reason: None,
         },
-        target_forwards: 2,
+        target_forwards: 3,
+        prefill_forwards: 1,
         proposed_tokens: 4,
         accepted_tokens: 3,
+        verify_steps: 2,
         replay_forwards: 0,
+        prefix_hit_tokens: 0,
+        prefix_cache: PathReport {
+            path: "miss".to_string(),
+            reason: None,
+        },
+        fallbacks: Vec::new(),
     }
 }
 
@@ -94,6 +103,7 @@ pub fn recording_loader(spec: &LoadSpec) -> crate::core_llm::Result<Box<dyn Text
         }],
         // Settled like the Candle runtime: the request, else its default (off).
         cuda_graphs: Some(spec.cuda_graphs.unwrap_or(false)),
+        ..LoadReport::default()
     });
     Ok(Box::new(provider))
 }

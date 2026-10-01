@@ -771,10 +771,8 @@ pub(crate) fn ensure_snapshot_weight_format_supported(
         return Ok(());
     }
     let support = probe(&LoadSpec {
-        source: source.to_string_lossy().to_string(),
-        projector_source: None,
         quantize: Some(QuantizeRequest::Nvfp4.into()),
-        cuda_graphs: None,
+        ..LoadSpec::dense(source.to_string_lossy())
     });
     if support.supported {
         return Ok(());
@@ -1567,24 +1565,14 @@ fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, S
 
 fn matching_provider(path: &Path) -> Result<Option<crate::core_llm::TextLlmDescriptor>, String> {
     let source = path.to_string_lossy().to_string();
-    let spec = LoadSpec {
-        source,
-        projector_source: None,
-        quantize: None,
-        cuda_graphs: None,
-    };
+    let spec = LoadSpec::dense(source);
     Ok(crate::inference_runtime::textllms()
         .find(|registration| (registration.can_load)(&spec))
         .map(|registration| (registration.descriptor)()))
 }
 
 fn provider_weightless_vision(path: &Path) -> bool {
-    let spec = LoadSpec {
-        source: path.to_string_lossy().to_string(),
-        projector_source: None,
-        quantize: None,
-        cuda_graphs: None,
-    };
+    let spec = LoadSpec::dense(path.to_string_lossy());
     crate::inference_runtime::textllms()
         .find(|registration| (registration.can_load)(&spec))
         .and_then(|registration| registration.weightless_vision)

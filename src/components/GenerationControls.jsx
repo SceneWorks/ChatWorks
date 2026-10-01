@@ -1,5 +1,19 @@
-export function GenerationControls({ params, onChange, capabilities, prefix = "generation" }) {
+import { clampSpeculativeDepth, proposerCapability, speculativeOptions } from "../state/generation.js";
+
+/// `speculativeLimits`: the capabilities whose per-proposer `max_depth` bounds the depth control
+/// when `capabilities` is null (Settings shows every control, bounded by the served model).
+/// `speculativeDefault`: the runtime's own default (`engine_status.speculative_default`), named
+/// beside "Runtime default".
+export function GenerationControls({
+  params, onChange, capabilities, speculativeLimits = null, speculativeDefault = null, prefix = "generation",
+}) {
   const defaults = capabilities == null;
+  const proposer = params.speculativeMode && !["off", "auto"].includes(params.speculativeMode)
+    ? params.speculativeMode : null;
+  const depthCapability = proposer ? proposerCapability(capabilities ?? speculativeLimits, proposer) : null;
+  // The depth control is clamped to what the model advertises for the chosen proposer (sc-24445).
+  const shownDepth = (value) => (value === "" || value == null ? "" : String(clampSpeculativeDepth(value, depthCapability)));
+  const changeDepth = (value) => onChange("speculativeDepth", shownDepth(value));
   const recommendedEfforts = capabilities?.reasoning_efforts ?? ["low", "medium", "xhigh"];
   // A saved/API-supplied compatibility alias must remain visible and pass through unchanged even
   // when a model deliberately omits it from its recommended distinct levels.
@@ -25,15 +39,14 @@ export function GenerationControls({ params, onChange, capabilities, prefix = "g
         reasoningOptions, params.disableThinking)}
       {(defaults || capabilities.supports_preserve_thinking) && field("preserveThinking", "Prior reasoning",
         [["", "Model default"], ["true", "Keep in conversation"], ["false", "Omit from future prompts"]])}
-      {(defaults || capabilities.mtp) && field("mtpMode", "Multi-token prediction",
-        [["", defaults ? "Default for this build" : "App setting"], ["off", "Off"], ["auto", "Automatic"],
-          ["enabled", "Choose draft count"]])}
-      {(defaults || capabilities.mtp) && params.mtpMode === "enabled" && (
+      {field("speculativeMode", "Speculative decoding",
+        speculativeOptions(capabilities, params.speculativeMode, defaults, speculativeDefault))}
+      {proposer && (
         <div className="field">
-          <label htmlFor={`${prefix}-mtp-drafts`}>Draft tokens</label>
-          <input id={`${prefix}-mtp-drafts`} type="number" min="1" step="1"
-            max={capabilities?.mtp?.max_draft_tokens} value={params.mtpDraftTokens ?? "3"}
-            onChange={(event) => onChange("mtpDraftTokens", event.target.value)} />
+          <label htmlFor={`${prefix}-speculative-depth`}>Draft depth</label>
+          <input id={`${prefix}-speculative-depth`} type="number" min="1" step="1"
+            max={depthCapability?.max_depth} value={shownDepth(params.speculativeDepth)}
+            onChange={(event) => changeDepth(event.target.value)} />
         </div>
       )}
       {[["topK", "Top K", 0, 1], ["presencePenalty", "Presence penalty", undefined, 0.05], ["repetitionPenalty", "Repetition penalty", 0.01, 0.05],

@@ -397,7 +397,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle?rev=1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d#1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"
+source = "git+https://github.com/SceneWorks/inference?rev=c2c346be352fc05cd34021a857f8253dfb8195f8#c2c346be352fc05cd34021a857f8253dfb8195f8"
 dependencies = [
  "cudaforge",
 ]
@@ -405,7 +405,7 @@ dependencies = [
 [[package]]
 name = "candle-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.1#10cca78e12d5489734e4fff073be973637de5717"
+source = "git+https://github.com/SceneWorks/inference?rev=c2c346be352fc05cd34021a857f8253dfb8195f8#c2c346be352fc05cd34021a857f8253dfb8195f8"
 dependencies = [
  "candle-core",
  "candle-flash-attn",
@@ -435,7 +435,7 @@ dependencies = [
 [[package]]
 name = "candle-quant-kernels"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.1#10cca78e12d5489734e4fff073be973637de5717"
+source = "git+https://github.com/SceneWorks/inference?rev=c2c346be352fc05cd34021a857f8253dfb8195f8#c2c346be352fc05cd34021a857f8253dfb8195f8"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -694,10 +694,11 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.1#10cca78e12d5489734e4fff073be973637de5717"
+source = "git+https://github.com/SceneWorks/inference?rev=c2c346be352fc05cd34021a857f8253dfb8195f8#c2c346be352fc05cd34021a857f8253dfb8195f8"
 dependencies = [
  "minijinja",
  "minijinja-contrib",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokenizers 0.21.4",
@@ -2804,7 +2805,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=d5a7fc018d713a37091e1cd102873eab355a00c6#d5a7fc018d713a37091e1cd102873eab355a00c6"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=48ff5e78a49e0a513f1976b0b1af70f9a5305f00#48ff5e78a49e0a513f1976b0b1af70f9a5305f00"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -2816,12 +2817,13 @@ dependencies = [
 [[package]]
 name = "mlx-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.1#10cca78e12d5489734e4fff073be973637de5717"
+source = "git+https://github.com/SceneWorks/inference?rev=c2c346be352fc05cd34021a857f8253dfb8195f8#c2c346be352fc05cd34021a857f8253dfb8195f8"
 dependencies = [
  "core-llm",
  "half",
  "memmap2",
  "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "serde_json",
  "thiserror 2.0.18",
 ]
@@ -2829,7 +2831,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=d5a7fc018d713a37091e1cd102873eab355a00c6#d5a7fc018d713a37091e1cd102873eab355a00c6"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=48ff5e78a49e0a513f1976b0b1af70f9a5305f00#48ff5e78a49e0a513f1976b0b1af70f9a5305f00"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -3412,7 +3414,7 @@ dependencies = [
 [[package]]
 name = "pmetal-mlx-rs"
 version = "0.25.8"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=d5a7fc018d713a37091e1cd102873eab355a00c6#d5a7fc018d713a37091e1cd102873eab355a00c6"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=48ff5e78a49e0a513f1976b0b1af70f9a5305f00#48ff5e78a49e0a513f1976b0b1af70f9a5305f00"
 dependencies = [
  "dyn-clone",
  "half",
@@ -3435,7 +3437,7 @@ dependencies = [
 [[package]]
 name = "pmetal-mlx-sys"
 version = "0.2.4"
-source = "git+https://github.com/michaeltrefry/mlx-rs?rev=d5a7fc018d713a37091e1cd102873eab355a00c6#d5a7fc018d713a37091e1cd102873eab355a00c6"
+source = "git+https://github.com/michaeltrefry/mlx-rs?rev=48ff5e78a49e0a513f1976b0b1af70f9a5305f00#48ff5e78a49e0a513f1976b0b1af70f9a5305f00"
 dependencies = [
  "bindgen",
  "cc",
@@ -3949,7 +3951,7 @@ dependencies = [
 [[package]]
 name = "runtime-catalog"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.1#10cca78e12d5489734e4fff073be973637de5717"
+source = "git+https://github.com/SceneWorks/inference?rev=c2c346be352fc05cd34021a857f8253dfb8195f8#c2c346be352fc05cd34021a857f8253dfb8195f8"
 dependencies = [
  "core-llm",
  "sceneworks-gen-core",
@@ -3959,7 +3961,7 @@ dependencies = [
 [[package]]
 name = "runtime-cpu"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.1#10cca78e12d5489734e4fff073be973637de5717"
+source = "git+https://github.com/SceneWorks/inference?rev=c2c346be352fc05cd34021a857f8253dfb8195f8#c2c346be352fc05cd34021a857f8253dfb8195f8"
 dependencies = [
  "candle-llm",
  "runtime-catalog",
@@ -3968,7 +3970,7 @@ dependencies = [
 [[package]]
 name = "runtime-cuda"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.1#10cca78e12d5489734e4fff073be973637de5717"
+source = "git+https://github.com/SceneWorks/inference?rev=c2c346be352fc05cd34021a857f8253dfb8195f8#c2c346be352fc05cd34021a857f8253dfb8195f8"
 dependencies = [
  "candle-llm",
  "runtime-catalog",
@@ -3977,7 +3979,7 @@ dependencies = [
 [[package]]
 name = "runtime-macos"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.1#10cca78e12d5489734e4fff073be973637de5717"
+source = "git+https://github.com/SceneWorks/inference?rev=c2c346be352fc05cd34021a857f8253dfb8195f8#c2c346be352fc05cd34021a857f8253dfb8195f8"
 dependencies = [
  "mlx-llm",
  "runtime-catalog",
@@ -4091,7 +4093,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core"
 version = "0.1.0"
-source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.09.1#10cca78e12d5489734e4fff073be973637de5717"
+source = "git+https://github.com/SceneWorks/inference?rev=c2c346be352fc05cd34021a857f8253dfb8195f8#c2c346be352fc05cd34021a857f8253dfb8195f8"
 dependencies = [
  "core-llm",
  "exr",

@@ -16,10 +16,10 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::app_settings::SamplingDefaults;
-use crate::core_llm::CancelFlag;
+use crate::core_llm::{CancelFlag, Speculative};
 use crate::engine::{
     ConstraintRequest, EngineHandle, GenerateMedia, GenerateMessage, GenerateRequest,
-    GenerateResponse, GenerateTool, GenerateToolCall, GenerateVideo, LoadedModelStatus, MtpRequest,
+    GenerateResponse, GenerateTool, GenerateToolCall, GenerateVideo, LoadedModelStatus,
     ReasoningEffortRequest, SamplingRequest, StreamChannel, StreamPayload, ThinkingRequest,
     UsagePayload,
 };
@@ -753,8 +753,10 @@ struct OpenAiChatRequest {
     model_defaults: Vec<ModelDefaultControl>,
     #[serde(default)]
     preserve_thinking: Option<bool>,
-    #[serde(default)]
-    mtp: Option<MtpRequest>,
+    /// The runtime's speculative option (`"off" | "auto" | {"proposer", "depth"}`); the legacy
+    /// `mtp` request field (`{"mode": …}`) still deserializes into it (sc-24445).
+    #[serde(default, alias = "mtp")]
+    speculative: Option<Speculative>,
     #[serde(default)]
     response_format: Option<OpenAiResponseFormat>,
     /// Tools / functions offered to the model, in the OpenAI function-tool shape
@@ -769,7 +771,10 @@ struct OpenAiChatRequest {
 enum ModelDefaultControl {
     ReasoningEffort,
     PreserveThinking,
-    Mtp,
+    /// Run the runtime's speculative default instead of the saved setting (`mtp` is the
+    /// pre-sc-24445 spelling).
+    #[serde(alias = "mtp")]
+    Speculative,
 }
 
 impl OpenAiChatRequest {
@@ -798,8 +803,18 @@ impl OpenAiChatRequest {
         {
             resolved.preserve_thinking = None;
         }
-        if caps.mtp.is_none() || self.model_defaults.contains(&ModelDefaultControl::Mtp) {
-            resolved.mtp_mode = "off".to_string();
+        if self
+            .model_defaults
+            .contains(&ModelDefaultControl::Speculative)
+        {
+            resolved.speculative = None;
+        }
+        // A saved proposer this model does not advertise is not inherited: the request decodes
+        // without one rather than being refused for a choice the caller never made.
+        if let Some(Speculative::Proposer { proposer, .. }) = resolved.speculative {
+            if !caps.speculative.iter().any(|cap| cap.proposer == proposer) {
+                resolved.speculative = Some(Speculative::Off);
+            }
         }
         resolved
     }
@@ -917,13 +932,16 @@ impl OpenAiChatRequest {
                     defaults.preserve_thinking
                 },
             ),
-            mtp: self.mtp.unwrap_or_else(|| {
-                if self.model_defaults.contains(&ModelDefaultControl::Mtp) {
-                    MtpRequest::Off
+            speculative: self.speculative.or(
+                if self
+                    .model_defaults
+                    .contains(&ModelDefaultControl::Speculative)
+                {
+                    None
                 } else {
-                    mtp_from_defaults(defaults)
-                }
-            }),
+                    defaults.speculative
+                },
+            ),
             constraint: response_format_constraint(self.response_format)?,
             tools,
         })
@@ -936,16 +954,6 @@ fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffortRequest> {
         "medium" => Some(ReasoningEffortRequest::Medium),
         "xhigh" => Some(ReasoningEffortRequest::Xhigh),
         _ => None,
-    }
-}
-
-fn mtp_from_defaults(defaults: &SamplingDefaults) -> MtpRequest {
-    match defaults.mtp_mode.as_str() {
-        "auto" => MtpRequest::Auto,
-        "enabled" => MtpRequest::Enabled {
-            draft_tokens: defaults.mtp_draft_tokens,
-        },
-        _ => MtpRequest::Off,
     }
 }
 
@@ -1624,8 +1632,8 @@ mod tests {
     // The weightless fakes are shared with the engine tests via `test_support` so the two can't
     // drift apart (code-review F-012).
     use crate::core_llm::{
-        FinishReason, LoadSpec, StreamEvent, TextLlm, TextLlmDescriptor, TextLlmOutput,
-        TextLlmRequest, Usage,
+        FinishReason, LoadSpec, SpeculativeProposer, StreamEvent, TextLlm, TextLlmDescriptor,
+        TextLlmOutput, TextLlmRequest, Usage,
     };
     use crate::test_support::{
         fake_loader, fake_telemetry_loader, fake_tool_loader, thinking_descriptor,
@@ -1922,7 +1930,7 @@ mod tests {
             max_tokens: 8,
             reasoning_effort: Some("xhigh".into()),
             preserve_thinking: Some(true),
-            mtp_mode: "enabled".into(),
+            speculative: Some(Speculative::proposer(SpeculativeProposer::Mtp, 3)),
             ..Default::default()
         };
         let base = json!({"messages":[{"role":"user","content":"hello"}]});
@@ -1934,7 +1942,16 @@ mod tests {
         for (key, value, expected) in [
             ("reasoning_effort", json!("low"), "reasoning_effort"),
             ("preserve_thinking", json!(true), "preserve_thinking"),
-            ("mtp", json!({"mode":"enabled", "draft_tokens":3}), "MTP"),
+            (
+                "mtp",
+                json!({"mode":"enabled", "draft_tokens":3}),
+                "`mtp` proposer",
+            ),
+            (
+                "speculative",
+                json!({"proposer": "draft_model", "depth": 2}),
+                "`draft_model` proposer",
+            ),
         ] {
             let mut wire = base.clone();
             wire[key] = value;
@@ -1984,7 +2001,7 @@ mod tests {
             system_prompt: String::new(),
             reasoning_effort: Some("xhigh".into()),
             preserve_thinking: Some(true),
-            mtp_mode: "enabled".into(),
+            speculative: Some(Speculative::proposer(SpeculativeProposer::Mtp, 3)),
             ..Default::default()
         };
         for supported in [true, false] {
@@ -1997,7 +2014,8 @@ mod tests {
             let output = request.into_generate(&resolved).unwrap();
             assert!(output.reasoning_effort.is_none());
             assert!(output.preserve_thinking.is_none());
-            assert!(matches!(output.mtp, MtpRequest::Off));
+            // A saved proposer the model does not advertise is not inherited.
+            assert_eq!(output.speculative, Some(Speculative::Off));
         }
         // An ordinary external API client inherits only controls supported by this model.
         let caps = crate::engine::CapabilitySummary::from(
@@ -2010,7 +2028,7 @@ mod tests {
         let output = request.into_generate(&resolved).unwrap();
         assert!(output.reasoning_effort.is_none());
         assert!(output.preserve_thinking.is_none());
-        assert!(matches!(output.mtp, MtpRequest::Off));
+        assert_eq!(output.speculative, Some(Speculative::Off));
         // Explicit unsupported intent is retained, for actionable native capability validation.
         wire["reasoning_effort"] = json!("low");
         wire["preserve_thinking"] = json!(true);
@@ -2023,7 +2041,51 @@ mod tests {
             Some(ReasoningEffortRequest::Low)
         ));
         assert_eq!(output.preserve_thinking, Some(true));
-        assert!(matches!(output.mtp, MtpRequest::Auto));
+        assert_eq!(output.speculative, Some(Speculative::Auto));
+    }
+
+    /// sc-24445: the saved speculative option reaches API callers that omit it — a proposer the
+    /// model advertises keeps its depth (the runtime clamps one above `max_depth` and names it),
+    /// `model_defaults: ["speculative"]` (or the legacy `"mtp"`) runs the runtime's default, and
+    /// an unsaved option (`None`) leaves the request to the runtime.
+    #[test]
+    fn the_saved_speculative_option_reaches_api_callers() {
+        let mut caps = crate::test_support::thinking_descriptor("fixture", 8).capabilities;
+        caps.speculative = vec![crate::core_llm::ProposerCapabilities {
+            proposer: SpeculativeProposer::PromptLookup,
+            max_depth: 7,
+            recommended_depth: 4,
+        }];
+        let summary = crate::engine::CapabilitySummary::from(caps);
+        let lookup = Speculative::proposer(SpeculativeProposer::PromptLookup, 9);
+        let resolve = |wire: serde_json::Value, saved: Option<Speculative>| {
+            let defaults = SamplingDefaults {
+                speculative: saved,
+                ..Default::default()
+            };
+            let request: OpenAiChatRequest = serde_json::from_value(wire).unwrap();
+            let resolved = request.resolve_inherited_defaults(&defaults, &summary);
+            request.into_generate(&resolved).unwrap().speculative
+        };
+        let base = json!({"messages":[{"role":"user","content":"hello"}]});
+        assert_eq!(resolve(base.clone(), Some(lookup)), Some(lookup));
+        assert_eq!(
+            resolve(base.clone(), Some(Speculative::Auto)),
+            Some(Speculative::Auto)
+        );
+        assert_eq!(resolve(base.clone(), None), None);
+        for control in ["speculative", "mtp"] {
+            let mut wire = base.clone();
+            wire["model_defaults"] = json!([control]);
+            assert_eq!(resolve(wire, Some(lookup)), None, "{control}");
+        }
+        let mut explicit = base.clone();
+        explicit["speculative"] = json!("off");
+        assert_eq!(resolve(explicit, Some(lookup)), Some(Speculative::Off));
+        let mut both = base;
+        both["speculative"] = json!("off");
+        both["mtp"] = json!({"mode": "auto"});
+        assert!(serde_json::from_value::<OpenAiChatRequest>(both).is_err());
     }
 
     #[test]
@@ -2076,10 +2138,10 @@ mod tests {
             Some(ReasoningEffortRequest::Low)
         ));
         assert_eq!(generate.preserve_thinking, Some(true));
-        assert!(matches!(
-            generate.mtp,
-            MtpRequest::Enabled { draft_tokens: 3 }
-        ));
+        assert_eq!(
+            generate.speculative,
+            Some(Speculative::proposer(SpeculativeProposer::Mtp, 3))
+        );
         assert!(matches!(generate.constraint, Some(ConstraintRequest::Json)));
     }
 

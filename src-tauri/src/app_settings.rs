@@ -4,28 +4,30 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
+use crate::core_llm::{MtpMode, Speculative};
 use crate::fsutil::write_json_atomic;
 use crate::server::{DEFAULT_OPENAI_HOST, DEFAULT_OPENAI_PORT};
 
 const API_AUTH_KEYCHAIN_SERVICE: &str = "net.trefry.chatworks.openai";
 const API_AUTH_KEYCHAIN_USER: &str = "api-auth-token";
 
-/// The settings schema this build writes (sc-24139). Every save stamps it; a file without one was
-/// written before this marker existed.
+/// The settings schema this build writes. Every save stamps it; a file without one was written
+/// before this marker existed (version 0).
 ///
-/// **Migration rule for the speculative-decoding default.** Before sc-24139 the MTP default was
-/// `off` everywhere and every save serialized `mtpMode`, so an `"mtpMode": "off"` in a pre-marker
-/// file cannot be told apart from "the user chose off". Pre-marker (version 0) files therefore
-/// keep what they have: a present `mtpMode` (including `off`) is honored as written, and only a
-/// **missing** `mtpMode` takes the new platform default ([`default_mtp_mode`]: `auto` on the Candle
-/// CUDA build, `off` on MLX and Candle CPU). Files at version 1 or later were written under the new
-/// default, so a saved `off` there is an explicit choice by construction.
-///
-/// Because every pre-marker save wrote `mtpMode`, most upgrading users keep `off` under that rule.
-/// Where the build's default is not `off` (Candle CUDA), such a carried-over `off` is flagged
-/// ([`NoticeSettings::speculative_off_carried_over`]) so the UI can offer — once, dismissibly — to
-/// turn on Auto, without ever changing the saved choice itself.
-pub const CURRENT_SETTINGS_VERSION: u32 = 1;
+/// * **Version 2 (sc-24445)** stores speculative decoding as the runtime's proposer-agnostic option
+///   ([`SamplingDefaults::speculative`]: `"off" | "auto" | {"proposer", "depth"}`, or `null` for
+///   "the runtime's default"). An older file's `mtpMode` / `mtpDraftTokens` map onto it through the
+///   runtime's own legacy mapping (`From<MtpMode> for Speculative`): `off` -> `off`, `auto` ->
+///   `auto`, `enabled` + N -> `{proposer: mtp, depth: N}` ([`legacy_speculative`]). A file with no
+///   speculative value at all follows the runtime's default ([`runtime_speculative_default`]),
+///   never a ChatWorks-side per-backend copy (epic sc-24432 E5).
+/// * **Version 1 (sc-24139)** marked files written after the speculative default stopped being `off`
+///   everywhere. Before it every save serialized `mtpMode`, so a version-0 `"mtpMode": "off"`
+///   cannot be told apart from "the user chose off": it is honoured as written. Where the runtime's
+///   default is not `off`, such a carried-over `off` is flagged
+///   ([`NoticeSettings::speculative_off_carried_over`]) so the UI can offer — once, dismissibly —
+///   to turn on Auto, without ever changing the saved choice itself.
+pub const CURRENT_SETTINGS_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,10 +61,10 @@ impl Default for AppSettings {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct NoticeSettings {
-    /// Speculative decoding is `off` only because a pre-marker settings file carried `off` over on
-    /// a build whose default is `auto` (see [`CURRENT_SETTINGS_VERSION`]). Set by the migration;
-    /// cleared as soon as the mode is anything but `off`, so a later explicit `off` never
-    /// re-raises the notice.
+    /// Speculative decoding is `off` only because a pre-marker settings file carried `off` over
+    /// where the runtime's default is not `off` (see [`CURRENT_SETTINGS_VERSION`]). Set by the
+    /// migration; cleared as soon as the option is anything but `off`, so a later explicit `off`
+    /// never re-raises the notice.
     #[serde(default)]
     pub speculative_off_carried_over: bool,
     /// The user dismissed the "speculative decoding is available" notice.
@@ -87,18 +89,17 @@ impl AppSettings {
     /// [`CURRENT_SETTINGS_VERSION`]) and validation. The result carries the current marker, so the
     /// next save records it.
     pub fn from_stored_json(body: &str) -> Result<Self, String> {
-        Self::from_stored_json_for(body, crate::inference_runtime::execution_backend())
+        Self::from_stored_json_for(body, runtime_speculative_default())
     }
 
-    /// [`from_stored_json`](Self::from_stored_json) for an execution backend label, whose
-    /// speculative default ([`default_mtp_mode_for`]) decides whether a pre-marker `off` was
-    /// carried over rather than chosen under the current default.
-    pub fn from_stored_json_for(body: &str, execution_backend: &str) -> Result<Self, String> {
+    /// [`from_stored_json`](Self::from_stored_json) against a runtime speculative default, which
+    /// decides whether a pre-marker `off` was carried over rather than chosen under that default.
+    pub fn from_stored_json_for(body: &str, runtime_default: Speculative) -> Result<Self, String> {
         let mut settings =
             serde_json::from_str::<AppSettings>(body).map_err(|error| error.to_string())?;
         if settings.settings_version == 0
-            && settings.sampling.mtp_mode == "off"
-            && default_mtp_mode_for(execution_backend) != "off"
+            && settings.sampling.legacy_mtp_mode.as_deref() == Some("off")
+            && runtime_default != Speculative::Off
         {
             settings.notices.speculative_off_carried_over = true;
         }
@@ -109,7 +110,8 @@ impl AppSettings {
         // A pre-marker file's values are kept as written (validated below); stamping the marker
         // records on the next save that this file now carries explicit choices.
         self.settings_version = CURRENT_SETTINGS_VERSION;
-        if self.sampling.mtp_mode != "off" {
+        self.sampling.migrate_legacy_speculative()?;
+        if self.sampling.speculative != Some(Speculative::Off) {
             self.notices.speculative_off_carried_over = false;
         }
         self.server.host = self.server.host.trim().to_string();
@@ -134,17 +136,12 @@ impl AppSettings {
         if self.sampling.max_tokens == 0 {
             return Err("max tokens must be at least 1".to_string());
         }
-        if !matches!(self.sampling.mtp_mode.as_str(), "off" | "auto" | "enabled") {
-            return Err("mtp mode must be off, auto, or enabled".to_string());
-        }
+        validate_speculative(self.sampling.speculative)?;
         if !matches!(
             self.sampling.reasoning_effort.as_deref(),
             None | Some("low" | "medium" | "xhigh")
         ) {
             return Err("reasoning effort must be low, medium, or xhigh".to_string());
-        }
-        if self.sampling.mtp_draft_tokens == 0 {
-            return Err("MTP draft tokens must be at least 1".to_string());
         }
         if let Some(penalty) = self.sampling.repetition_penalty {
             if penalty <= 0.0 || !penalty.is_finite() {
@@ -206,10 +203,19 @@ pub struct SamplingDefaults {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub preserve_thinking: Option<bool>,
-    #[serde(default = "default_mtp_mode")]
-    pub mtp_mode: String,
-    #[serde(default = "default_mtp_draft_tokens")]
-    pub mtp_draft_tokens: u32,
+    /// The saved speculative-decoding option (sc-24445), the runtime's own proposer-agnostic
+    /// type: `off`, `auto`, or `{proposer, depth}`. `None` (`null`) follows the runtime's default
+    /// ([`runtime_speculative_default`]). A depth above what the loaded model advertises is
+    /// clamped by the runtime, which names the clamp in the decode report.
+    #[serde(default)]
+    pub speculative: Option<Speculative>,
+    /// The pre-sc-24445 `mtpMode` (`off | auto | enabled`), read only to migrate it onto
+    /// [`speculative`](Self::speculative); never written back.
+    #[serde(default, rename = "mtpMode", skip_serializing)]
+    pub(crate) legacy_mtp_mode: Option<String>,
+    /// The pre-sc-24445 `mtpDraftTokens`, read only with [`legacy_mtp_mode`](Self::legacy_mtp_mode).
+    #[serde(default, rename = "mtpDraftTokens", skip_serializing)]
+    pub(crate) legacy_mtp_draft_tokens: Option<u32>,
     #[serde(default)]
     pub top_k: Option<usize>,
     #[serde(default)]
@@ -232,8 +238,9 @@ impl Default for SamplingDefaults {
             disable_thinking: default_disable_thinking(),
             reasoning_effort: None,
             preserve_thinking: None,
-            mtp_mode: default_mtp_mode(),
-            mtp_draft_tokens: default_mtp_draft_tokens(),
+            speculative: None,
+            legacy_mtp_mode: None,
+            legacy_mtp_draft_tokens: None,
             top_k: None,
             presence_penalty: None,
             repetition_penalty: None,
@@ -241,6 +248,68 @@ impl Default for SamplingDefaults {
             seed: None,
         }
     }
+}
+
+impl SamplingDefaults {
+    /// Map a pre-sc-24445 `mtpMode` / `mtpDraftTokens` onto [`speculative`](Self::speculative)
+    /// when the file carries no speculative option of its own, then drop the legacy fields.
+    pub(crate) fn migrate_legacy_speculative(&mut self) -> Result<(), String> {
+        let legacy = legacy_speculative(
+            self.legacy_mtp_mode.take().as_deref(),
+            self.legacy_mtp_draft_tokens.take(),
+        )?;
+        if self.speculative.is_none() {
+            self.speculative = legacy;
+        }
+        Ok(())
+    }
+}
+
+/// The runtime's mapping of a pre-sc-24445 saved `mtpMode` (`off | auto | enabled`, with
+/// `mtpDraftTokens` drafts, `3` when absent) onto the proposer-agnostic option: the runtime's own
+/// `From<MtpMode> for Speculative`, so `auto` means the runtime's `auto` (MTP where the model has a
+/// head, else prompt lookup). `None` when no legacy mode was saved.
+pub(crate) fn legacy_speculative(
+    mode: Option<&str>,
+    draft_tokens: Option<u32>,
+) -> Result<Option<Speculative>, String> {
+    let mode = match mode {
+        None => return Ok(None),
+        Some("off") => MtpMode::Off,
+        Some("auto") => MtpMode::Auto,
+        Some("enabled") => match draft_tokens.unwrap_or(LEGACY_MTP_DRAFT_TOKENS) {
+            0 => return Err("MTP draft tokens must be at least 1".to_string()),
+            draft_tokens => MtpMode::Enabled { draft_tokens },
+        },
+        Some(other) => {
+            return Err(format!(
+                "mtp mode must be off, auto, or enabled (found `{other}`)"
+            ))
+        }
+    };
+    Ok(Some(Speculative::from(mode)))
+}
+
+/// The draft count a legacy `"mtpMode": "enabled"` without `mtpDraftTokens` ran with.
+const LEGACY_MTP_DRAFT_TOKENS: u32 = 3;
+
+/// A saved speculative option must name at least one draft per verify step; the upper bound is the
+/// loaded model's, which the runtime clamps to.
+pub(crate) fn validate_speculative(speculative: Option<Speculative>) -> Result<(), String> {
+    match speculative {
+        Some(Speculative::Proposer { depth: 0, .. }) => {
+            Err("speculative depth must be at least 1".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The speculative option a request that names none runs under, as the linked runtime resolves it
+/// (epic sc-24432 E5): its own resolution of an unset request option
+/// (`TextLlmRequest::speculative_mode`). ChatWorks keeps no per-backend copy; the runtime's
+/// per-backend defaults table (sc-24446) answers here once it exists.
+pub fn runtime_speculative_default() -> Speculative {
+    crate::inference_runtime::speculative_default()
 }
 
 pub fn load_app_settings(app: &AppHandle) -> Result<AppSettings, String> {
@@ -338,25 +407,6 @@ fn default_max_tokens() -> u32 {
 fn default_disable_thinking() -> bool {
     true
 }
-/// The speculative-decoding (MTP) default for fresh settings or a missing value (sc-24139): `auto`
-/// on the Candle CUDA build (the runtime resolves it to the checkpoint's MTP head where one exists,
-/// and to ordinary decode, reported as `proposer=none`, where none does) and `off` on MLX and
-/// Candle CPU.
-pub fn default_mtp_mode() -> String {
-    default_mtp_mode_for(crate::inference_runtime::execution_backend()).to_string()
-}
-
-/// [`default_mtp_mode`] for an execution backend label (`candle-cuda`, `candle-cpu`, `mlx`).
-pub fn default_mtp_mode_for(execution_backend: &str) -> &'static str {
-    if execution_backend == "candle-cuda" {
-        "auto"
-    } else {
-        "off"
-    }
-}
-fn default_mtp_draft_tokens() -> u32 {
-    3
-}
 
 #[cfg(test)]
 mod tests {
@@ -420,136 +470,166 @@ mod tests {
         assert_eq!(settings.sampling.system_prompt, "hello");
     }
 
-    #[test]
-    fn generation_defaults_round_trip_with_platform_mtp_defaults() {
-        let platform = default_mtp_mode_for(crate::inference_runtime::execution_backend());
-        let defaults = SamplingDefaults::default();
-        assert_eq!(defaults.mtp_mode, platform);
-        assert_eq!(defaults.mtp_draft_tokens, 3);
-        assert!(defaults.reasoning_effort.is_none());
-        let decoded: SamplingDefaults = serde_json::from_str("{}").unwrap();
-        assert_eq!(decoded.mtp_mode, platform);
-        assert_eq!(decoded.mtp_draft_tokens, 3);
+    use crate::core_llm::SpeculativeProposer;
+
+    fn mtp(depth: u32) -> Option<Speculative> {
+        Some(Speculative::proposer(SpeculativeProposer::Mtp, depth))
     }
 
-    /// AC1 (sc-24139): speculative decoding defaults to `auto` on the Candle CUDA build and `off`
-    /// on MLX and Candle CPU.
+    /// sc-24445 AC1: every saved `mtpMode` maps onto the runtime's proposer-agnostic option —
+    /// `off` -> `off`, `auto` -> `auto`, `enabled` + N -> `{proposer: mtp, depth: N}` (3 drafts when
+    /// the file never saved a count) — for every schema version that could have written one, and
+    /// a save writes only the new option.
     #[test]
-    fn speculative_default_is_auto_on_cuda_and_off_elsewhere() {
-        assert_eq!(default_mtp_mode_for("candle-cuda"), "auto");
-        assert_eq!(default_mtp_mode_for("candle-cpu"), "off");
-        assert_eq!(default_mtp_mode_for("mlx"), "off");
-        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
-        assert_eq!(default_mtp_mode(), "auto");
-        #[cfg(not(all(not(target_os = "macos"), feature = "cuda")))]
-        assert_eq!(default_mtp_mode(), "off");
+    fn saved_mtp_modes_map_onto_the_speculative_option() {
+        for version in ["", r#""settingsVersion":0,"#, r#""settingsVersion":1,"#] {
+            for (sampling, expected) in [
+                (
+                    r#"{"mtpMode":"off","mtpDraftTokens":3}"#,
+                    Some(Speculative::Off),
+                ),
+                (
+                    r#"{"mtpMode":"auto","mtpDraftTokens":3}"#,
+                    Some(Speculative::Auto),
+                ),
+                (r#"{"mtpMode":"enabled","mtpDraftTokens":5}"#, mtp(5)),
+                (r#"{"mtpMode":"enabled"}"#, mtp(3)),
+                (r#"{"mtpDraftTokens":5}"#, None),
+            ] {
+                let body = format!(r#"{{{version}"sampling":{sampling}}}"#);
+                let migrated = AppSettings::from_stored_json(&body).unwrap();
+                assert_eq!(migrated.sampling.speculative, expected, "{body}");
+                assert_eq!(migrated.settings_version, CURRENT_SETTINGS_VERSION);
+                let saved = serde_json::to_value(&migrated).unwrap();
+                assert!(saved["sampling"].get("mtpMode").is_none(), "{saved}");
+                assert!(saved["sampling"].get("mtpDraftTokens").is_none(), "{saved}");
+                let reloaded = AppSettings::from_stored_json(&saved.to_string()).unwrap();
+                assert_eq!(
+                    reloaded.sampling.speculative, expected,
+                    "{body} after a save"
+                );
+            }
+        }
+        // A legacy value the old schema itself refused is still refused, naming the field.
+        for bad in [
+            r#"{"sampling":{"mtpMode":"always"}}"#,
+            r#"{"sampling":{"mtpMode":"enabled","mtpDraftTokens":0}}"#,
+        ] {
+            assert!(AppSettings::from_stored_json(bad).is_err(), "{bad}");
+        }
     }
 
-    /// AC1: fresh settings (no file) take the platform default and the current schema marker, and
-    /// a save records both.
+    /// The new option round-trips in its wire form, and an explicit option wins over a stray
+    /// legacy field.
     #[test]
-    fn fresh_settings_take_the_platform_default_and_record_the_marker() {
+    fn the_speculative_option_round_trips_in_its_wire_form() {
+        for (wire, expected) in [
+            (r#""off""#, Some(Speculative::Off)),
+            (r#""auto""#, Some(Speculative::Auto)),
+            (
+                r#"{"proposer":"prompt_lookup","depth":4}"#,
+                Some(Speculative::proposer(SpeculativeProposer::PromptLookup, 4)),
+            ),
+            (
+                r#"{"proposer":"draft_model","depth":2}"#,
+                Some(Speculative::proposer(SpeculativeProposer::DraftModel, 2)),
+            ),
+            ("null", None),
+        ] {
+            let body = format!(r#"{{"settingsVersion":2,"sampling":{{"speculative":{wire}}}}}"#);
+            let settings = AppSettings::from_stored_json(&body).unwrap();
+            assert_eq!(settings.sampling.speculative, expected, "{body}");
+            let saved = serde_json::to_value(&settings).unwrap();
+            assert_eq!(
+                saved["sampling"]["speculative"],
+                serde_json::from_str::<serde_json::Value>(wire).unwrap()
+            );
+        }
+        let both = r#"{"sampling":{"speculative":"off","mtpMode":"auto"}}"#;
+        assert_eq!(
+            AppSettings::from_stored_json(both)
+                .unwrap()
+                .sampling
+                .speculative,
+            Some(Speculative::Off)
+        );
+        let zero = r#"{"sampling":{"speculative":{"proposer":"mtp","depth":0}}}"#;
+        assert!(AppSettings::from_stored_json(zero).is_err());
+    }
+
+    /// Epic sc-24432 E5: no per-backend default lives in ChatWorks. Fresh settings, and a file
+    /// that never saved a speculative value, follow the runtime's default (`None`), which is the
+    /// runtime's own resolution of an unset request option.
+    #[test]
+    fn an_unsaved_speculative_option_follows_the_runtime_default() {
         let fresh = AppSettings::default().normalized().unwrap();
         assert_eq!(fresh.settings_version, CURRENT_SETTINGS_VERSION);
-        assert_eq!(fresh.sampling.mtp_mode, default_mtp_mode());
+        assert_eq!(fresh.sampling.speculative, None);
         assert!(!fresh.runtime.cuda_graphs, "CUDA graphs ship off");
         let saved = serde_json::to_value(&fresh).unwrap();
         assert_eq!(saved["settingsVersion"], CURRENT_SETTINGS_VERSION);
-        assert_eq!(saved["sampling"]["mtpMode"], default_mtp_mode());
+        assert!(saved["sampling"]["speculative"].is_null());
         assert_eq!(saved["runtime"]["cudaGraphs"], false);
-    }
-
-    /// AC1: an upgrade never flips a saved choice. A pre-marker file that serialized
-    /// `"mtpMode": "off"` keeps `off` (it cannot be told apart from an explicit choice), whatever
-    /// the build's new default.
-    #[test]
-    fn a_saved_off_survives_the_upgrade() {
-        let legacy = r#"{"server":{},"sampling":{"mtpMode":"off","mtpDraftTokens":3}}"#;
-        let migrated = AppSettings::from_stored_json(legacy).unwrap();
-        assert_eq!(migrated.sampling.mtp_mode, "off");
-        assert_eq!(migrated.settings_version, CURRENT_SETTINGS_VERSION);
-        // Every other saved value is kept too.
-        let legacy_enabled = r#"{"sampling":{"mtpMode":"enabled","mtpDraftTokens":5}}"#;
-        let migrated = AppSettings::from_stored_json(legacy_enabled).unwrap();
-        assert_eq!(migrated.sampling.mtp_mode, "enabled");
-        assert_eq!(migrated.sampling.mtp_draft_tokens, 5);
-        // A current-schema file's `off` is an explicit choice and stays.
-        let current = r#"{"settingsVersion":1,"sampling":{"mtpMode":"off"}}"#;
+        for body in [
+            "{}",
+            r#"{"server":{"port":8000},"sampling":{"temperature":0.5}}"#,
+        ] {
+            let migrated = AppSettings::from_stored_json(body).unwrap();
+            assert_eq!(migrated.sampling.speculative, None, "{body}");
+        }
         assert_eq!(
-            AppSettings::from_stored_json(current)
-                .unwrap()
-                .sampling
-                .mtp_mode,
-            "off"
+            runtime_speculative_default(),
+            crate::core_llm::TextLlmRequest::default().speculative_mode()
         );
     }
 
-    /// AC1: only a MISSING value takes the new default. A file written before MTP existed has no
-    /// `mtpMode`, so it gets `auto` on CUDA and `off` elsewhere.
-    #[test]
-    fn a_missing_mtp_mode_takes_the_platform_default() {
-        let pre_mtp = r#"{"server":{"port":8000},"sampling":{"temperature":0.5}}"#;
-        let migrated = AppSettings::from_stored_json(pre_mtp).unwrap();
-        assert_eq!(migrated.sampling.mtp_mode, default_mtp_mode());
-        assert_eq!(migrated.sampling.temperature, 0.5);
-        assert!(!migrated.runtime.cuda_graphs);
-        let empty = AppSettings::from_stored_json("{}").unwrap();
-        assert_eq!(empty.sampling.mtp_mode, default_mtp_mode());
-    }
-
-    /// sc-24139 feature-end review: a pre-marker `off` kept by the migration on a build whose
-    /// default is `auto` is flagged as carried over (the UI then offers Auto, once) — while the
-    /// saved `off` itself is untouched. Nothing is flagged where `off` is the default, for a
-    /// current-schema `off`, or for any other saved mode; the flag and a dismissal persist through
-    /// a save, and moving off `off` clears the flag for good.
+    /// A pre-marker `off` kept by the migration where the runtime's default is not `off` is
+    /// flagged as carried over (the UI then offers Auto, once) — while the saved `off` itself is
+    /// untouched. Nothing is flagged where the runtime's default is `off`, for a post-marker `off`,
+    /// or for any other saved mode; the flag and a dismissal persist through a save, and moving off
+    /// `off` clears the flag for good.
     #[test]
     fn a_carried_over_off_is_flagged_for_the_speculative_notice() {
         let legacy = r#"{"server":{},"sampling":{"mtpMode":"off","mtpDraftTokens":3}}"#;
-        let migrated = AppSettings::from_stored_json_for(legacy, "candle-cuda").unwrap();
+        let migrated = AppSettings::from_stored_json_for(legacy, Speculative::Auto).unwrap();
         assert_eq!(
-            migrated.sampling.mtp_mode, "off",
+            migrated.sampling.speculative,
+            Some(Speculative::Off),
             "the saved choice survives"
         );
         assert!(migrated.notices.speculative_off_carried_over);
         assert!(!migrated.notices.speculative_notice_dismissed);
 
-        // Not carried over: where `off` is the default, a current-schema `off`, another mode.
-        for (body, backend) in [
-            (legacy, "candle-cpu"),
-            (legacy, "mlx"),
+        for (body, runtime_default) in [
+            (legacy, Speculative::Off),
             (
                 r#"{"settingsVersion":1,"sampling":{"mtpMode":"off"}}"#,
-                "candle-cuda",
+                Speculative::Auto,
             ),
-            (r#"{"sampling":{"mtpMode":"enabled"}}"#, "candle-cuda"),
-            // A missing mode takes this build's default, which is never a carried-over `off`.
-            (
-                r#"{"sampling":{}}"#,
-                crate::inference_runtime::execution_backend(),
-            ),
+            (r#"{"sampling":{"mtpMode":"enabled"}}"#, Speculative::Auto),
+            (r#"{"sampling":{}}"#, Speculative::Auto),
         ] {
-            let settings = AppSettings::from_stored_json_for(body, backend).unwrap();
+            let settings = AppSettings::from_stored_json_for(body, runtime_default).unwrap();
             assert!(
                 !settings.notices.speculative_off_carried_over,
-                "{body} on {backend}"
+                "{body} under {runtime_default:?}"
             );
         }
 
-        // The flag and a dismissal survive a save (the file is at the current schema from then on).
         let mut dismissed = migrated.clone();
         dismissed.notices.speculative_notice_dismissed = true;
         let saved = serde_json::to_string(&dismissed.normalized().unwrap()).unwrap();
-        let reloaded = AppSettings::from_stored_json_for(&saved, "candle-cuda").unwrap();
+        let reloaded = AppSettings::from_stored_json_for(&saved, Speculative::Auto).unwrap();
         assert!(reloaded.notices.speculative_off_carried_over);
         assert!(reloaded.notices.speculative_notice_dismissed);
+        assert_eq!(reloaded.sampling.speculative, Some(Speculative::Off));
 
-        // Turning Auto on clears the flag, so a later explicit `off` never re-raises the notice.
         let mut auto = migrated;
-        auto.sampling.mtp_mode = "auto".to_string();
+        auto.sampling.speculative = Some(Speculative::Auto);
         let auto = auto.normalized().unwrap();
         assert!(!auto.notices.speculative_off_carried_over);
         let mut off_again = auto;
-        off_again.sampling.mtp_mode = "off".to_string();
+        off_again.sampling.speculative = Some(Speculative::Off);
         assert!(
             !off_again
                 .normalized()

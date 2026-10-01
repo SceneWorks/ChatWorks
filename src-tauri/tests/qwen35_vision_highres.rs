@@ -69,7 +69,7 @@ fn qwen35_vision_high_resolution_prefill_does_not_crash() {
             disable_thinking: None,
             reasoning_effort: None,
             preserve_thinking: None,
-            mtp: chatworks::engine::MtpRequest::Off,
+            speculative: None,
             constraint: None,
             tools: vec![],
         };

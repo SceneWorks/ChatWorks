@@ -64,19 +64,46 @@ export function serveAction(isServed, reloadPending) {
   return { label: "Serve", disabled: false };
 }
 
-/// The CUDA-graph toggle: disabled with the runtime's reason where the switch is unavailable, and
-/// flagged when the served model was loaded under a different saved setting (the Models screen
-/// then offers "Reload" on the served model).
+/// Why the SERVED model cannot capture CUDA graphs, in the runtime's words, or `null` (sc-24445).
+/// The runtime says so three ways: a load fallback naming `cuda_graphs` (its load report), a load
+/// that settled no switch at all for a provider that never routes decode steps through the graph
+/// runner (`cuda_graphs: null` on a host that offers the switch), and a generation that ran with
+/// graphs on yet replayed nothing — eager, with the runtime's fallback reason (for example
+/// `moe_router_host_read`).
+export function servedModelGraphRefusal(loaded) {
+  if (!loaded) return null;
+  const loadFallback = (loaded.load_report?.fallbacks ?? []).find((item) => item.startsWith("cuda_graphs"));
+  if (loadFallback) return loadFallback;
+  if (loaded.load_report && loaded.cuda_graphs == null) {
+    return "cuda_graphs: the served model's provider does not route decode steps through the CUDA-graph runner (its load settled no switch)";
+  }
+  const graphs = loaded.last_decode?.cuda_graphs;
+  const eager = loaded.last_decode?.graph_path != null
+    ? loaded.last_decode.graph_path === "eager"
+    : graphs?.path === "eager";
+  if (graphs?.enabled && eager && graphs.replayed === 0 && graphs.fallback_reason) {
+    return `cuda_graphs: the served model cannot capture (${graphs.fallback_reason}); its steps run eagerly`;
+  }
+  return null;
+}
+
+/// The CUDA-graph toggle: disabled with the runtime's reason where the switch is unavailable on
+/// this host or the served model cannot capture (sc-24445), and flagged when the served model was
+/// loaded under a different saved setting (the Models screen then offers "Reload" on the served
+/// model).
 export function cudaGraphsControl(capabilities, savedSetting, loaded) {
   const graphs = feature(capabilities, "cuda_graphs");
-  const pendingReload = graphsReloadPending(capabilities, savedSetting, loaded);
+  const modelRefusal = graphs.supported ? servedModelGraphRefusal(loaded) : null;
+  const pendingReload = !modelRefusal && graphsReloadPending(capabilities, savedSetting, loaded);
   return {
-    disabled: !graphs.supported,
-    reason: graphs.reason,
+    disabled: !graphs.supported || modelRefusal != null,
+    reason: graphs.supported ? modelRefusal : graphs.reason,
     pendingReload,
     note: pendingReload
       ? `The served model was loaded with CUDA graphs ${loaded.cuda_graphs ? "on" : "off"}; reload it from Models to apply.`
-      : "Applies when a model is loaded.",
+      : modelRefusal
+        ? "The saved setting is kept and applies to the next model that can capture."
+        : "Applies when a model is loaded.",
   };
 }
 
@@ -125,6 +152,24 @@ function proposerValue(decode) {
     ? `Accepted ${decode.accepted_tokens} of ${decode.proposed_tokens} drafts in ${decode.target_forwards} forwards`
     : null;
   return { value: `${decode.proposer}${drafts}`, detail };
+}
+
+/// The realized mean accepted length, as the runtime computed it (`accepted / verify_steps`).
+function acceptedLengthValue(decode) {
+  const mean = decode.mean_accepted_length;
+  if (typeof mean !== "number") {
+    return { value: "n/a", detail: decode.proposer === "none" ? "No proposer ran." : "No verify step ran." };
+  }
+  return {
+    value: `${mean.toFixed(2)} drafts per verify step`,
+    detail: `${decode.accepted_tokens} accepted over ${decode.verify_steps} verify steps`,
+  };
+}
+
+function prefixCacheValue(decode) {
+  const cache = decode.prefix_cache;
+  const value = cache.path === "hit" ? `hit · ${decode.prefix_hit_tokens} prompt tokens reused` : cache.path || "none";
+  return { value, detail: cache.reason ?? null };
 }
 
 function graphsValue(graphs) {
@@ -186,11 +231,26 @@ export function decodePathRows(engineStatus) {
   }
   last({ key: "implementation", label: "Decode implementation", value: decode.path, detail: null });
   last({ key: "proposer", label: "Proposer", ...proposerValue(decode) });
+  if ("mean_accepted_length" in decode) {
+    last({ key: "accepted_length", label: "Accepted length", ...acceptedLengthValue(decode) });
+  }
   last({ key: "cuda_graphs", label: "CUDA graphs", ...graphsValue(decode.cuda_graphs) });
+  if (decode.graph_path != null) {
+    last({ key: "graph_path", label: "Graph path", value: decode.graph_path, detail: null });
+  }
   last({ key: "nvfp4", label: "NVFP4 projections", ...pathValue(decode.nvfp4_projections, "none (no NVFP4 weights)") });
   last({ key: "fused", label: "Fused primitives", ...pathValue(decode.fused_primitives, "none") });
   last({ key: "sampler", label: "Sampler", value: decode.sampler, detail: null });
   last({ key: "kv_cache", label: "KV cache", value: `${decode.kv_cache} · ${decode.attention} attention`, detail: null });
+  if (decode.prefix_cache) last({ key: "prefix_cache", label: "Prefix cache", ...prefixCacheValue(decode) });
+  if (Array.isArray(decode.fallbacks)) {
+    last({
+      key: "fallbacks",
+      label: "Fallbacks",
+      value: decode.fallbacks.length ? decode.fallbacks.join("; ") : "none",
+      detail: null,
+    });
+  }
   return rows;
 }
 
@@ -206,19 +266,21 @@ export function applyDecodeEvent(engineStatus, payload) {
   };
 }
 
-/// The one-time "speculative decoding is available" notice (sc-24139 feature-end review): shown on
-/// the Candle CUDA build when speculative decoding is `off` only because an older settings file
-/// carried `off` over, until the user turns Auto on or dismisses it.
-export function speculativeNotice(appSettings, executionBackend) {
+/// The one-time "speculative decoding is available" notice (sc-24139 feature-end review): shown
+/// while speculative decoding is `off` only because an older settings file carried `off` over and
+/// the runtime's own default (`engine_status.speculative_default`, sc-24445) is not `off`, until the
+/// user turns Auto on or dismisses it.
+export function speculativeNotice(appSettings, speculativeDefault) {
   const notices = appSettings?.notices ?? {};
-  const show = executionBackend === "candle-cuda"
-    && appSettings?.sampling?.mtpMode === "off"
+  const show = speculativeDefault != null
+    && speculativeDefault !== "off"
+    && appSettings?.sampling?.speculative === "off"
     && notices.speculativeOffCarriedOver === true
     && notices.speculativeNoticeDismissed !== true;
   return {
     show,
     message: "Speculative decoding is available — turn on Auto",
-    detail: "Your earlier settings kept it off. Auto uses the model's own MTP head where it has one and ordinary decoding where it does not.",
+    detail: "Your earlier settings kept it off. Auto uses the model's own MTP head where it has one, prompt lookup where it does not, and ordinary decoding where neither runs.",
     actionLabel: "Turn on Auto",
     dismissLabel: "Dismiss",
   };
@@ -229,7 +291,7 @@ export function speculativeNotice(appSettings, executionBackend) {
 export function enableSpeculativeAuto(appSettings) {
   return {
     ...appSettings,
-    sampling: { ...appSettings.sampling, mtpMode: "auto" },
+    sampling: { ...appSettings.sampling, speculative: "auto" },
     notices: { ...appSettings.notices, speculativeOffCarriedOver: false },
   };
 }

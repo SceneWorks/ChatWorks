@@ -132,14 +132,21 @@ for the Tauri app.
 
 ### Per-chat optional controls
 
-The desktop sends the chat's MTP choice explicitly. A fresh chat takes it from Settings, and the
-build's default is Auto on Candle CUDA and Off on MLX and Candle CPU. When no choice is known yet
-(for example, before the settings have loaded), the desktop leaves `mtp` out and the server
-applies the saved setting. If the settings cannot be read, the UI falls back to the backend's
+The desktop sends the chat's speculative-decoding choice explicitly, as the runtime's
+proposer-agnostic option: `"off"`, `"auto"` (the model's MTP head where it has one, else prompt
+lookup), or `{"proposer": "mtp" | "prompt_lookup" | "draft_model", "depth": N}`. Only the proposers
+the loaded model advertises are offered, and the depth is clamped to that proposer's advertised
+maximum. A fresh chat takes the choice from Settings; a Settings value that was never chosen
+follows the runtime's own default (ChatWorks keeps no per-backend copy), shown beside
+"Runtime default". When no choice is known yet (for example, before the settings have loaded),
+the desktop leaves `speculative` out and the server applies the saved setting. API clients may
+still send the legacy `mtp` field (`{"mode": "off" | "auto" | "enabled", "draft_tokens": N}`); it
+maps onto the same option, and sending both is refused. If the settings cannot be read, the UI falls back to the backend's
 defaults for this build (`default_app_settings`). Optional API fields that are absent inherit application
 settings only when the loaded model supports them; inherited reasoning effort is omitted when
 thinking is disabled. Explicit unsupported values still produce the runtime's capability error.
-`model_defaults: ["reasoning_effort", "preserve_thinking", "mtp"]` clears those application
+`model_defaults: ["reasoning_effort", "preserve_thinking", "speculative"]` (`"mtp"` is still
+accepted) clears those application
 overrides for one request. An explicit value on the same request takes precedence over clearing.
 The desktop's Model default choices use this clearing mechanism and remain persisted per chat.
 

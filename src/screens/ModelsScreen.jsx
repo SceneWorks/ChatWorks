@@ -447,7 +447,7 @@ export function ModelsScreen() {
           title="Served model decode path"
           notice={{
             appSettings,
-            executionBackend: engineStatus?.execution_backend,
+            speculativeDefault: engineStatus?.speculative_default,
             onEnableAuto: () => updateAppSettings(enableSpeculativeAuto).catch((cause) => setError(String(cause))),
             onDismiss: () => updateAppSettings(dismissSpeculativeNotice).catch((cause) => setError(String(cause))),
           }}

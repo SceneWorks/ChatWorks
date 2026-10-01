@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 use crate::core_llm::{
     BackendCapabilities, CancelFlag, Channel, Constraint, Content, CudaGraphsReport, DecodeReport,
-    FeatureSupport, FinishReason, GenerationTimings, ImageRef, LoadReport, LoadSpec, Message,
-    MtpCapabilities, MtpMode, MtpStats, PathReport, ProjectionReport, Quantize, ReasoningEffort,
-    Role, Sampling, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest,
-    ThinkingMode, ToolCall, ToolSpec, Usage, VideoRef,
+    DraftReport, FeatureSupport, FinishReason, GenerationTimings, ImageRef, LoadReport, LoadSpec,
+    Message, MtpStats, PathReport, ProjectionReport, ProposerCapabilities, Quantize,
+    ReasoningEffort, Role, Sampling, Speculative, StreamEvent, TextLlm, TextLlmCapabilities,
+    TextLlmDescriptor, TextLlmRequest, ThinkingMode, ToolCall, ToolSpec, Usage, VideoRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -368,6 +368,7 @@ impl EngineActor {
             backend_capabilities: BackendCapabilitiesPayload::from(
                 crate::inference_runtime::backend_capabilities(),
             ),
+            speculative_default: crate::inference_runtime::speculative_default(),
             providers: crate::inference_runtime::textllms()
                 .map(|registration| ProviderSummary::from((registration.descriptor)()))
                 .collect(),
@@ -491,6 +492,7 @@ impl LoadModelRequest {
             projector_source: self.projector_source.clone(),
             quantize: self.quantize.map(Into::into),
             cuda_graphs: self.cuda_graphs,
+            ..LoadSpec::default()
         }
     }
 }
@@ -564,8 +566,12 @@ pub struct GenerateRequest {
     pub reasoning_effort: Option<ReasoningEffortRequest>,
     #[serde(default)]
     pub preserve_thinking: Option<bool>,
-    #[serde(default)]
-    pub mtp: MtpRequest,
+    /// The runtime's proposer-agnostic speculative option (sc-24445): `"off"`, `"auto"` or
+    /// `{"proposer": "mtp" | "prompt_lookup" | "draft_model", "depth": N}`; `None` runs the
+    /// runtime's default. The legacy `mtp` field (`{"mode": "off" | "auto" | "enabled",
+    /// "draft_tokens": N}`) still deserializes into it; sending both is refused.
+    #[serde(default, alias = "mtp", skip_serializing_if = "Option::is_none")]
+    pub speculative: Option<Speculative>,
     #[serde(default)]
     pub constraint: Option<ConstraintRequest>,
     /// Tools / functions offered to the model. Rendered into the prompt by the chat template and used
@@ -581,6 +587,7 @@ impl GenerateRequest {
         if self.messages.is_empty() {
             return Err("messages must not be empty".to_string());
         }
+        crate::app_settings::validate_speculative(self.speculative)?;
         Ok(TextLlmRequest {
             messages: self
                 .messages
@@ -598,7 +605,7 @@ impl GenerateRequest {
             thinking: resolve_thinking(self.thinking, self.enable_thinking, self.disable_thinking)?,
             reasoning_effort: self.reasoning_effort.map(ReasoningEffortRequest::into_core),
             preserve_thinking: self.preserve_thinking,
-            mtp: self.mtp.into_core()?,
+            speculative: self.speculative,
             tools: self
                 .tools
                 .into_iter()
@@ -606,6 +613,7 @@ impl GenerateRequest {
                 .collect(),
             stop: self.stop,
             cancel,
+            ..TextLlmRequest::default()
         })
     }
 }
@@ -724,29 +732,6 @@ impl ReasoningEffortRequest {
             Self::Low => ReasoningEffort::Low,
             Self::Medium => ReasoningEffort::Medium,
             Self::Xhigh => ReasoningEffort::XHigh,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(tag = "mode", rename_all = "lowercase")]
-pub enum MtpRequest {
-    #[default]
-    Off,
-    Auto,
-    Enabled {
-        draft_tokens: u32,
-    },
-}
-impl MtpRequest {
-    fn into_core(self) -> EngineResult<MtpMode> {
-        match self {
-            Self::Off => Ok(MtpMode::Off),
-            Self::Auto => Ok(MtpMode::Auto),
-            Self::Enabled { draft_tokens: 0 } => {
-                Err("mtp.draft_tokens must be at least 1".to_string())
-            }
-            Self::Enabled { draft_tokens } => Ok(MtpMode::Enabled { draft_tokens }),
         }
     }
 }
@@ -1644,6 +1629,9 @@ pub struct EngineStatus {
     /// What the runtime can serve on this host before any load (NVFP4, CUDA graphs), each
     /// unavailable feature with the runtime's reason (sc-24139).
     pub backend_capabilities: BackendCapabilitiesPayload,
+    /// The speculative option a request that names none runs under, as the linked runtime
+    /// resolves it (epic sc-24432 E5, sc-24445) — what "Runtime default" means in the UI.
+    pub speculative_default: Speculative,
     pub providers: Vec<ProviderSummary>,
 }
 
@@ -1690,7 +1678,7 @@ pub struct LoadedModelStatus {
 
 /// The served model's decode status after a generation, pushed to the UI (the
 /// `engine://decode` event) for every finished generation, from the desktop or an API client.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DecodeStatusPayload {
     /// The served model the generation ran on (`LoadedModelStatus::source`).
     pub source: String,
@@ -1763,6 +1751,11 @@ pub struct LoadReportPayload {
     pub projections: Vec<ProjectionReportPayload>,
     /// The CUDA-graph switch the load settled (`None` where the provider does not use it).
     pub cuda_graphs: Option<bool>,
+    /// The cross-turn prefix cache's byte budget the load settled (`Some(0)` = off; `None` where
+    /// the provider has no prefix cache).
+    pub prefix_cache_bytes: Option<u64>,
+    /// The draft model the load named: resident, or refused with the runtime's reason.
+    pub draft: Option<DraftReportPayload>,
 }
 impl From<LoadReport> for LoadReportPayload {
     fn from(value: LoadReport) -> Self {
@@ -1774,6 +1767,23 @@ impl From<LoadReport> for LoadReportPayload {
                 .map(ProjectionReportPayload::from)
                 .collect(),
             cuda_graphs: value.cuda_graphs,
+            prefix_cache_bytes: value.prefix_cache_bytes,
+            draft: value.draft.map(DraftReportPayload::from),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DraftReportPayload {
+    pub source: String,
+    /// Why the draft was not loaded; `None` when it is resident.
+    pub refusal: Option<String>,
+}
+impl From<DraftReport> for DraftReportPayload {
+    fn from(value: DraftReport) -> Self {
+        Self {
+            source: value.source,
+            refusal: value.refusal,
         }
     }
 }
@@ -1814,12 +1824,13 @@ impl From<CudaGraphsReport> for CudaGraphsReportPayload {
     }
 }
 
-/// Which decode path served a generation (sc-24139, epic E2): the runtime's own labels, so a
-/// fallback is always named.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// Which decode path served a generation (sc-24139; epic sc-24432 E3): the runtime's own labels
+/// and counters, so the proposer that ran, the realized accepted length, the sampler path and
+/// every fallback are visible.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DecodeReportPayload {
     pub path: String,
-    /// `none` | `mtp` | `ngram` | `draft`.
+    /// `none` | `mtp` | `prompt_lookup` | `draft_model`.
     pub proposer: String,
     pub draft_tokens: Option<u32>,
     /// `device` | `host:<reason>` | `none`.
@@ -1830,13 +1841,26 @@ pub struct DecodeReportPayload {
     pub nvfp4_projections: PathReportPayload,
     pub fused_primitives: PathReportPayload,
     pub target_forwards: u64,
+    pub prefill_forwards: u64,
     pub proposed_tokens: u64,
     pub accepted_tokens: u64,
+    /// Target verification passes; the denominator of `mean_accepted_length`.
+    pub verify_steps: u64,
+    /// Drafts accepted per verify step, as the runtime computes it (`None` when no proposer ran
+    /// or no verify step did).
+    pub mean_accepted_length: Option<f64>,
     pub replay_forwards: u64,
+    /// Leading prompt tokens served from the cross-turn prefix cache.
+    pub prefix_hit_tokens: u64,
+    /// The prefix cache's part: `hit` | `miss` | `off` | `bypassed` | `none`, with the reason.
+    pub prefix_cache: PathReportPayload,
+    /// Every fallback the request took that no field above names (`speculative: …`).
+    pub fallbacks: Vec<String>,
 }
 impl From<DecodeReport> for DecodeReportPayload {
     fn from(value: DecodeReport) -> Self {
         Self {
+            mean_accepted_length: value.mean_accepted_length(),
             path: value.path,
             proposer: value.proposer.label().to_string(),
             draft_tokens: value.draft_tokens,
@@ -1847,9 +1871,14 @@ impl From<DecodeReport> for DecodeReportPayload {
             nvfp4_projections: PathReportPayload::from(value.nvfp4_projections),
             fused_primitives: PathReportPayload::from(value.fused_primitives),
             target_forwards: value.target_forwards,
+            prefill_forwards: value.prefill_forwards,
             proposed_tokens: value.proposed_tokens,
             accepted_tokens: value.accepted_tokens,
+            verify_steps: value.verify_steps,
             replay_forwards: value.replay_forwards,
+            prefix_hit_tokens: value.prefix_hit_tokens,
+            prefix_cache: PathReportPayload::from(value.prefix_cache),
+            fallbacks: value.fallbacks,
         }
     }
 }
@@ -1890,12 +1919,15 @@ pub struct CapabilitySummary {
     pub model_sampling_defaults: Option<ModelSamplingDefaultsPayload>,
     pub supports_preserve_thinking: bool,
     pub supports_tools: bool,
-    pub mtp: Option<MtpCapabilitiesPayload>,
+    /// The speculative proposers this model runs and their per-proposer depth limits (the legacy
+    /// MTP advertisement included), as the runtime advertises them.
+    pub speculative: Vec<ProposerCapabilities>,
     pub supported_constraints: Vec<String>,
 }
 
 impl From<TextLlmCapabilities> for CapabilitySummary {
     fn from(value: TextLlmCapabilities) -> Self {
+        let speculative = value.speculative_proposers();
         Self {
             max_context_tokens: value.max_context_tokens,
             max_new_tokens: value.max_new_tokens,
@@ -1914,26 +1946,12 @@ impl From<TextLlmCapabilities> for CapabilitySummary {
                 .map(ModelSamplingDefaultsPayload::from),
             supports_preserve_thinking: value.supports_preserve_thinking,
             supports_tools: value.supports_tools,
-            mtp: value.mtp.map(MtpCapabilitiesPayload::from),
+            speculative,
             supported_constraints: value
                 .supported_constraints
                 .into_iter()
                 .map(|constraint| format!("{constraint:?}"))
                 .collect(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct MtpCapabilitiesPayload {
-    pub max_draft_tokens: u32,
-    pub recommended_draft_tokens: u32,
-}
-impl From<MtpCapabilities> for MtpCapabilitiesPayload {
-    fn from(value: MtpCapabilities) -> Self {
-        Self {
-            max_draft_tokens: value.max_draft_tokens,
-            recommended_draft_tokens: value.recommended_draft_tokens,
         }
     }
 }
@@ -2157,7 +2175,7 @@ mod tests {
                     disable_thinking: None,
                     reasoning_effort: None,
                     preserve_thinking: None,
-                    mtp: MtpRequest::Off,
+                    speculative: None,
                     constraint: None,
                     tools: Vec::new(),
                 },
@@ -2338,7 +2356,7 @@ mod tests {
                 disable_thinking: None,
                 reasoning_effort: None,
                 preserve_thinking: None,
-                mtp: MtpRequest::Off,
+                speculative: None,
                 constraint: None,
                 tools: Vec::new(),
             },
@@ -2376,7 +2394,7 @@ mod tests {
             disable_thinking: None,
             reasoning_effort: None,
             preserve_thinking: None,
-            mtp: MtpRequest::Off,
+            speculative: None,
             constraint: None,
             tools: Vec::new(),
         };
@@ -2403,14 +2421,59 @@ mod tests {
             resolve_thinking(ThinkingRequest::Auto, Some(true), Some(true)),
             Err(message) if message.contains("conflicts")
         ));
-        assert!(matches!(
-            MtpRequest::Enabled { draft_tokens: 0 }.into_core(),
-            Err(message) if message.contains("draft_tokens")
-        ));
-        assert!(matches!(
-            MtpRequest::Enabled { draft_tokens: 3 }.into_core(),
-            Ok(MtpMode::Enabled { draft_tokens: 3 })
-        ));
+    }
+
+    /// sc-24445: the request carries the runtime's speculative option; the legacy `mtp` wire field
+    /// still deserializes into it (`enabled` -> `{proposer: mtp, depth}`), sending both is refused,
+    /// and a zero depth is refused at the boundary.
+    #[test]
+    fn the_speculative_option_and_its_legacy_mtp_spelling_reach_the_runtime_request() {
+        use crate::core_llm::SpeculativeProposer;
+        let body = |extra: Value| {
+            let mut wire = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+            for (key, value) in extra.as_object().unwrap() {
+                wire[key] = value.clone();
+            }
+            serde_json::from_value::<GenerateRequest>(wire)
+        };
+        for (extra, expected) in [
+            (serde_json::json!({}), None),
+            (
+                serde_json::json!({"speculative": "off"}),
+                Some(Speculative::Off),
+            ),
+            (
+                serde_json::json!({"speculative": "auto"}),
+                Some(Speculative::Auto),
+            ),
+            (
+                serde_json::json!({"speculative": {"proposer": "prompt_lookup", "depth": 4}}),
+                Some(Speculative::proposer(SpeculativeProposer::PromptLookup, 4)),
+            ),
+            (
+                serde_json::json!({"mtp": {"mode": "off"}}),
+                Some(Speculative::Off),
+            ),
+            (
+                serde_json::json!({"mtp": {"mode": "auto"}}),
+                Some(Speculative::Auto),
+            ),
+            (
+                serde_json::json!({"mtp": {"mode": "enabled", "draft_tokens": 3}}),
+                Some(Speculative::proposer(SpeculativeProposer::Mtp, 3)),
+            ),
+        ] {
+            let request = body(extra.clone()).unwrap();
+            assert_eq!(request.speculative, expected, "{extra}");
+            let core = request.into_core(CancelFlag::new()).unwrap();
+            assert_eq!(core.speculative, expected, "{extra}");
+            assert_eq!(core.mtp, crate::core_llm::MtpMode::Off, "never both");
+        }
+        assert!(body(serde_json::json!({"speculative": "off", "mtp": {"mode": "auto"}})).is_err());
+        let zero = body(serde_json::json!({"speculative": {"proposer": "mtp", "depth": 0}}))
+            .unwrap()
+            .into_core(CancelFlag::new());
+        assert!(matches!(zero, Err(message) if message.contains("depth")));
     }
 
     #[test]
@@ -2565,7 +2628,7 @@ mod tests {
             disable_thinking: None,
             reasoning_effort: None,
             preserve_thinking: None,
-            mtp: MtpRequest::Auto,
+            speculative: Some(Speculative::Auto),
             constraint: None,
             tools: Vec::new(),
         }
@@ -2760,6 +2823,7 @@ mod tests {
                 nvfp4: FeatureSupport::available(),
                 cuda_graphs: FeatureSupport::available(),
             }),
+            speculative_default: Speculative::Off,
             providers: Vec::new(),
         };
         let wire = serde_json::to_value(&status).unwrap();
@@ -2768,6 +2832,7 @@ mod tests {
         let read_by_the_view = serde_json::json!({
             "execution_backend": wire["execution_backend"],
             "backend_capabilities": wire["backend_capabilities"],
+            "speculative_default": wire["speculative_default"],
             "loaded": {
                 "source": loaded["source"],
                 "quantize": loaded["quantize"],
@@ -2848,7 +2913,7 @@ mod tests {
                     disable_thinking: None,
                     reasoning_effort: None,
                     preserve_thinking: None,
-                    mtp: MtpRequest::Off,
+                    speculative: None,
                     constraint: None,
                     tools: Vec::new(),
                 },

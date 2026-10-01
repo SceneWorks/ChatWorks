@@ -291,7 +291,10 @@ test("the Rust wire shape renders: the view reads tests/engine-status-wire.json 
   assert.equal(rows.graph_switch.value, "on");
   assert.equal(rows.implementation.value, "mtp");
   assert.equal(rows.proposer.value, "mtp · 2 drafts");
-  assert.equal(rows.proposer.detail, "Accepted 3 of 4 drafts in 2 forwards");
+  assert.equal(rows.proposer.detail, "Accepted 3 of 4 drafts in 3 forwards");
+  assert.equal(rows.accepted_length.value, "1.50 drafts per verify step");
+  assert.equal(rows.prefix_cache.value, "miss");
+  assert.equal(rows.fallbacks.value, "none");
   assert.equal(rows.cuda_graphs.value, "eager");
   assert.equal(rows.cuda_graphs.detail, "0 captured · fallback: deltanet_state_unstable");
   assert.equal(rows.nvfp4.value, "mixed");
@@ -320,41 +323,42 @@ test("a pushed decode status updates the served model without polling, and only 
 });
 
 const CARRIED_OVER = {
-  sampling: { mtpMode: "off" },
+  sampling: { speculative: "off" },
   notices: { speculativeOffCarriedOver: true, speculativeNoticeDismissed: false },
 };
 
-test("the speculative notice shows once for a carried-over off on CUDA, and hides otherwise", () => {
-  const shown = speculativeNotice(CARRIED_OVER, "candle-cuda");
+test("the speculative notice shows once for a carried-over off where the runtime's default is not off", () => {
+  const shown = speculativeNotice(CARRIED_OVER, "auto");
   assert.equal(shown.show, true);
   assert.equal(shown.message, "Speculative decoding is available — turn on Auto");
   assert.equal(shown.actionLabel, "Turn on Auto");
-  // Hidden: another backend, an off that was not carried over, a mode other than off, dismissed.
-  assert.equal(speculativeNotice(CARRIED_OVER, "candle-cpu").show, false);
-  assert.equal(speculativeNotice(CARRIED_OVER, "mlx").show, false);
+  // Hidden: the runtime's default is off (or unknown), an off that was not carried over, another
+  // saved option, dismissed.
+  assert.equal(speculativeNotice(CARRIED_OVER, "off").show, false);
+  assert.equal(speculativeNotice(CARRIED_OVER, undefined).show, false);
   assert.equal(
-    speculativeNotice({ ...CARRIED_OVER, notices: { speculativeOffCarriedOver: false } }, "candle-cuda").show,
+    speculativeNotice({ ...CARRIED_OVER, notices: { speculativeOffCarriedOver: false } }, "auto").show,
     false,
   );
-  assert.equal(speculativeNotice({ ...CARRIED_OVER, sampling: { mtpMode: "auto" } }, "candle-cuda").show, false);
-  assert.equal(speculativeNotice(undefined, "candle-cuda").show, false);
-  assert.equal(speculativeNotice(dismissSpeculativeNotice(CARRIED_OVER), "candle-cuda").show, false);
+  assert.equal(speculativeNotice({ ...CARRIED_OVER, sampling: { speculative: "auto" } }, "auto").show, false);
+  assert.equal(speculativeNotice(undefined, "auto").show, false);
+  assert.equal(speculativeNotice(dismissSpeculativeNotice(CARRIED_OVER), "auto").show, false);
 });
 
-test("the notice's one-click action turns on Auto; dismissing persists without touching the saved mode", () => {
+test("the notice's one-click action turns on Auto; dismissing persists without touching the saved option", () => {
   const auto = enableSpeculativeAuto(CARRIED_OVER);
-  assert.equal(auto.sampling.mtpMode, "auto");
+  assert.equal(auto.sampling.speculative, "auto");
   assert.equal(auto.notices.speculativeOffCarriedOver, false);
-  assert.equal(speculativeNotice(auto, "candle-cuda").show, false);
+  assert.equal(speculativeNotice(auto, "auto").show, false);
   const dismissed = dismissSpeculativeNotice(CARRIED_OVER);
-  assert.equal(dismissed.sampling.mtpMode, "off", "a dismissal never changes the saved choice");
+  assert.equal(dismissed.sampling.speculative, "off", "a dismissal never changes the saved choice");
   assert.equal(dismissed.notices.speculativeNoticeDismissed, true);
   assert.equal(dismissed.notices.speculativeOffCarriedOver, true);
   assert.equal(CARRIED_OVER.notices.speculativeNoticeDismissed, false, "the input is not mutated");
 });
 
 test("the notice renders in the decode-path panel with its action and dismiss buttons", () => {
-  const notice = { appSettings: CARRIED_OVER, executionBackend: "candle-cuda", onEnableAuto() {}, onDismiss() {} };
+  const notice = { appSettings: CARRIED_OVER, speculativeDefault: "auto", onEnableAuto() {}, onDismiss() {} };
   const html = ReactDOMServer.renderToStaticMarkup(React.createElement(DecodePathStatus, {
     engineStatus: status(SM120, null),
     notice,
@@ -367,6 +371,113 @@ test("the notice renders in the decode-path panel with its action and dismiss bu
     appSettings: dismissSpeculativeNotice(CARRIED_OVER),
   }));
   assert.equal(hidden, "");
+});
+
+// The decode report the MLX runtime returns for a chat response under `auto` on a model without an
+// MTP head, in the shape `src-tauri/tests/mlx_decode_status.rs` reads back from a real MLX
+// generation (pinned runtime, tiny Llama snapshot).
+const MLX_DECODE = {
+  path: "prompt_lookup",
+  proposer: "prompt_lookup",
+  draft_tokens: 4,
+  sampler: "device",
+  kv_cache: "growing",
+  attention: "gqa",
+  cuda_graphs: { enabled: false, path: "none", replayed: 0, eager: 0, captured: 0, fallback_reason: null },
+  nvfp4_projections: { path: "none", reason: null },
+  fused_primitives: { path: "none", reason: null },
+  target_forwards: 7,
+  prefill_forwards: 1,
+  proposed_tokens: 9,
+  accepted_tokens: 5,
+  verify_steps: 6,
+  mean_accepted_length: 5 / 6,
+  replay_forwards: 0,
+  prefix_hit_tokens: 0,
+  prefix_cache: { path: "miss", reason: null },
+  fallbacks: [],
+};
+
+test("sc-24445 AC2: on MLX a chat response shows the proposer, accepted length and sampler path", () => {
+  const engineStatus = {
+    ...status(MLX, {
+      source: "/models/tiny", quantize: null, cuda_graphs: null, load_report: null,
+      last_decode: null, decode_reported: null,
+    }),
+    speculative_default: "off",
+  };
+  // The finished generation arrives as an `engine://decode` push.
+  const pushed = applyDecodeEvent(engineStatus, { source: "/models/tiny", last_decode: MLX_DECODE, decode_reported: true });
+  const html = ReactDOMServer.renderToStaticMarkup(React.createElement(DecodePathStatus, { engineStatus: pushed }));
+  const rows = Object.fromEntries(decodePathRows(pushed).map((row) => [row.key, row]));
+  assert.equal(rows.backend.value, "mlx · metal");
+  assert.equal(rows.proposer.value, "prompt_lookup · 4 drafts");
+  assert.equal(rows.accepted_length.value, "0.83 drafts per verify step");
+  assert.equal(rows.accepted_length.detail, "5 accepted over 6 verify steps");
+  assert.equal(rows.sampler.value, "device");
+  for (const text of [
+    'data-row="proposer"', "prompt_lookup · 4 drafts",
+    'data-row="accepted_length"', "Accepted length", "0.83 drafts per verify step",
+    'data-row="sampler"', "Sampler", "device",
+  ]) {
+    assert.ok(html.includes(text), `missing ${text} in ${html}`);
+  }
+  assert.ok(!html.includes("not reported"), html);
+});
+
+test("fallbacks, the prefix cache and (when reported) the graph path are named", () => {
+  const decode = {
+    ...MLX_DECODE,
+    proposer: "none",
+    draft_tokens: null,
+    mean_accepted_length: null,
+    sampler: "host:penalty",
+    prefix_hit_tokens: 120,
+    prefix_cache: { path: "hit", reason: null },
+    fallbacks: ["speculative: `prompt_lookup` depth 12 clamped to 7 (advertised 1..=7)"],
+    graph_path: "captured",
+  };
+  const rows = Object.fromEntries(decodePathRows(status(MLX, { quantize: null, last_decode: decode })).map((row) => [row.key, row]));
+  assert.equal(rows.accepted_length.value, "n/a");
+  assert.equal(rows.accepted_length.detail, "No proposer ran.");
+  assert.equal(rows.sampler.value, "host:penalty");
+  assert.equal(rows.prefix_cache.value, "hit · 120 prompt tokens reused");
+  assert.match(rows.fallbacks.value, /clamped to 7/);
+  assert.equal(rows.graph_path.value, "captured");
+  // A report from a runtime without these fields renders without them.
+  const older = decodePathRows(status(SM120, { quantize: null, last_decode: DECODE })).map((row) => row.key);
+  for (const key of ["accepted_length", "graph_path", "prefix_cache", "fallbacks"]) {
+    assert.ok(!older.includes(key), key);
+  }
+});
+
+test("sc-24445 AC3: the CUDA-graph toggle is disabled with the runtime's reason when the served model cannot capture", () => {
+  const eagerDecode = {
+    ...DECODE,
+    cuda_graphs: { enabled: true, path: "eager", replayed: 0, eager: 12, captured: 0, fallback_reason: "moe_router_host_read" },
+  };
+  const moe = { name: "Qwen3.5 MoE", cuda_graphs: true, load_report: { cuda_graphs: true, projections: [] }, last_decode: eagerDecode };
+  const control = cudaGraphsControl(SM120, true, moe);
+  assert.equal(control.disabled, true);
+  assert.match(control.reason, /moe_router_host_read/);
+  assert.match(control.reason, /^cuda_graphs: /);
+  assert.equal(control.pendingReload, false);
+  assert.match(control.note, /saved setting is kept/);
+  // The runtime's graph path decides when it reports one.
+  assert.equal(cudaGraphsControl(SM120, true, { ...moe, last_decode: { ...eagerDecode, graph_path: "captured" } }).disabled, false);
+  // A load fallback naming the switch is the runtime's reason verbatim.
+  const fallback = "cuda_graphs: positions_host_scalar: this decoder reads positions on the host";
+  assert.equal(cudaGraphsControl(SM120, true, { cuda_graphs: true, load_report: { cuda_graphs: true, fallbacks: [fallback] } }).reason, fallback);
+  // A load that settled no switch: the provider never routes steps through the runner.
+  const unrouted = cudaGraphsControl(SM120, true, { cuda_graphs: null, load_report: { cuda_graphs: null, projections: [] } });
+  assert.equal(unrouted.disabled, true);
+  assert.match(unrouted.reason, /does not route decode steps/);
+  // A model that captured (some steps replayed), or one not yet measured, keeps the toggle live.
+  const captured = { ...moe, last_decode: { ...DECODE, cuda_graphs: { ...DECODE.cuda_graphs, path: "mixed", replayed: 7 } } };
+  assert.equal(cudaGraphsControl(SM120, true, captured).disabled, false);
+  assert.equal(cudaGraphsControl(SM120, true, { ...moe, last_decode: null }).disabled, false);
+  // The host's own refusal still wins where the switch is unavailable.
+  assert.equal(cudaGraphsControl(MLX, true, moe).reason, MLX.cuda_graphs.reason);
 });
 
 test("resident NVFP4 weights are labelled lossy beside the served model's name and in the Weights row", () => {

@@ -7,6 +7,7 @@
     "nvfp4": { "supported": true, "reason": null },
     "cuda_graphs": { "supported": true, "reason": null }
   },
+  "speculative_default": "off",
   "loaded": {
     "source": "/models/qwen3.8-27b",
     "quantize": "nvfp4",
@@ -14,7 +15,9 @@
     "load_report": {
       "requested": "nvfp4",
       "projections": [{ "kind": "nvfp4", "count": 448, "params": 1000, "resident_bytes": 562 }],
-      "cuda_graphs": true
+      "cuda_graphs": true,
+      "prefix_cache_bytes": null,
+      "draft": null
     },
     "last_decode": {
       "path": "mtp",
@@ -33,10 +36,16 @@
       },
       "nvfp4_projections": { "path": "mixed", "reason": "rows" },
       "fused_primitives": { "path": "fused", "reason": null },
-      "target_forwards": 2,
+      "target_forwards": 3,
+      "prefill_forwards": 1,
       "proposed_tokens": 4,
       "accepted_tokens": 3,
-      "replay_forwards": 0
+      "verify_steps": 2,
+      "mean_accepted_length": 1.5,
+      "replay_forwards": 0,
+      "prefix_hit_tokens": 0,
+      "prefix_cache": { "path": "miss", "reason": null },
+      "fallbacks": []
     },
     "decode_reported": true
   }
