@@ -94,6 +94,11 @@ pub struct ModelEntry {
     /// `LoadSpec::prefix_cache_bytes`. `None` keeps the runtime's default; `Some(0)` turns it off.
     #[serde(default)]
     pub prefix_cache_bytes: Option<u64>,
+    /// The user's companion MTP head for this model (a predictor-only artifact path, epic
+    /// sc-24432 story sc-24444), sent as the load's `LoadSpec::mtp_head_source`. `None` loads the
+    /// model alone.
+    #[serde(default)]
+    pub mtp_head_source: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -251,6 +256,7 @@ pub fn adopt_cached_hf_model(
         projector_sources: candidate.projector_sources,
         draft_source: None,
         prefix_cache_bytes: None,
+        mtp_head_source: None,
     };
     let manifest = registry_path(app)?;
     let mut registry = read_registry(&manifest)?;
@@ -335,21 +341,30 @@ pub fn load_registered_model(
     Ok(status)
 }
 
-/// Save a registered model's load options (epic sc-24432): its draft model (`None` or blank = no
-/// draft) and prefix-cache budget (`None` = the runtime's default). They apply the next time the
-/// model is loaded.
+/// Save a registered model's load options (epic sc-24432): its draft model and companion MTP head
+/// (`None` or blank = none) and prefix-cache budget (`None` = the runtime's default). They apply
+/// the next time the model is loaded.
 pub fn set_model_load_options(
     app: &AppHandle,
     model_id: &str,
     draft_source: Option<String>,
     prefix_cache_bytes: Option<u64>,
+    mtp_head_source: Option<String>,
 ) -> Result<ModelRegistry, String> {
     set_model_load_options_in(
         &registry_path(app)?,
         model_id,
         draft_source,
         prefix_cache_bytes,
+        mtp_head_source,
     )
+}
+
+/// A path option as saved: trimmed, with a blank value meaning none.
+fn optional_path(value: Option<String>) -> Option<String> {
+    value
+        .map(|source| source.trim().to_string())
+        .filter(|source| !source.is_empty())
 }
 
 fn set_model_load_options_in(
@@ -357,6 +372,7 @@ fn set_model_load_options_in(
     model_id: &str,
     draft_source: Option<String>,
     prefix_cache_bytes: Option<u64>,
+    mtp_head_source: Option<String>,
 ) -> Result<ModelRegistry, String> {
     let mut registry = read_registry(manifest)?;
     let entry = registry
@@ -364,10 +380,9 @@ fn set_model_load_options_in(
         .iter_mut()
         .find(|model| model.id == model_id)
         .ok_or_else(|| format!("model {model_id:?} is not in the registry"))?;
-    entry.draft_source = draft_source
-        .map(|source| source.trim().to_string())
-        .filter(|source| !source.is_empty());
+    entry.draft_source = optional_path(draft_source);
     entry.prefix_cache_bytes = prefix_cache_bytes;
+    entry.mtp_head_source = optional_path(mtp_head_source);
     write_registry(manifest, &registry)?;
     Ok(registry)
 }
@@ -560,6 +575,7 @@ async fn import_hf_model_inner(
         },
         draft_source: None,
         prefix_cache_bytes: None,
+        mtp_head_source: None,
     };
     upsert_model(&mut registry, entry);
     write_registry(&manifest, &registry)?;
@@ -930,6 +946,7 @@ pub(crate) fn load_request_for(
         cuda_graphs,
         draft_source: entry.draft_source.clone(),
         prefix_cache_bytes: entry.prefix_cache_bytes,
+        mtp_head_source: entry.mtp_head_source.clone(),
     })
 }
 
@@ -2353,6 +2370,7 @@ mod tests {
             projector_sources: Vec::new(),
             draft_source: None,
             prefix_cache_bytes: None,
+            mtp_head_source: None,
         };
         let mut settings = crate::app_settings::AppSettings::default();
         settings.runtime.cuda_graphs = true;
@@ -2392,9 +2410,10 @@ mod tests {
         );
     }
 
-    /// Epic sc-24432 load options: a registered model's saved draft model and prefix-cache budget
-    /// are saved through `set_model_load_options` (a blank draft = none, a `None` budget = the
-    /// runtime's default) and reach its load request, then the runtime's `LoadSpec`.
+    /// Epic sc-24432 load options: a registered model's saved draft model, companion MTP head and
+    /// prefix-cache budget are saved through `set_model_load_options` (a blank path = none, a
+    /// `None` budget = the runtime's default) and reach its load request, then the runtime's
+    /// `LoadSpec`.
     #[test]
     fn saved_draft_and_prefix_cache_options_reach_the_load_request() {
         let entry: ModelEntry = serde_json::from_value(serde_json::json!({
@@ -2431,11 +2450,16 @@ mod tests {
             "qwen3-32b",
             Some(" /snapshots/qwen3-0.6b ".to_string()),
             Some(256 << 20),
+            Some(" /snapshots/qwen3.8-27b-mtp ".to_string()),
         )
         .unwrap();
         let saved = &read_registry(&manifest).unwrap().models[0];
         assert_eq!(saved.draft_source.as_deref(), Some("/snapshots/qwen3-0.6b"));
         assert_eq!(saved.prefix_cache_bytes, Some(256 << 20));
+        assert_eq!(
+            saved.mtp_head_source.as_deref(),
+            Some("/snapshots/qwen3.8-27b-mtp")
+        );
         assert_eq!(registry.models[0].draft_source, saved.draft_source);
         let request =
             load_request_for(saved, None, no_settings, &capabilities(false, false)).unwrap();
@@ -2444,24 +2468,40 @@ mod tests {
             Some("/snapshots/qwen3-0.6b")
         );
         assert_eq!(request.prefix_cache_bytes, Some(256 << 20));
+        assert_eq!(
+            request.mtp_head_source.as_deref(),
+            Some("/snapshots/qwen3.8-27b-mtp")
+        );
         let spec = request.load_spec();
         assert_eq!(spec.draft_source.as_deref(), Some("/snapshots/qwen3-0.6b"));
         assert_eq!(spec.prefix_cache_bytes, Some(256 << 20));
+        assert_eq!(
+            spec.mtp_head_source.as_deref(),
+            Some("/snapshots/qwen3.8-27b-mtp")
+        );
 
-        // Clearing: a blank draft is none, and a `None` budget is the runtime's default.
-        set_model_load_options_in(&manifest, "qwen3-32b", Some("  ".to_string()), None).unwrap();
+        // Clearing: a blank draft or head is none, and a `None` budget is the runtime's default.
+        set_model_load_options_in(
+            &manifest,
+            "qwen3-32b",
+            Some("  ".to_string()),
+            None,
+            Some(" ".to_string()),
+        )
+        .unwrap();
         let cleared = &read_registry(&manifest).unwrap().models[0];
         let request =
             load_request_for(cleared, None, no_settings, &capabilities(false, false)).unwrap();
         assert_eq!(request.draft_source, None);
         assert_eq!(request.prefix_cache_bytes, None);
+        assert_eq!(request.mtp_head_source, None);
         // `Some(0)` (off) is distinct from the runtime's default.
-        set_model_load_options_in(&manifest, "qwen3-32b", None, Some(0)).unwrap();
+        set_model_load_options_in(&manifest, "qwen3-32b", None, Some(0), None).unwrap();
         assert_eq!(
             read_registry(&manifest).unwrap().models[0].prefix_cache_bytes,
             Some(0)
         );
-        assert!(set_model_load_options_in(&manifest, "missing", None, None).is_err());
+        assert!(set_model_load_options_in(&manifest, "missing", None, None, None).is_err());
     }
 
     /// sc-24140 feature-end review: an unreadable settings file blocks a load only where the
@@ -3127,6 +3167,7 @@ mod tests {
                 projector_sources: Vec::new(),
                 draft_source: None,
                 prefix_cache_bytes: None,
+                mtp_head_source: None,
             },
         );
         upsert_model(
@@ -3150,6 +3191,7 @@ mod tests {
                 projector_sources: vec!["/tmp/mmproj-F16.gguf".to_string()],
                 draft_source: None,
                 prefix_cache_bytes: None,
+                mtp_head_source: None,
             },
         );
         assert_eq!(registry.models.len(), 1);
@@ -3200,6 +3242,7 @@ mod tests {
             projector_sources: Vec::new(),
             draft_source: None,
             prefix_cache_bytes: None,
+            mtp_head_source: None,
         };
         let mut value = serde_json::to_value(ModelRegistry {
             models: vec![entry],

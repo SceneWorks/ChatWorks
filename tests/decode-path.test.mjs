@@ -277,7 +277,7 @@ test("the view shows the decode implementation, fused primitives, graphs capture
   assert.equal(unused.value, "not used");
   // Every per-generation row is labelled as the last generation; the host and load rows are not.
   for (const row of Object.values(rows)) {
-    const perGeneration = !["backend", "weights", "graph_switch", "draft", "prefix_cache_budget"].includes(row.key);
+    const perGeneration = !["backend", "weights", "graph_switch", "draft", "load_fallbacks", "prefix_cache_budget"].includes(row.key);
     assert.equal(row.section, perGeneration ? LAST_GENERATION : null, row.key);
   }
 });
@@ -291,6 +291,13 @@ test("the Rust wire shape renders: the view reads tests/engine-status-wire.json 
   assert.equal(rows.graph_switch.value, "on");
   assert.equal(rows.draft.value, "resident");
   assert.equal(rows.draft.detail, "/models/qwen3-0.6b");
+  assert.match(rows.load_fallbacks.value, /^cuda_graphs: positions_host_scalar; mtp_head: /);
+  assert.match(rows.load_fallbacks.value, /qwen3\.8-27b-mtp/);
+  assert.equal(rows.graph_path.value, "eager");
+  // AC3 at load, from the engine's own wire shape: the runtime's load fallback is the toggle's reason.
+  const toggle = cudaGraphsControl(wire.backend_capabilities, false, wire.loaded);
+  assert.equal(toggle.disabled, true);
+  assert.equal(toggle.reason, "cuda_graphs: positions_host_scalar");
   assert.equal(rows.prefix_cache_budget.value, "1.0 GB");
   assert.equal(rows.prefix_cache_budget.detail, "Requested 1.0 GB; settled by the runtime at load.");
   assert.equal(rows.implementation.value, "mtp");
@@ -476,7 +483,8 @@ test("sc-24445 AC3: the CUDA-graph toggle is disabled with the runtime's reason 
   assert.equal(cudaGraphsControl(SM120, false, { ...moe, last_decode: { ...eagerDecode, graph_path: "captured" } }).disabled, false);
   // A load fallback naming the switch (`cuda_graphs: …`, the runtime's load-time format) is the
   // runtime's reason verbatim, before any generation.
-  const fallback = "cuda_graphs: positions_host_scalar: this decoder reads positions on the host";
+  // The exact string candle-llm pushes at load for a Qwen3.5/3.8 decoder (`cuda_graphs: <graph_support reason>`).
+  const fallback = "cuda_graphs: positions_host_scalar";
   const atLoad = cudaGraphsControl(SM120, false, { cuda_graphs: true, load_report: { cuda_graphs: true, fallbacks: [fallback] } });
   assert.equal(atLoad.disabled, true);
   assert.equal(atLoad.reason, fallback);
@@ -519,6 +527,20 @@ test("epic sc-24432 load options: the status names a refused draft with the runt
   const keys = decodePathRows(status(MLX, { quantize: null, load_report: { projections: [], prefix_cache_bytes: null, draft: null } }))
     .map((row) => row.key);
   assert.ok(!keys.includes("draft") && !keys.includes("prefix_cache_budget"), keys.join(","));
+});
+
+test("Candle's length-aware decode attention reads as such; other labels keep the runtime's name", () => {
+  const rows = (attention) => Object.fromEntries(decodePathRows(status(SM120, { quantize: null, last_decode: { ...DECODE, attention } }))
+    .map((row) => [row.key, row]));
+  assert.equal(rows("decode_attention").kv_cache.value, "static · length-aware decode attention");
+  assert.equal(rows("expanded").kv_cache.value, "static · expanded attention");
+  assert.equal(rows("gqa").kv_cache.value, "static · gqa attention");
+});
+
+test("a load with nothing unattached shows no load-fallbacks row", () => {
+  const keys = decodePathRows(status(SM120, { quantize: null, load_report: { projections: [], fallbacks: [] } }))
+    .map((row) => row.key);
+  assert.ok(!keys.includes("load_fallbacks"), keys.join(","));
 });
 
 test("resident NVFP4 weights are labelled lossy beside the served model's name and in the Weights row", () => {

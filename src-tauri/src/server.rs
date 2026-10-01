@@ -1731,6 +1731,7 @@ mod tests {
                 cuda_graphs: None,
                 draft_source: None,
                 prefix_cache_bytes: None,
+                mtp_head_source: None,
             })
             .unwrap();
         engine
@@ -1747,6 +1748,7 @@ mod tests {
                 cuda_graphs: None,
                 draft_source: None,
                 prefix_cache_bytes: None,
+                mtp_head_source: None,
             })
             .unwrap();
         engine
@@ -1763,6 +1765,7 @@ mod tests {
                 cuda_graphs: None,
                 draft_source: None,
                 prefix_cache_bytes: None,
+                mtp_head_source: None,
             })
             .unwrap();
         engine
@@ -2611,6 +2614,7 @@ mod tests {
                 cuda_graphs: None,
                 draft_source: None,
                 prefix_cache_bytes: None,
+                mtp_head_source: None,
             })
             .unwrap();
         let request = |prompt| {

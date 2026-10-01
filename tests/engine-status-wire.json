@@ -14,10 +14,15 @@
     "cuda_graphs": true,
     "draft_source": "/models/qwen3-0.6b",
     "prefix_cache_bytes": 1073741824,
+    "mtp_head_source": "/models/qwen3.8-27b-mtp",
     "load_report": {
       "requested": "nvfp4",
       "projections": [{ "kind": "nvfp4", "count": 448, "params": 1000, "resident_bytes": 562 }],
       "cuda_graphs": true,
+      "fallbacks": [
+        "cuda_graphs: positions_host_scalar",
+        "mtp_head: the target already carries its own MTP predictor (`/models/qwen3.8-27b-mtp`); the model loaded without a companion head"
+      ],
       "prefix_cache_bytes": 1073741824,
       "draft": { "source": "/models/qwen3-0.6b", "refusal": null }
     },
@@ -36,6 +41,7 @@
         "captured": 0,
         "fallback_reason": "deltanet_state_unstable"
       },
+      "graph_path": "eager",
       "nvfp4_projections": { "path": "mixed", "reason": "rows" },
       "fused_primitives": { "path": "fused", "reason": null },
       "target_forwards": 3,

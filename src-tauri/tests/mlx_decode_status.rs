@@ -182,6 +182,7 @@ fn an_mlx_chat_response_reports_proposer_accepted_length_and_sampler() {
             cuda_graphs: None,
             draft_source: None,
             prefix_cache_bytes: None,
+            mtp_head_source: None,
         })
         .expect("the MLX runtime loads the tiny snapshot");
     assert_eq!(status.execution_backend, "mlx");

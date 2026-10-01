@@ -263,6 +263,7 @@ impl EngineActor {
             projector_source: request.projector_source,
             draft_source: request.draft_source,
             prefix_cache_bytes: request.prefix_cache_bytes,
+            mtp_head_source: request.mtp_head_source,
             provider,
             descriptor,
             load_report,
@@ -427,6 +428,7 @@ struct LoadedModel {
     projector_source: Option<String>,
     draft_source: Option<String>,
     prefix_cache_bytes: Option<u64>,
+    mtp_head_source: Option<String>,
     provider: Box<dyn TextLlm>,
     descriptor: TextLlmDescriptor,
     load_report: Option<LoadReportPayload>,
@@ -447,6 +449,7 @@ impl LoadedModel {
             projector_source: self.projector_source.clone(),
             draft_source: self.draft_source.clone(),
             prefix_cache_bytes: self.prefix_cache_bytes,
+            mtp_head_source: self.mtp_head_source.clone(),
             provider: ProviderSummary::from(self.descriptor.clone()),
             load_report: self.load_report.clone(),
             last_decode: self.last_decode.clone(),
@@ -497,15 +500,19 @@ pub struct LoadModelRequest {
     /// the headroom its load admission leaves and reports the settled budget.
     #[serde(default)]
     pub prefix_cache_bytes: Option<u64>,
-    // REPIN(sc-24444): the companion MTP head (`LoadSpec::mtp_head_source`) is not in the pinned
-    // runtime (c2c346be3). The re-pin pass adds `mtp_head_source: Option<String>` here, maps it in
-    // `load_spec` below, and exposes it beside the draft model on the Models screen.
+    /// An optional companion multi-token-prediction head (`LoadSpec::mtp_head_source`, epic
+    /// sc-24432 story sc-24444): an artifact holding only a predictor layer, attached to a target
+    /// that ships none so the `mtp` proposer can run. `None` loads the target alone. A head the
+    /// runtime cannot attach never fails the load: it names why in the load report's `fallbacks`
+    /// (`mtp_head: …`).
+    #[serde(default)]
+    pub mtp_head_source: Option<String>,
 }
 
 impl LoadModelRequest {
     /// The runtime load request: the weight format (`bf16` = none, `q4`, `q8`, `nvfp4`), the
-    /// CUDA-graph switch, the draft model and the prefix-cache budget reach the runtime's
-    /// `LoadSpec` unchanged.
+    /// CUDA-graph switch, the draft model, the companion MTP head and the prefix-cache budget reach
+    /// the runtime's `LoadSpec` unchanged.
     pub(crate) fn load_spec(&self) -> LoadSpec {
         LoadSpec {
             source: self.source.clone(),
@@ -514,7 +521,7 @@ impl LoadModelRequest {
             cuda_graphs: self.cuda_graphs,
             draft_source: self.draft_source.clone(),
             prefix_cache_bytes: self.prefix_cache_bytes,
-            // REPIN(sc-24444): mtp_head_source: self.mtp_head_source.clone(),
+            mtp_head_source: self.mtp_head_source.clone(),
         }
     }
 }
@@ -1694,6 +1701,9 @@ pub struct LoadedModelStatus {
     /// budget is `load_report.prefix_cache_bytes`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix_cache_bytes: Option<u64>,
+    /// The companion MTP head the load REQUESTED (a refusal is in `load_report.fallbacks`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtp_head_source: Option<String>,
     pub provider: ProviderSummary,
     /// What the load produced, as the runtime reports it (`None` when it does not).
     pub load_report: Option<LoadReportPayload>,
@@ -1780,6 +1790,9 @@ pub struct LoadReportPayload {
     pub projections: Vec<ProjectionReportPayload>,
     /// The CUDA-graph switch the load settled (`None` where the provider does not use it).
     pub cuda_graphs: Option<bool>,
+    /// Every requested accelerator the load did not attach, each leading with the feature
+    /// (`mtp_head: …`, `cuda_graphs: …`); empty when everything requested was attached.
+    pub fallbacks: Vec<String>,
     /// The cross-turn prefix cache's byte budget the load settled (`Some(0)` = off; `None` where
     /// the provider has no prefix cache).
     pub prefix_cache_bytes: Option<u64>,
@@ -1796,6 +1809,7 @@ impl From<LoadReport> for LoadReportPayload {
                 .map(ProjectionReportPayload::from)
                 .collect(),
             cuda_graphs: value.cuda_graphs,
+            fallbacks: value.fallbacks,
             prefix_cache_bytes: value.prefix_cache_bytes,
             draft: value.draft.map(DraftReportPayload::from),
         }
@@ -1865,8 +1879,11 @@ pub struct DecodeReportPayload {
     /// `device` | `host:<reason>` | `none`.
     pub sampler: String,
     pub kv_cache: String,
+    /// `gqa` | `expanded` | `decode_attention` (Candle's length-aware decode attention).
     pub attention: String,
     pub cuda_graphs: CudaGraphsReportPayload,
+    /// Which graph path served the steps: `captured` | `eager` | `none`.
+    pub graph_path: String,
     pub nvfp4_projections: PathReportPayload,
     pub fused_primitives: PathReportPayload,
     pub target_forwards: u64,
@@ -1897,6 +1914,7 @@ impl From<DecodeReport> for DecodeReportPayload {
             kv_cache: value.kv_cache,
             attention: value.attention,
             cuda_graphs: CudaGraphsReportPayload::from(value.cuda_graphs),
+            graph_path: value.graph_path,
             nvfp4_projections: PathReportPayload::from(value.nvfp4_projections),
             fused_primitives: PathReportPayload::from(value.fused_primitives),
             target_forwards: value.target_forwards,
@@ -2180,6 +2198,7 @@ mod tests {
                 cuda_graphs: None,
                 draft_source: None,
                 prefix_cache_bytes: None,
+                mtp_head_source: None,
             })
             .unwrap();
         assert_eq!(status.loaded.unwrap().name, "fake-model");
@@ -2232,6 +2251,7 @@ mod tests {
             cuda_graphs: None,
             draft_source: None,
             prefix_cache_bytes: None,
+            mtp_head_source: None,
         }
     }
 
@@ -2441,6 +2461,7 @@ mod tests {
                 cuda_graphs: None,
                 draft_source: None,
                 prefix_cache_bytes: None,
+                mtp_head_source: None,
             })
             .unwrap();
         let err = engine.generate(request, |_| {}).unwrap_err();
@@ -2699,6 +2720,7 @@ mod tests {
                     cuda_graphs,
                     draft_source: None,
                     prefix_cache_bytes: None,
+                    mtp_head_source: None,
                 })
                 .unwrap();
             assert_eq!(
@@ -2734,13 +2756,16 @@ mod tests {
         // runtime's `LoadSpec`; omitted, no draft loads and the runtime's default budget applies.
         assert_eq!(omitted.load_spec().draft_source, None);
         assert_eq!(omitted.load_spec().prefix_cache_bytes, None);
+        assert_eq!(omitted.load_spec().mtp_head_source, None);
         let options: LoadModelRequest = serde_json::from_value(serde_json::json!({
-            "source": "/tmp/m", "draft_source": "/tmp/draft", "prefix_cache_bytes": 0
+            "source": "/tmp/m", "draft_source": "/tmp/draft", "prefix_cache_bytes": 0,
+            "mtp_head_source": "/tmp/mtp-head"
         }))
         .unwrap();
         let spec = options.load_spec();
         assert_eq!(spec.draft_source.as_deref(), Some("/tmp/draft"));
         assert_eq!(spec.prefix_cache_bytes, Some(0));
+        assert_eq!(spec.mtp_head_source.as_deref(), Some("/tmp/mtp-head"));
     }
 
     /// Epic sc-24432: the load's draft model and prefix-cache budget reach the status twice — as
@@ -2766,6 +2791,7 @@ mod tests {
                     cuda_graphs: None,
                     draft_source: Some(draft.to_string()),
                     prefix_cache_bytes: Some(64 << 20),
+                    mtp_head_source: None,
                 })
                 .unwrap()
                 .loaded
@@ -2777,7 +2803,43 @@ mod tests {
             let reported = report.draft.expect("the runtime's draft report");
             assert_eq!(reported.source, draft);
             assert_eq!(reported.refusal.as_deref(), refusal);
+            assert!(report.fallbacks.is_empty(), "{:?}", report.fallbacks);
         }
+    }
+
+    /// Epic sc-24432: the companion MTP head reaches the status as requested, and every
+    /// accelerator the load did not attach reaches it verbatim in the load report's `fallbacks`
+    /// (`mtp_head: …`, `cuda_graphs: …`) — the strings the CUDA-graph toggle and the status show.
+    #[test]
+    fn the_mtp_head_and_load_fallbacks_reach_the_model_status() {
+        use crate::test_support::recording_loader;
+        let engine = EngineHandle::spawn_with_loader(recording_loader);
+        let loaded = engine
+            .load_model(LoadModelRequest {
+                source: "/tmp/sc-24445-mtp-head-target".to_string(),
+                display_name: None,
+                quantize: None,
+                projector_source: None,
+                cuda_graphs: Some(true),
+                draft_source: None,
+                prefix_cache_bytes: None,
+                mtp_head_source: Some("/tmp/sc-24445-mtp-head".to_string()),
+            })
+            .unwrap()
+            .loaded
+            .unwrap();
+        assert_eq!(
+            loaded.mtp_head_source.as_deref(),
+            Some("/tmp/sc-24445-mtp-head")
+        );
+        let fallbacks = loaded.load_report.unwrap().fallbacks;
+        assert_eq!(fallbacks.len(), 2, "{fallbacks:?}");
+        assert_eq!(fallbacks[0], "cuda_graphs: positions_host_scalar");
+        assert!(
+            fallbacks[1].starts_with("mtp_head: ")
+                && fallbacks[1].contains("/tmp/sc-24445-mtp-head"),
+            "{fallbacks:?}"
+        );
     }
 
     /// AC3 (sc-24139): the runtime's decode report reaches the generate response and the model
@@ -2799,6 +2861,7 @@ mod tests {
                 cuda_graphs: Some(true),
                 draft_source: None,
                 prefix_cache_bytes: None,
+                mtp_head_source: None,
             })
             .unwrap();
         let loaded = status.loaded.unwrap();
@@ -2866,6 +2929,7 @@ mod tests {
                 cuda_graphs: Some(true),
                 draft_source: None,
                 prefix_cache_bytes: None,
+                mtp_head_source: None,
             })
             .unwrap()
             .loaded
@@ -2899,6 +2963,7 @@ mod tests {
                 cuda_graphs: Some(true),
                 draft_source: Some("/models/qwen3-0.6b".to_string()),
                 prefix_cache_bytes: Some(1 << 30),
+                mtp_head_source: Some("/models/qwen3.8-27b-mtp".to_string()),
             })
             .unwrap();
         engine.generate(hello_request(), |_| {}).unwrap();
@@ -2930,6 +2995,7 @@ mod tests {
                 "cuda_graphs": loaded["cuda_graphs"],
                 "draft_source": loaded["draft_source"],
                 "prefix_cache_bytes": loaded["prefix_cache_bytes"],
+                "mtp_head_source": loaded["mtp_head_source"],
                 "load_report": loaded["load_report"],
                 "last_decode": loaded["last_decode"],
                 "decode_reported": loaded["decode_reported"],
@@ -2960,6 +3026,7 @@ mod tests {
                 cuda_graphs: Some(true),
                 draft_source: None,
                 prefix_cache_bytes: None,
+                mtp_head_source: None,
             })
             .unwrap_err();
         assert!(
@@ -2987,6 +3054,7 @@ mod tests {
                 cuda_graphs: None,
                 draft_source: None,
                 prefix_cache_bytes: None,
+                mtp_head_source: None,
             })
             .unwrap();
         engine

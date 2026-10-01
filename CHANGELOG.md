@@ -25,9 +25,14 @@ Release notes for ChatWorks. The newest unreleased changes come first.
 - Conversations saved with a legacy speculative value the old schema refused (`enabled` with 0
   draft tokens, or an unknown mode) open and use the app setting instead of failing to load.
 - Models can be loaded with a draft model (another registered model, for draft-model
-  speculation) and a prefix-cache budget (blank = the runtime's default, 0 = off), set per model
-  on the Models screen. The decode-path status shows whether the draft is resident or refused
-  (with the runtime's reason) and the prefix-cache budget the load settled.
+  speculation), a companion MTP head (a predictor-only artifact for a model that ships none, such
+  as a packed checkpoint) and a prefix-cache budget (blank = the runtime's default, 0 = off), set
+  per model on the Models screen. The decode-path status shows whether the draft is resident or
+  refused (with the runtime's reason), every accelerator the load did not attach (`mtp_head: …`,
+  `cuda_graphs: …`), the graph path a generation took, and the prefix-cache budget the load
+  settled. Candle's length-aware decode attention is shown by name.
+- The CUDA-graphs toggle now knows at load time when the served model's decoder cannot be
+  captured (the runtime's `cuda_graphs: …` load fallback), before any generation runs.
 - **Downgrade note:** settings are now written as schema version 2 with a `speculative` field
   instead of `mtpMode` / `mtpDraftTokens`. An older ChatWorks reading a version-2 file finds no
   `mtpMode`, falls back to its own default, and its next save drops `speculative` — the choice is

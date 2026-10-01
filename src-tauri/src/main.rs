@@ -264,12 +264,14 @@ fn set_model_load_options(
     model_id: String,
     draft_source: Option<String>,
     prefix_cache_bytes: Option<u64>,
+    mtp_head_source: Option<String>,
 ) -> Result<ModelRegistry, String> {
     chatworks::model_registry::set_model_load_options(
         &app,
         &model_id,
         draft_source,
         prefix_cache_bytes,
+        mtp_head_source,
     )
 }
 

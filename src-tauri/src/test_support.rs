@@ -48,6 +48,7 @@ pub fn fake_decode_report() -> DecodeReport {
             captured: 0,
             fallback_reason: Some("deltanet_state_unstable".to_string()),
         },
+        graph_path: "eager".to_string(),
         nvfp4_projections: PathReport {
             path: "mixed".to_string(),
             reason: Some("rows".to_string()),
@@ -103,6 +104,22 @@ pub fn recording_loader(spec: &LoadSpec) -> crate::core_llm::Result<Box<dyn Text
         }],
         // Settled like the Candle runtime: the request, else its default (off).
         cuda_graphs: Some(spec.cuda_graphs.unwrap_or(false)),
+        // Like a Qwen3.5/3.8 decoder on the Candle runtime: with the switch on, the step cannot
+        // be captured (its `graph_support` refusal), and a companion head is refused because the
+        // fake already carries its own MTP predictor — both in the runtime's own wording.
+        fallbacks: [
+            (spec.cuda_graphs == Some(true))
+                .then(|| "cuda_graphs: positions_host_scalar".to_string()),
+            spec.mtp_head_source.as_ref().map(|head| {
+                format!(
+                    "mtp_head: the target already carries its own MTP predictor (`{head}`); \
+                     the model loaded without a companion head"
+                )
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
         // The requested budget settles unchanged (no headroom clamp in the fake).
         prefix_cache_bytes: spec.prefix_cache_bytes,
         // A named draft is resident unless its source names a refusal.

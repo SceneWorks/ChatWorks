@@ -1083,6 +1083,7 @@ fn decode_from(value: &Value) -> Option<DecodeReportPayload> {
             captured: graphs["captured"].as_u64().unwrap_or(0),
             fallback_reason: graphs["fallback_reason"].as_str().map(str::to_string),
         },
+        graph_path: text("graph_path").unwrap_or_default(),
         nvfp4_projections: path("nvfp4_projections"),
         fused_primitives: path("fused_primitives"),
         target_forwards: count("target_forwards"),

@@ -39,6 +39,7 @@ fn qwen35_vision_over_openai_server() {
             cuda_graphs: None,
             draft_source: None,
             prefix_cache_bytes: None,
+            mtp_head_source: None,
         })
         .expect("load 27B");
     // The provider must advertise vision once loaded (the VLM checkpoint carries model.visual.*).
