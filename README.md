@@ -135,8 +135,9 @@ for the Tauri app.
 The desktop sends the chat's speculative-decoding choice explicitly, as the runtime's
 proposer-agnostic option: `"off"`, `"auto"` (the model's MTP head where it has one, else prompt
 lookup), or `{"proposer": "mtp" | "prompt_lookup" | "draft_model", "depth": N}`. Only the proposers
-the loaded model advertises are offered, and the depth is clamped to that proposer's advertised
-maximum. A fresh chat takes the choice from Settings; a Settings value that was never chosen
+the loaded model advertises are offered; a saved proposer the model does not advertise runs
+`"off"`. A saved depth is kept as saved, and the request clamps it to that proposer's advertised
+maximum (the control notes the depth it runs at). A fresh chat takes the choice from Settings; a Settings value that was never chosen
 follows the runtime's own default (ChatWorks keeps no per-backend copy), shown beside
 "Runtime default". When no choice is known yet (for example, before the settings have loaded),
 the desktop leaves `speculative` out and the server applies the saved setting. API clients may
@@ -154,7 +155,10 @@ Removing an attachment, switching conversations, or leaving the chat cancels its
 Native URL cancellation closes the download, kills/reaps an owned decoder, and removes staging
 files. Models exposes **Unload model**, available after UI generation stops; it also cancels an
 external API generation before unloading. Registered files and the saved model selection remain
-available for reloading. When you load the served model again (**Reload** after a CUDA-graph
+available for reloading. Each registered model can name a draft model (another registered model
+sharing its tokenizer, for `draft_model` speculation) and a prefix-cache budget in MiB (blank = the
+runtime's default, `0` = off); both apply on its next load, and the decode-path status shows whether
+the draft is resident or refused (with the runtime's reason) and the budget the load settled. When you load the served model again (**Reload** after a CUDA-graph
 change, or the same snapshot in another weight format), the engine unloads the resident copy
 first, so two copies never have to fit on the device. A different model loads beside the served
 one, so a failed switch keeps serving the old model. The exception is a runtime memory refusal:

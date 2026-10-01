@@ -3,7 +3,8 @@ import test from "node:test";
 import { chatRequestBody, toOpenAiMessage } from "../src/api/sse.js";
 import { paramsFromConversation, paramsToConversation } from "../src/state/conversations.js";
 import {
-  applySamplingPreset, clampSpeculativeDepth, generationParams, generationSettings, speculativeOptions,
+  applySamplingPreset, clampSpeculativeDepth, generationParams, generationSettings, speculativeDepthNote,
+  speculativeOptions,
 } from "../src/state/generation.js";
 import { appendAttachmentPlaceholders, settleAttachment, registerPreparation } from "../src/state/attachments.js";
 import { isExactGgufUrl, modelSubtitle, unloadServedModel } from "../src/state/models.js";
@@ -63,16 +64,31 @@ test("explicit native controls survive conversation persistence and request mapp
   assert.equal(body.seed, 42);
 });
 
-test("sc-24445: the depth is clamped to the proposer's advertised max_depth, and an unadvertised proposer is never sent", () => {
+test("sc-24445: the depth is clamped to the proposer's advertised max_depth, and an unadvertised proposer runs off", () => {
   assert.deepEqual(request({ speculativeMode: "prompt_lookup", speculativeDepth: "12" }).speculative,
     { proposer: "prompt_lookup", depth: 7 });
   assert.deepEqual(request({ speculativeMode: "prompt_lookup", speculativeDepth: "2" }).speculative,
     { proposer: "prompt_lookup", depth: 2 });
-  assert.equal(Object.hasOwn(request({ speculativeMode: "draft_model", speculativeDepth: "2" }), "speculative"), false);
+  // One rule with the server's inherited path: a proposer the model does not advertise runs off.
+  assert.equal(request({ speculativeMode: "draft_model", speculativeDepth: "2" }).speculative, "off");
   assert.equal(clampSpeculativeDepth(0, { max_depth: 7 }), 1);
   assert.equal(clampSpeculativeDepth(9, { max_depth: 7 }), 7);
   assert.equal(clampSpeculativeDepth(9, null), 9, "no model in view: only the lower bound");
   assert.throws(() => generationSettings({ ...generationParams(), speculativeMode: "mtp", speculativeDepth: "0" }), /at least 1/);
+});
+
+test("sc-24445: a saved depth above the model's max is kept as saved, with a note naming the depth it runs at", () => {
+  const capability = { proposer: "prompt_lookup", max_depth: 7 };
+  assert.equal(speculativeDepthNote("12", capability), "Runs at 7 on this model (it advertises up to 7).");
+  assert.equal(speculativeDepthNote("7", capability), null);
+  assert.equal(speculativeDepthNote("3", capability), null);
+  assert.equal(speculativeDepthNote("12", null), null, "no model in view: nothing to clamp against");
+  assert.equal(speculativeDepthNote("", capability), null);
+  // The saved preference itself is never rewritten: it persists as entered, only the request clamps.
+  const params = { ...generationParams(), speculativeMode: "prompt_lookup", speculativeDepth: "12" };
+  assert.deepEqual(generationSettings(params).speculative, { proposer: "prompt_lookup", depth: 12 });
+  assert.deepEqual(paramsToConversation(params).speculative, { proposer: "prompt_lookup", depth: 12 });
+  assert.deepEqual(request(params).speculative, { proposer: "prompt_lookup", depth: 7 });
 });
 
 test("sc-24445: the control offers the inherited default, off, auto and only the advertised proposers", () => {

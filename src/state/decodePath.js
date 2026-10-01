@@ -5,6 +5,8 @@
 // `loaded.last_decode` (which path the most recent generation took). Nothing here guesses a path
 // the runtime did not report.
 
+import { formatBytes } from "./models.js";
+
 /// NVFP4 is lossy: on Qwen3.8-27B it measured +7.37% perplexity against bf16, above the epic's 2%
 /// gate for a default-eligible format. It is offered, labelled as such, and never preselected.
 export const NVFP4_LOSSY_NOTE =
@@ -65,18 +67,14 @@ export function serveAction(isServed, reloadPending) {
 }
 
 /// Why the SERVED model cannot capture CUDA graphs, in the runtime's words, or `null` (sc-24445).
-/// The runtime says so three ways: a load fallback naming `cuda_graphs` (its load report), a load
-/// that settled no switch at all for a provider that never routes decode steps through the graph
-/// runner (`cuda_graphs: null` on a host that offers the switch), and a generation that ran with
-/// graphs on yet replayed nothing — eager, with the runtime's fallback reason (for example
-/// `moe_router_host_read`).
+/// The reason always comes from the runtime, in two places: a load fallback the runtime names
+/// `cuda_graphs: …` (its load report's `fallbacks`, the agreed load-time format), shown verbatim,
+/// and a generation that ran with graphs on yet replayed nothing — eager, with the runtime's
+/// fallback reason (for example `moe_router_host_read`). Without one of those, nothing is refused.
 export function servedModelGraphRefusal(loaded) {
   if (!loaded) return null;
-  const loadFallback = (loaded.load_report?.fallbacks ?? []).find((item) => item.startsWith("cuda_graphs"));
+  const loadFallback = (loaded.load_report?.fallbacks ?? []).find((item) => item.startsWith("cuda_graphs:"));
   if (loadFallback) return loadFallback;
-  if (loaded.load_report && loaded.cuda_graphs == null) {
-    return "cuda_graphs: the served model's provider does not route decode steps through the CUDA-graph runner (its load settled no switch)";
-  }
   const graphs = loaded.last_decode?.cuda_graphs;
   const eager = loaded.last_decode?.graph_path != null
     ? loaded.last_decode.graph_path === "eager"
@@ -88,15 +86,16 @@ export function servedModelGraphRefusal(loaded) {
 }
 
 /// The CUDA-graph toggle: disabled with the runtime's reason where the switch is unavailable on
-/// this host or the served model cannot capture (sc-24445), and flagged when the served model was
-/// loaded under a different saved setting (the Models screen then offers "Reload" on the served
-/// model).
+/// this host, and — where the served model cannot capture (sc-24445) — disabled only for turning it
+/// ON: a saved ON stays switchable off, with the runtime's reason shown. Flagged when the served
+/// model was loaded under a different saved setting (the Models screen then offers "Reload" on the
+/// served model).
 export function cudaGraphsControl(capabilities, savedSetting, loaded) {
   const graphs = feature(capabilities, "cuda_graphs");
   const modelRefusal = graphs.supported ? servedModelGraphRefusal(loaded) : null;
   const pendingReload = !modelRefusal && graphsReloadPending(capabilities, savedSetting, loaded);
   return {
-    disabled: !graphs.supported || modelRefusal != null,
+    disabled: !graphs.supported || (modelRefusal != null && !savedSetting),
     reason: graphs.supported ? modelRefusal : graphs.reason,
     pendingReload,
     note: pendingReload
@@ -141,6 +140,19 @@ function graphSwitchValue(loaded) {
     return { value: "not used", detail: "This runtime/provider does not take the CUDA-graph switch." };
   }
   return { value: loaded.cuda_graphs ? "on" : "off", detail: "Settled by the runtime at load." };
+}
+
+/// The draft model the load named (epic sc-24432): resident, or refused with the runtime's reason.
+function draftValue(draft) {
+  return draft.refusal
+    ? { value: "refused", detail: `${draft.source}: ${draft.refusal}` }
+    : { value: "resident", detail: draft.source };
+}
+
+/// The prefix-cache budget the load settled (epic sc-24432), beside the budget it asked for.
+function prefixBudgetValue(settled, requested) {
+  const asked = requested == null ? "Requested the runtime default" : `Requested ${requested === 0 ? "off" : formatBytes(requested)}`;
+  return { value: settled === 0 ? "off" : formatBytes(settled), detail: `${asked}; settled by the runtime at load.` };
 }
 
 function proposerValue(decode) {
@@ -211,6 +223,17 @@ export function decodePathRows(engineStatus) {
   if (!loaded) return rows;
   rows.push({ key: "weights", label: "Weights", ...weightsValue(loaded), section: null });
   rows.push({ key: "graph_switch", label: "CUDA-graph switch", ...graphSwitchValue(loaded), section: null });
+  if (loaded.load_report?.draft) {
+    rows.push({ key: "draft", label: "Draft model", ...draftValue(loaded.load_report.draft), section: null });
+  }
+  if (typeof loaded.load_report?.prefix_cache_bytes === "number") {
+    rows.push({
+      key: "prefix_cache_budget",
+      label: "Prefix cache budget",
+      ...prefixBudgetValue(loaded.load_report.prefix_cache_bytes, loaded.prefix_cache_bytes),
+      section: null,
+    });
+  }
   const decode = loaded.last_decode;
   const last = (row) => rows.push({ ...row, section: LAST_GENERATION });
   if (!decode) {

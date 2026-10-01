@@ -22,9 +22,10 @@ const API_AUTH_KEYCHAIN_USER: &str = "api-auth-token";
 ///   speculative value at all follows the runtime's default ([`runtime_speculative_default`]),
 ///   never a ChatWorks-side per-backend copy (epic sc-24432 E5).
 /// * **Version 1 (sc-24139)** marked files written after the speculative default stopped being `off`
-///   everywhere. Before it every save serialized `mtpMode`, so a version-0 `"mtpMode": "off"`
-///   cannot be told apart from "the user chose off": it is honoured as written. Where the runtime's
-///   default is not `off`, such a carried-over `off` is flagged
+///   everywhere. Every pre-version-2 save serialized `mtpMode` — including an MLX version-1 `off`
+///   that was almost always the untouched default — so a pre-version-2 `"mtpMode": "off"` cannot be
+///   told apart from "the user chose off": it is honoured as written. Where the runtime's default is
+///   not `off`, such a carried-over `off` is flagged
 ///   ([`NoticeSettings::speculative_off_carried_over`]) so the UI can offer — once, dismissibly —
 ///   to turn on Auto, without ever changing the saved choice itself.
 pub const CURRENT_SETTINGS_VERSION: u32 = 2;
@@ -61,7 +62,7 @@ impl Default for AppSettings {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct NoticeSettings {
-    /// Speculative decoding is `off` only because a pre-marker settings file carried `off` over
+    /// Speculative decoding is `off` only because a pre-version-2 settings file carried `off` over
     /// where the runtime's default is not `off` (see [`CURRENT_SETTINGS_VERSION`]). Set by the
     /// migration; cleared as soon as the option is anything but `off`, so a later explicit `off`
     /// never re-raises the notice.
@@ -93,11 +94,11 @@ impl AppSettings {
     }
 
     /// [`from_stored_json`](Self::from_stored_json) against a runtime speculative default, which
-    /// decides whether a pre-marker `off` was carried over rather than chosen under that default.
+    /// decides whether a pre-version-2 `off` was carried over rather than chosen under that default.
     pub fn from_stored_json_for(body: &str, runtime_default: Speculative) -> Result<Self, String> {
         let mut settings =
             serde_json::from_str::<AppSettings>(body).map_err(|error| error.to_string())?;
-        if settings.settings_version == 0
+        if settings.settings_version < 2
             && settings.sampling.legacy_mtp_mode.as_deref() == Some("off")
             && runtime_default != Speculative::Off
         {
@@ -583,11 +584,11 @@ mod tests {
         );
     }
 
-    /// A pre-marker `off` kept by the migration where the runtime's default is not `off` is
-    /// flagged as carried over (the UI then offers Auto, once) — while the saved `off` itself is
-    /// untouched. Nothing is flagged where the runtime's default is `off`, for a post-marker `off`,
-    /// or for any other saved mode; the flag and a dismissal persist through a save, and moving off
-    /// `off` clears the flag for good.
+    /// A pre-version-2 `off` (version 0 or 1) kept by the migration where the runtime's default is
+    /// not `off` is flagged as carried over (the UI then offers Auto, once) — while the saved `off`
+    /// itself is untouched. Nothing is flagged where the runtime's default is `off`, for a version-2
+    /// `off`, or for any other saved mode; the flag and a dismissal persist through a save, and
+    /// moving off `off` clears the flag for good.
     #[test]
     fn a_carried_over_off_is_flagged_for_the_speculative_notice() {
         let legacy = r#"{"server":{},"sampling":{"mtpMode":"off","mtpDraftTokens":3}}"#;
@@ -600,10 +601,16 @@ mod tests {
         assert!(migrated.notices.speculative_off_carried_over);
         assert!(!migrated.notices.speculative_notice_dismissed);
 
+        // An MLX version-1 `off` is almost always the untouched default: flagged too.
+        let v1 = r#"{"settingsVersion":1,"sampling":{"mtpMode":"off"}}"#;
+        let v1 = AppSettings::from_stored_json_for(v1, Speculative::Auto).unwrap();
+        assert_eq!(v1.sampling.speculative, Some(Speculative::Off));
+        assert!(v1.notices.speculative_off_carried_over);
+
         for (body, runtime_default) in [
             (legacy, Speculative::Off),
             (
-                r#"{"settingsVersion":1,"sampling":{"mtpMode":"off"}}"#,
+                r#"{"settingsVersion":2,"sampling":{"speculative":"off"}}"#,
                 Speculative::Auto,
             ),
             (r#"{"sampling":{"mtpMode":"enabled"}}"#, Speculative::Auto),

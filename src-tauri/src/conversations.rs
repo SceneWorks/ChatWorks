@@ -86,11 +86,17 @@ impl ConversationParams {
     /// Map a saved conversation's pre-sc-24445 `mtpMode` / `mtpDraftTokens` onto
     /// [`speculative`](Self::speculative) (the same mapping as the app settings) when it carries no
     /// speculative option of its own, then drop the legacy fields.
+    ///
+    /// Unlike the app settings, a conversation never refuses a legacy value: a transcript must
+    /// always open. A legacy value the old schema itself would have refused (`enabled` with `0`
+    /// drafts, which the old UI could save, or an unknown mode) carries no choice, so the
+    /// conversation uses the app setting (`None`).
     fn migrate_legacy_speculative(&mut self) -> Result<(), String> {
         let legacy = crate::app_settings::legacy_speculative(
             self.legacy_mtp_mode.take().as_deref(),
             self.legacy_mtp_draft_tokens.take(),
-        )?;
+        )
+        .unwrap_or(None);
         if self.speculative.is_none() {
             self.speculative = legacy;
         }
@@ -438,6 +444,9 @@ mod tests {
                 json!({"speculative": {"proposer": "prompt_lookup", "depth": 5}}),
                 Some(Speculative::proposer(SpeculativeProposer::PromptLookup, 5)),
             ),
+            // Legacy values the old schema refused still open, using the app setting.
+            (json!({"mtpMode": "enabled", "mtpDraftTokens": 0}), None),
+            (json!({"mtpMode": "bogus"}), None),
         ]
         .into_iter()
         .enumerate()
@@ -479,6 +488,74 @@ mod tests {
             );
         }
         assert_eq!(ConversationParams::default().speculative, None);
+    }
+
+    /// A pre-sc-24445 conversation with a legacy value the old schema refused, and no `.meta`
+    /// sidecar, still opens and is listed (never silently dropped from the history).
+    #[test]
+    fn legacy_conversations_with_refused_mtp_values_open_and_are_listed() {
+        let dir = TempDir::new("conversations-legacy-refused");
+        for (id, params) in [
+            (
+                "zero-drafts",
+                json!({"mtpMode": "enabled", "mtpDraftTokens": 0}),
+            ),
+            ("bogus-mode", json!({"mtpMode": "bogus"})),
+        ] {
+            let stored = json!({
+                "id": id,
+                "title": id,
+                "createdAt": 1,
+                "updatedAt": 1,
+                "params": params,
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            fs::write(
+                conversation_file_path(dir.path(), id),
+                serde_json::to_string(&stored).unwrap(),
+            )
+            .unwrap();
+        }
+        let listed: Vec<String> = list_conversations_in_dir(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|meta| meta.id)
+            .collect();
+        assert_eq!(listed, ["bogus-mode", "zero-drafts"]);
+        for id in ["zero-drafts", "bogus-mode"] {
+            let loaded = get_conversation_in_dir(dir.path(), id).unwrap();
+            assert_eq!(loaded.params.speculative, None, "{id}");
+        }
+    }
+
+    /// The save path migrates legacy fields too: a conversation handed to save with a legacy
+    /// `mtpMode` is written with the speculative option and without the legacy fields.
+    #[test]
+    fn save_migrates_legacy_mtp_fields_onto_the_speculative_option() {
+        use crate::core_llm::{Speculative, SpeculativeProposer};
+        let dir = TempDir::new("conversations-save-legacy");
+        let mut conversation = empty_conversation("save-legacy");
+        conversation.params.legacy_mtp_mode = Some("enabled".to_string());
+        conversation.params.legacy_mtp_draft_tokens = Some(5);
+        let saved = save_conversation_in_dir(dir.path(), conversation).unwrap();
+        assert_eq!(
+            saved.params.speculative,
+            Some(Speculative::proposer(SpeculativeProposer::Mtp, 5))
+        );
+        let on_disk: Value = serde_json::from_str(
+            &fs::read_to_string(conversation_file_path(dir.path(), "save-legacy")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            on_disk["params"]["speculative"],
+            json!({"proposer": "mtp", "depth": 5}),
+            "{on_disk}"
+        );
+        assert!(on_disk["params"].get("mtpMode").is_none(), "{on_disk}");
+        assert!(
+            on_disk["params"].get("mtpDraftTokens").is_none(),
+            "{on_disk}"
+        );
     }
 
     use crate::fsutil::{TempDir, TEMP_FILE_SUFFIX};

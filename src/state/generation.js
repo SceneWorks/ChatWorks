@@ -41,10 +41,19 @@ export function clampSpeculativeDepth(depth, capability) {
   return capability ? Math.min(value, Math.max(1, capability.max_depth)) : value;
 }
 
+/// Why the saved depth is not the one the model runs, or `null`: a saved depth above the proposer's
+/// advertised `max_depth` stays the user's saved preference and runs clamped (sc-24445).
+export function speculativeDepthNote(depth, capability) {
+  const number = Number(depth);
+  if (!capability || depth === "" || depth == null || !Number.isInteger(number) || number < 1) return null;
+  const runs = clampSpeculativeDepth(number, capability);
+  return runs === number ? null : `Runs at ${runs} on this model (it advertises up to ${capability.max_depth}).`;
+}
+
 /// The speculative choices the control offers: the inherited default, `off`, `auto`, then every
 /// proposer the loaded model advertises (all of them where no model is in view, as in Settings).
-/// A saved proposer the model does not advertise stays visible, marked unavailable, and is never
-/// sent.
+/// A saved proposer the model does not advertise stays visible, marked unavailable; a request
+/// with it runs `off` ([`speculativeRequest`]).
 export function speculativeOptions(capabilities, selected = "", defaults = false, runtimeDefault = null) {
   const advertised = defaults
     ? SPECULATIVE_PROPOSERS
@@ -137,11 +146,12 @@ function speculativeSetting(params) {
 
 /// The request's speculative option against the loaded model: `off` and `auto` always (the runtime
 /// resolves `auto` to what the model offers and names any fallback); a proposer only when the model
-/// advertises it, its depth clamped to that proposer's `max_depth`.
+/// advertises it, its depth clamped to that proposer's `max_depth`. A proposer the model does not
+/// advertise runs `off` — the same rule the server applies to an inherited one.
 export function speculativeRequest(speculative, capabilities) {
   if (speculative === undefined || typeof speculative === "string") return speculative;
   const capability = proposerCapability(capabilities, speculative.proposer);
-  if (!capability) return undefined;
+  if (!capability) return "off";
   return { proposer: speculative.proposer, depth: clampSpeculativeDepth(speculative.depth, capability) };
 }
 

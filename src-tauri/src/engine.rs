@@ -261,6 +261,8 @@ impl EngineActor {
             display_name: request.display_name,
             quantize: request.quantize,
             projector_source: request.projector_source,
+            draft_source: request.draft_source,
+            prefix_cache_bytes: request.prefix_cache_bytes,
             provider,
             descriptor,
             load_report,
@@ -423,6 +425,8 @@ struct LoadedModel {
     display_name: Option<String>,
     quantize: Option<QuantizeRequest>,
     projector_source: Option<String>,
+    draft_source: Option<String>,
+    prefix_cache_bytes: Option<u64>,
     provider: Box<dyn TextLlm>,
     descriptor: TextLlmDescriptor,
     load_report: Option<LoadReportPayload>,
@@ -441,6 +445,8 @@ impl LoadedModel {
             quantize: self.quantize,
             cuda_graphs: self.settled_cuda_graphs(),
             projector_source: self.projector_source.clone(),
+            draft_source: self.draft_source.clone(),
+            prefix_cache_bytes: self.prefix_cache_bytes,
             provider: ProviderSummary::from(self.descriptor.clone()),
             load_report: self.load_report.clone(),
             last_decode: self.last_decode.clone(),
@@ -481,18 +487,34 @@ pub struct LoadModelRequest {
     /// change applies to the next load.
     #[serde(default)]
     pub cuda_graphs: Option<bool>,
+    /// An optional draft model loaded beside the target for `draft_model` speculation
+    /// (`LoadSpec::draft_source`, epic sc-24432). `None` loads no draft. A draft never fails the
+    /// load: the runtime names it resident or refused (with its reason) in the load report.
+    #[serde(default)]
+    pub draft_source: Option<String>,
+    /// The cross-turn prefix cache's byte budget (`LoadSpec::prefix_cache_bytes`, epic sc-24432):
+    /// `None` keeps the runtime's default, `Some(0)` turns the cache off. The runtime clamps it to
+    /// the headroom its load admission leaves and reports the settled budget.
+    #[serde(default)]
+    pub prefix_cache_bytes: Option<u64>,
+    // REPIN(sc-24444): the companion MTP head (`LoadSpec::mtp_head_source`) is not in the pinned
+    // runtime (c2c346be3). The re-pin pass adds `mtp_head_source: Option<String>` here, maps it in
+    // `load_spec` below, and exposes it beside the draft model on the Models screen.
 }
 
 impl LoadModelRequest {
-    /// The runtime load request: the weight format (`bf16` = none, `q4`, `q8`, `nvfp4`) and the
-    /// CUDA-graph switch reach the runtime's `LoadSpec` unchanged.
+    /// The runtime load request: the weight format (`bf16` = none, `q4`, `q8`, `nvfp4`), the
+    /// CUDA-graph switch, the draft model and the prefix-cache budget reach the runtime's
+    /// `LoadSpec` unchanged.
     pub(crate) fn load_spec(&self) -> LoadSpec {
         LoadSpec {
             source: self.source.clone(),
             projector_source: self.projector_source.clone(),
             quantize: self.quantize.map(Into::into),
             cuda_graphs: self.cuda_graphs,
-            ..LoadSpec::default()
+            draft_source: self.draft_source.clone(),
+            prefix_cache_bytes: self.prefix_cache_bytes,
+            // REPIN(sc-24444): mtp_head_source: self.mtp_head_source.clone(),
         }
     }
 }
@@ -1665,6 +1687,13 @@ pub struct LoadedModelStatus {
     pub cuda_graphs: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub projector_source: Option<String>,
+    /// The draft model the load REQUESTED (its fate is in `load_report.draft`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft_source: Option<String>,
+    /// The prefix-cache budget the load REQUESTED (`None` = the runtime's default); the settled
+    /// budget is `load_report.prefix_cache_bytes`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_cache_bytes: Option<u64>,
     pub provider: ProviderSummary,
     /// What the load produced, as the runtime reports it (`None` when it does not).
     pub load_report: Option<LoadReportPayload>,
@@ -2149,6 +2178,8 @@ mod tests {
                 quantize: None,
                 projector_source: None,
                 cuda_graphs: None,
+                draft_source: None,
+                prefix_cache_bytes: None,
             })
             .unwrap();
         assert_eq!(status.loaded.unwrap().name, "fake-model");
@@ -2199,6 +2230,8 @@ mod tests {
             quantize: None,
             projector_source: None,
             cuda_graphs: None,
+            draft_source: None,
+            prefix_cache_bytes: None,
         }
     }
 
@@ -2406,6 +2439,8 @@ mod tests {
                 quantize: None,
                 projector_source: None,
                 cuda_graphs: None,
+                draft_source: None,
+                prefix_cache_bytes: None,
             })
             .unwrap();
         let err = engine.generate(request, |_| {}).unwrap_err();
@@ -2662,6 +2697,8 @@ mod tests {
                     quantize,
                     projector_source: None,
                     cuda_graphs,
+                    draft_source: None,
+                    prefix_cache_bytes: None,
                 })
                 .unwrap();
             assert_eq!(
@@ -2693,6 +2730,54 @@ mod tests {
         let omitted: LoadModelRequest =
             serde_json::from_value(serde_json::json!({ "source": "/tmp/m" })).unwrap();
         assert_eq!(omitted.load_spec().cuda_graphs, None);
+        // Epic sc-24432 load options: the draft model and the prefix-cache budget reach the
+        // runtime's `LoadSpec`; omitted, no draft loads and the runtime's default budget applies.
+        assert_eq!(omitted.load_spec().draft_source, None);
+        assert_eq!(omitted.load_spec().prefix_cache_bytes, None);
+        let options: LoadModelRequest = serde_json::from_value(serde_json::json!({
+            "source": "/tmp/m", "draft_source": "/tmp/draft", "prefix_cache_bytes": 0
+        }))
+        .unwrap();
+        let spec = options.load_spec();
+        assert_eq!(spec.draft_source.as_deref(), Some("/tmp/draft"));
+        assert_eq!(spec.prefix_cache_bytes, Some(0));
+    }
+
+    /// Epic sc-24432: the load's draft model and prefix-cache budget reach the status twice — as
+    /// requested, and as the runtime settled them in its load report (a draft resident, or refused
+    /// with the runtime's reason).
+    #[test]
+    fn the_draft_and_prefix_cache_reach_the_model_status() {
+        use crate::test_support::recording_loader;
+        let engine = EngineHandle::spawn_with_loader(recording_loader);
+        for (draft, refusal) in [
+            ("/tmp/sc-24445-draft", None),
+            (
+                "/tmp/sc-24445-refused-draft",
+                Some("draft vocabulary is not the target's"),
+            ),
+        ] {
+            let loaded = engine
+                .load_model(LoadModelRequest {
+                    source: format!("{draft}-target"),
+                    display_name: None,
+                    quantize: None,
+                    projector_source: None,
+                    cuda_graphs: None,
+                    draft_source: Some(draft.to_string()),
+                    prefix_cache_bytes: Some(64 << 20),
+                })
+                .unwrap()
+                .loaded
+                .unwrap();
+            assert_eq!(loaded.draft_source.as_deref(), Some(draft));
+            assert_eq!(loaded.prefix_cache_bytes, Some(64 << 20));
+            let report = loaded.load_report.unwrap();
+            assert_eq!(report.prefix_cache_bytes, Some(64 << 20));
+            let reported = report.draft.expect("the runtime's draft report");
+            assert_eq!(reported.source, draft);
+            assert_eq!(reported.refusal.as_deref(), refusal);
+        }
     }
 
     /// AC3 (sc-24139): the runtime's decode report reaches the generate response and the model
@@ -2712,6 +2797,8 @@ mod tests {
                 quantize: Some(QuantizeRequest::Nvfp4),
                 projector_source: None,
                 cuda_graphs: Some(true),
+                draft_source: None,
+                prefix_cache_bytes: None,
             })
             .unwrap();
         let loaded = status.loaded.unwrap();
@@ -2777,6 +2864,8 @@ mod tests {
                 quantize: None,
                 projector_source: None,
                 cuda_graphs: Some(true),
+                draft_source: None,
+                prefix_cache_bytes: None,
             })
             .unwrap()
             .loaded
@@ -2808,6 +2897,8 @@ mod tests {
                 quantize: Some(QuantizeRequest::Nvfp4),
                 projector_source: None,
                 cuda_graphs: Some(true),
+                draft_source: Some("/models/qwen3-0.6b".to_string()),
+                prefix_cache_bytes: Some(1 << 30),
             })
             .unwrap();
         engine.generate(hello_request(), |_| {}).unwrap();
@@ -2837,6 +2928,8 @@ mod tests {
                 "source": loaded["source"],
                 "quantize": loaded["quantize"],
                 "cuda_graphs": loaded["cuda_graphs"],
+                "draft_source": loaded["draft_source"],
+                "prefix_cache_bytes": loaded["prefix_cache_bytes"],
                 "load_report": loaded["load_report"],
                 "last_decode": loaded["last_decode"],
                 "decode_reported": loaded["decode_reported"],
@@ -2865,6 +2958,8 @@ mod tests {
                 quantize: Some(QuantizeRequest::Nvfp4),
                 projector_source: None,
                 cuda_graphs: Some(true),
+                draft_source: None,
+                prefix_cache_bytes: None,
             })
             .unwrap_err();
         assert!(
@@ -2890,6 +2985,8 @@ mod tests {
                 quantize: None,
                 projector_source: None,
                 cuda_graphs: None,
+                draft_source: None,
+                prefix_cache_bytes: None,
             })
             .unwrap();
         engine

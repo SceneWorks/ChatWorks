@@ -10,10 +10,10 @@
 #![cfg(test)]
 
 use crate::core_llm::{
-    Channel, CudaGraphsReport, DecodeReport, FinishReason, GenerationTimings, LoadReport, LoadSpec,
-    MtpCapabilities, MtpStats, PathReport, ProjectionReport, ProposerKind, Quantize, StreamEvent,
-    TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingMode,
-    Usage,
+    Channel, CudaGraphsReport, DecodeReport, DraftReport, FinishReason, GenerationTimings,
+    LoadReport, LoadSpec, MtpCapabilities, MtpStats, PathReport, ProjectionReport, ProposerKind,
+    Quantize, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
+    TextLlmRequest, ThinkingMode, Usage,
 };
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -103,7 +103,16 @@ pub fn recording_loader(spec: &LoadSpec) -> crate::core_llm::Result<Box<dyn Text
         }],
         // Settled like the Candle runtime: the request, else its default (off).
         cuda_graphs: Some(spec.cuda_graphs.unwrap_or(false)),
-        ..LoadReport::default()
+        // The requested budget settles unchanged (no headroom clamp in the fake).
+        prefix_cache_bytes: spec.prefix_cache_bytes,
+        // A named draft is resident unless its source names a refusal.
+        draft: spec.draft_source.as_ref().map(|source| {
+            if source.contains("refused") {
+                DraftReport::refused(source, "draft vocabulary is not the target's")
+            } else {
+                DraftReport::resident(source)
+            }
+        }),
     });
     Ok(Box::new(provider))
 }

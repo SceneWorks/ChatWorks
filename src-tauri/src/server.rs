@@ -1729,6 +1729,8 @@ mod tests {
                 quantize: None,
                 projector_source: None,
                 cuda_graphs: None,
+                draft_source: None,
+                prefix_cache_bytes: None,
             })
             .unwrap();
         engine
@@ -1743,6 +1745,8 @@ mod tests {
                 quantize: None,
                 projector_source: None,
                 cuda_graphs: None,
+                draft_source: None,
+                prefix_cache_bytes: None,
             })
             .unwrap();
         engine
@@ -1757,6 +1761,8 @@ mod tests {
                 quantize: None,
                 projector_source: None,
                 cuda_graphs: None,
+                draft_source: None,
+                prefix_cache_bytes: None,
             })
             .unwrap();
         engine
@@ -2603,6 +2609,8 @@ mod tests {
                 quantize: None,
                 projector_source: None,
                 cuda_graphs: None,
+                draft_source: None,
+                prefix_cache_bytes: None,
             })
             .unwrap();
         let request = |prompt| {

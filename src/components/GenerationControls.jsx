@@ -1,4 +1,4 @@
-import { clampSpeculativeDepth, proposerCapability, speculativeOptions } from "../state/generation.js";
+import { proposerCapability, speculativeDepthNote, speculativeOptions } from "../state/generation.js";
 
 /// `speculativeLimits`: the capabilities whose per-proposer `max_depth` bounds the depth control
 /// when `capabilities` is null (Settings shows every control, bounded by the served model).
@@ -11,9 +11,9 @@ export function GenerationControls({
   const proposer = params.speculativeMode && !["off", "auto"].includes(params.speculativeMode)
     ? params.speculativeMode : null;
   const depthCapability = proposer ? proposerCapability(capabilities ?? speculativeLimits, proposer) : null;
-  // The depth control is clamped to what the model advertises for the chosen proposer (sc-24445).
-  const shownDepth = (value) => (value === "" || value == null ? "" : String(clampSpeculativeDepth(value, depthCapability)));
-  const changeDepth = (value) => onChange("speculativeDepth", shownDepth(value));
+  // The depth control shows (and saves) the user's own depth; where the model advertises less for
+  // the chosen proposer, a note says what it runs at (the request is clamped, sc-24445).
+  const depthNote = speculativeDepthNote(params.speculativeDepth, depthCapability);
   const recommendedEfforts = capabilities?.reasoning_efforts ?? ["low", "medium", "xhigh"];
   // A saved/API-supplied compatibility alias must remain visible and pass through unchanged even
   // when a model deliberately omits it from its recommended distinct levels.
@@ -45,8 +45,9 @@ export function GenerationControls({
         <div className="field">
           <label htmlFor={`${prefix}-speculative-depth`}>Draft depth</label>
           <input id={`${prefix}-speculative-depth`} type="number" min="1" step="1"
-            max={depthCapability?.max_depth} value={shownDepth(params.speculativeDepth)}
-            onChange={(event) => changeDepth(event.target.value)} />
+            value={params.speculativeDepth ?? ""}
+            onChange={(event) => onChange("speculativeDepth", event.target.value)} />
+          {depthNote && <small className="field-note">{depthNote}</small>}
         </div>
       )}
       {[["topK", "Top K", 0, 1], ["presencePenalty", "Presence penalty", undefined, 0.05], ["repetitionPenalty", "Repetition penalty", 0.01, 0.05],

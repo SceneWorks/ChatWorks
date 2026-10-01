@@ -12,12 +12,14 @@
     "source": "/models/qwen3.8-27b",
     "quantize": "nvfp4",
     "cuda_graphs": true,
+    "draft_source": "/models/qwen3-0.6b",
+    "prefix_cache_bytes": 1073741824,
     "load_report": {
       "requested": "nvfp4",
       "projections": [{ "kind": "nvfp4", "count": 448, "params": 1000, "resident_bytes": 562 }],
       "cuda_graphs": true,
-      "prefix_cache_bytes": null,
-      "draft": null
+      "prefix_cache_bytes": 1073741824,
+      "draft": { "source": "/models/qwen3-0.6b", "refusal": null }
     },
     "last_decode": {
       "path": "mtp",
