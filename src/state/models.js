@@ -41,6 +41,46 @@ export function loadNotice(modelName, status) {
   return `${modelName} is now the served model.`;
 }
 
+const MIB = 1024 * 1024;
+
+/// A registered model's prefix-cache budget as the Models screen's MiB field: blank for the
+/// runtime's default (`null`), `0` for off.
+export function prefixCacheField(bytes) {
+  return bytes == null ? "" : String(bytes / MIB);
+}
+
+/// The prefix-cache budget (`LoadSpec::prefix_cache_bytes`) a MiB field asks for: `null` (the
+/// runtime's default) when blank, `0` (off), or a whole number of bytes.
+export function prefixCacheBytesFromField(value) {
+  const text = String(value ?? "").trim();
+  if (text === "") return null;
+  const mib = Number(text);
+  if (!Number.isFinite(mib) || mib < 0) {
+    throw new Error("Prefix cache budget must be a number of MiB of at least 0 (blank = runtime default).");
+  }
+  return Math.round(mib * MIB);
+}
+
+/// The draft-model choices for `model`: none, then every other registered model by its snapshot
+/// path. A saved draft that is no longer registered stays visible.
+export function draftModelOptions(models, model) {
+  const options = [["", "No draft model"]];
+  for (const other of models) {
+    if (other.id !== model.id && other.localPath) options.push([other.localPath, other.name]);
+  }
+  if (model.draftSource && !options.some(([value]) => value === model.draftSource)) {
+    options.push([model.draftSource, model.draftSource.split("/").at(-1)]);
+  }
+  return options;
+}
+
+/// Whether the served model was loaded with `model`'s saved draft model and prefix-cache budget
+/// (the load options the engine echoes in `loaded.draft_source` / `loaded.prefix_cache_bytes`).
+export function servedWithLoadOptions(model, loaded) {
+  return (model.draftSource ?? null) === (loaded?.draft_source ?? null)
+    && (model.prefixCacheBytes ?? null) === (loaded?.prefix_cache_bytes ?? null);
+}
+
 export function isExactGgufUrl(value) {
   return /huggingface\.co\/[^/]+\/[^/]+\/(?:blob|resolve)\/[^/]+\/.+\.gguf(?:[?#].*)?$/i.test(value.trim());
 }

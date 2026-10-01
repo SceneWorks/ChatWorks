@@ -53,6 +53,8 @@ fn qwen3vl_tool_calling_with_image_over_openai_server() {
             quantize: None,
             projector_source: None,
             cuda_graphs: None,
+            draft_source: None,
+            prefix_cache_bytes: None,
         })
         .expect("load Qwen3-VL");
     // The same VLM checkpoint must advertise BOTH capabilities — that is precisely what makes

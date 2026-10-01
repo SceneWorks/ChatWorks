@@ -17,16 +17,6 @@ const PREVIEW_MAX_CHARS: usize = 80;
 const META_SUFFIX: &str = ".meta";
 const JSON_SUFFIX: &str = ".json";
 
-/// A conversation that carries no speculative mode (saved before it existed, or by a UI that did
-/// not know one) takes this build's default, like a settings file without one
-/// ([`crate::app_settings::default_mtp_mode`]), never a hard-coded `off` (sc-24140).
-fn default_mtp_mode() -> String {
-    crate::app_settings::default_mtp_mode()
-}
-fn default_mtp_draft_tokens() -> u32 {
-    3
-}
-
 /// Per-conversation sampling overrides. Mirrors the in-app sampling defaults shape so a
 /// conversation carries the exact params it was run with and round-trips untouched.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -46,10 +36,18 @@ pub struct ConversationParams {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub preserve_thinking: Option<bool>,
-    #[serde(default = "default_mtp_mode")]
-    pub mtp_mode: String,
-    #[serde(default = "default_mtp_draft_tokens")]
-    pub mtp_draft_tokens: u32,
+    /// The conversation's speculative-decoding option (sc-24445): the runtime's proposer-agnostic
+    /// `off | auto | {proposer, depth}`, or `None` (`null`) to use the app setting — never a
+    /// hard-coded mode the user did not choose.
+    #[serde(default)]
+    pub speculative: Option<crate::core_llm::Speculative>,
+    /// The pre-sc-24445 `mtpMode`, read only to migrate it onto [`speculative`](Self::speculative)
+    /// ([`crate::app_settings::legacy_speculative`]); never written back.
+    #[serde(default, rename = "mtpMode", skip_serializing)]
+    pub(crate) legacy_mtp_mode: Option<String>,
+    /// The pre-sc-24445 `mtpDraftTokens`, read only with [`legacy_mtp_mode`](Self::legacy_mtp_mode).
+    #[serde(default, rename = "mtpDraftTokens", skip_serializing)]
+    pub(crate) legacy_mtp_draft_tokens: Option<u32>,
     #[serde(default)]
     pub top_k: Option<usize>,
     #[serde(default)]
@@ -72,14 +70,37 @@ impl Default for ConversationParams {
             disable_thinking: false,
             reasoning_effort: None,
             preserve_thinking: None,
-            mtp_mode: default_mtp_mode(),
-            mtp_draft_tokens: default_mtp_draft_tokens(),
+            speculative: None,
+            legacy_mtp_mode: None,
+            legacy_mtp_draft_tokens: None,
             top_k: None,
             presence_penalty: None,
             repetition_penalty: None,
             repetition_context: None,
             seed: None,
         }
+    }
+}
+
+impl ConversationParams {
+    /// Map a saved conversation's pre-sc-24445 `mtpMode` / `mtpDraftTokens` onto
+    /// [`speculative`](Self::speculative) (the same mapping as the app settings) when it carries no
+    /// speculative option of its own, then drop the legacy fields.
+    ///
+    /// Unlike the app settings, a conversation never refuses a legacy value: a transcript must
+    /// always open. A legacy value the old schema itself would have refused (`enabled` with `0`
+    /// drafts, which the old UI could save, or an unknown mode) carries no choice, so the
+    /// conversation uses the app setting (`None`).
+    fn migrate_legacy_speculative(&mut self) -> Result<(), String> {
+        let legacy = crate::app_settings::legacy_speculative(
+            self.legacy_mtp_mode.take().as_deref(),
+            self.legacy_mtp_draft_tokens.take(),
+        )
+        .unwrap_or(None);
+        if self.speculative.is_none() {
+            self.speculative = legacy;
+        }
+        crate::app_settings::validate_speculative(self.speculative)
     }
 }
 
@@ -262,6 +283,7 @@ fn save_conversation_in_dir(
     // Canonicalize the id once at the storage boundary so the safety check and the storage key agree
     // on the id (F-009): the key is built from the validated, trimmed id, not the raw input.
     conversation.id = validate_id(&conversation.id)?;
+    conversation.params.migrate_legacy_speculative()?;
     let path = conversation_file_path(dir, &conversation.id);
     let now = now_secs();
     if conversation.created_at == 0 {
@@ -315,7 +337,11 @@ fn delete_conversation_in_dir(dir: &Path, id: &str) -> Result<(), String> {
 
 fn read_conversation_file(path: &Path) -> Result<Conversation, String> {
     let body = fs::read_to_string(path).map_err(|error| error.to_string())?;
-    serde_json::from_str::<Conversation>(&body).map_err(|error| error.to_string())
+    let mut conversation =
+        serde_json::from_str::<Conversation>(&body).map_err(|error| error.to_string())?;
+    // A conversation saved before sc-24445 carries `mtpMode`; it loads as the speculative option.
+    conversation.params.migrate_legacy_speculative()?;
+    Ok(conversation)
 }
 
 fn read_meta_file(path: &Path) -> Result<ConversationMetadata, String> {
@@ -389,19 +415,149 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
-    /// sc-24140 feature-end review: params without a speculative mode take this build's default
-    /// (`auto` on Candle CUDA, `off` on MLX and Candle CPU), not a hard-coded `off`.
+    /// sc-24445 AC1: a conversation saved with a legacy `mtpMode` loads with that choice mapped
+    /// onto the speculative option, saves back without the legacy fields, and one with no mode at
+    /// all uses the app setting (`None`) — never a hard-coded mode.
     #[test]
-    fn params_without_a_speculative_mode_take_the_builds_default() {
-        let params: ConversationParams = serde_json::from_str("{}").unwrap();
-        assert_eq!(params.mtp_mode, crate::app_settings::default_mtp_mode());
-        assert_eq!(
-            ConversationParams::default().mtp_mode,
-            crate::app_settings::default_mtp_mode()
-        );
-        let chosen: ConversationParams = serde_json::from_str(r#"{"mtpMode":"off"}"#).unwrap();
-        assert_eq!(chosen.mtp_mode, "off");
+    fn saved_conversation_mtp_modes_map_onto_the_speculative_option() {
+        use crate::core_llm::{Speculative, SpeculativeProposer};
+        let dir = TempDir::new("conversations-legacy-mtp");
+        for (index, (params, expected)) in [
+            (
+                json!({"mtpMode": "off", "mtpDraftTokens": 3}),
+                Some(Speculative::Off),
+            ),
+            (
+                json!({"mtpMode": "auto", "mtpDraftTokens": 3}),
+                Some(Speculative::Auto),
+            ),
+            (
+                json!({"mtpMode": "enabled", "mtpDraftTokens": 6}),
+                Some(Speculative::proposer(SpeculativeProposer::Mtp, 6)),
+            ),
+            (
+                json!({"mtpMode": "enabled"}),
+                Some(Speculative::proposer(SpeculativeProposer::Mtp, 3)),
+            ),
+            (json!({}), None),
+            (
+                json!({"speculative": {"proposer": "prompt_lookup", "depth": 5}}),
+                Some(Speculative::proposer(SpeculativeProposer::PromptLookup, 5)),
+            ),
+            // Legacy values the old schema refused still open, using the app setting.
+            (json!({"mtpMode": "enabled", "mtpDraftTokens": 0}), None),
+            (json!({"mtpMode": "bogus"}), None),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("legacy-{index}");
+            let stored = json!({
+                "id": id,
+                "title": "Old chat",
+                "createdAt": 1,
+                "updatedAt": 1,
+                "params": params,
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            fs::write(
+                conversation_file_path(dir.path(), &id),
+                serde_json::to_string(&stored).unwrap(),
+            )
+            .unwrap();
+            let loaded = get_conversation_in_dir(dir.path(), &id).unwrap();
+            assert_eq!(loaded.params.speculative, expected, "{params}");
+            let saved = save_conversation_in_dir(dir.path(), loaded).unwrap();
+            let on_disk: Value = serde_json::from_str(
+                &fs::read_to_string(conversation_file_path(dir.path(), &id)).unwrap(),
+            )
+            .unwrap();
+            assert!(on_disk["params"].get("mtpMode").is_none(), "{on_disk}");
+            assert!(
+                on_disk["params"].get("mtpDraftTokens").is_none(),
+                "{on_disk}"
+            );
+            assert_eq!(saved.params.speculative, expected);
+            assert_eq!(
+                get_conversation_in_dir(dir.path(), &id)
+                    .unwrap()
+                    .params
+                    .speculative,
+                expected,
+                "{params} after a save"
+            );
+        }
+        assert_eq!(ConversationParams::default().speculative, None);
     }
+
+    /// A pre-sc-24445 conversation with a legacy value the old schema refused, and no `.meta`
+    /// sidecar, still opens and is listed (never silently dropped from the history).
+    #[test]
+    fn legacy_conversations_with_refused_mtp_values_open_and_are_listed() {
+        let dir = TempDir::new("conversations-legacy-refused");
+        for (id, params) in [
+            (
+                "zero-drafts",
+                json!({"mtpMode": "enabled", "mtpDraftTokens": 0}),
+            ),
+            ("bogus-mode", json!({"mtpMode": "bogus"})),
+        ] {
+            let stored = json!({
+                "id": id,
+                "title": id,
+                "createdAt": 1,
+                "updatedAt": 1,
+                "params": params,
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            fs::write(
+                conversation_file_path(dir.path(), id),
+                serde_json::to_string(&stored).unwrap(),
+            )
+            .unwrap();
+        }
+        let listed: Vec<String> = list_conversations_in_dir(dir.path())
+            .unwrap()
+            .into_iter()
+            .map(|meta| meta.id)
+            .collect();
+        assert_eq!(listed, ["bogus-mode", "zero-drafts"]);
+        for id in ["zero-drafts", "bogus-mode"] {
+            let loaded = get_conversation_in_dir(dir.path(), id).unwrap();
+            assert_eq!(loaded.params.speculative, None, "{id}");
+        }
+    }
+
+    /// The save path migrates legacy fields too: a conversation handed to save with a legacy
+    /// `mtpMode` is written with the speculative option and without the legacy fields.
+    #[test]
+    fn save_migrates_legacy_mtp_fields_onto_the_speculative_option() {
+        use crate::core_llm::{Speculative, SpeculativeProposer};
+        let dir = TempDir::new("conversations-save-legacy");
+        let mut conversation = empty_conversation("save-legacy");
+        conversation.params.legacy_mtp_mode = Some("enabled".to_string());
+        conversation.params.legacy_mtp_draft_tokens = Some(5);
+        let saved = save_conversation_in_dir(dir.path(), conversation).unwrap();
+        assert_eq!(
+            saved.params.speculative,
+            Some(Speculative::proposer(SpeculativeProposer::Mtp, 5))
+        );
+        let on_disk: Value = serde_json::from_str(
+            &fs::read_to_string(conversation_file_path(dir.path(), "save-legacy")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            on_disk["params"]["speculative"],
+            json!({"proposer": "mtp", "depth": 5}),
+            "{on_disk}"
+        );
+        assert!(on_disk["params"].get("mtpMode").is_none(), "{on_disk}");
+        assert!(
+            on_disk["params"].get("mtpDraftTokens").is_none(),
+            "{on_disk}"
+        );
+    }
+
     use crate::fsutil::{TempDir, TEMP_FILE_SUFFIX};
     use serde_json::json;
 

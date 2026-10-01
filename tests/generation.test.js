@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { chatRequestBody, toOpenAiMessage } from "../src/api/sse.js";
 import { paramsFromConversation, paramsToConversation } from "../src/state/conversations.js";
-import { applySamplingPreset, generationParams } from "../src/state/generation.js";
+import {
+  applySamplingPreset, clampSpeculativeDepth, generationParams, generationSettings, speculativeDepthNote,
+  speculativeOptions,
+} from "../src/state/generation.js";
 import { appendAttachmentPlaceholders, settleAttachment, registerPreparation } from "../src/state/attachments.js";
 import { isExactGgufUrl, modelSubtitle, unloadServedModel } from "../src/state/models.js";
 import { prepareRemoteMedia } from "../src/state/media.js";
@@ -13,7 +16,10 @@ const capabilities = {
   supports_thinking: true,
   supports_reasoning_effort: true,
   supports_preserve_thinking: true,
-  mtp: { max_draft_tokens: 8, recommended_draft_tokens: 3 },
+  speculative: [
+    { proposer: "mtp", max_depth: 7, recommended_depth: 3 },
+    { proposer: "prompt_lookup", max_depth: 7, recommended_depth: 4 },
+  ],
 };
 function request(params, caps = capabilities) {
   return chatRequestBody({
@@ -25,12 +31,13 @@ function request(params, caps = capabilities) {
   });
 }
 
-test("model defaults remain omitted and an unknown MTP mode is left to the backend", () => {
+test("model defaults remain omitted and an unchosen speculative option is left to the backend", () => {
   const body = request({});
-  // No UI constant: the server applies the saved setting (the build's default: auto on CUDA).
-  assert.equal(Object.hasOwn(body, "mtp"), false);
-  assert.deepEqual(request({ mtpMode: "off" }).mtp, { mode: "off" });
-  assert.deepEqual(request({ mtpMode: "auto" }).mtp, { mode: "auto" });
+  // No UI constant: the server applies the saved setting (null there: the runtime's default).
+  assert.equal(Object.hasOwn(body, "speculative"), false);
+  assert.equal(Object.hasOwn(body, "mtp"), false, "the legacy field is never sent");
+  assert.equal(request({ speculativeMode: "off" }).speculative, "off");
+  assert.equal(request({ speculativeMode: "auto" }).speculative, "auto");
   assert.deepEqual(body.model_defaults, ["reasoning_effort", "preserve_thinking"]);
   for (const field of ["reasoning_effort", "preserve_thinking", "top_k", "seed"]) {
     assert.equal(Object.hasOwn(body, field), false, field);
@@ -40,14 +47,16 @@ test("model defaults remain omitted and an unknown MTP mode is left to the backe
 test("explicit native controls survive conversation persistence and request mapping", () => {
   const selected = { systemPrompt: "", temperature: "0.7", topP: "0.9", maxTokens: "16",
     disableThinking: false, reasoningEffort: "low", preserveThinking: "false",
-    mtpMode: "enabled", mtpDraftTokens: "5", topK: "20", presencePenalty: "1.5", repetitionPenalty: "1.1",
+    speculativeMode: "mtp", speculativeDepth: "5", topK: "20", presencePenalty: "1.5", repetitionPenalty: "1.1",
     repetitionContext: "64", seed: "42" };
-  const restored = paramsFromConversation(paramsToConversation(selected));
+  const saved = paramsToConversation(selected);
+  assert.deepEqual(saved.speculative, { proposer: "mtp", depth: 5 });
+  const restored = paramsFromConversation(saved);
   assert.deepEqual(restored, selected);
   const body = request(restored);
   assert.equal(body.reasoning_effort, "low");
   assert.equal(body.preserve_thinking, false);
-  assert.deepEqual(body.mtp, { mode: "enabled", draft_tokens: 5 });
+  assert.deepEqual(body.speculative, { proposer: "mtp", depth: 5 });
   assert.equal(body.top_k, 20);
   assert.equal(body.presence_penalty, 1.5);
   assert.equal(body.repetition_penalty, 1.1);
@@ -55,14 +64,59 @@ test("explicit native controls survive conversation persistence and request mapp
   assert.equal(body.seed, 42);
 });
 
-test("thinking alone does not advertise effort, preservation, or MTP", () => {
-  const selected = { reasoningEffort: "xhigh", preserveThinking: "true", mtpMode: "auto" };
+test("sc-24445: the depth is clamped to the proposer's advertised max_depth, and an unadvertised proposer runs off", () => {
+  assert.deepEqual(request({ speculativeMode: "prompt_lookup", speculativeDepth: "12" }).speculative,
+    { proposer: "prompt_lookup", depth: 7 });
+  assert.deepEqual(request({ speculativeMode: "prompt_lookup", speculativeDepth: "2" }).speculative,
+    { proposer: "prompt_lookup", depth: 2 });
+  // One rule with the server's inherited path: a proposer the model does not advertise runs off.
+  assert.equal(request({ speculativeMode: "draft_model", speculativeDepth: "2" }).speculative, "off");
+  assert.equal(clampSpeculativeDepth(0, { max_depth: 7 }), 1);
+  assert.equal(clampSpeculativeDepth(9, { max_depth: 7 }), 7);
+  assert.equal(clampSpeculativeDepth(9, null), 9, "no model in view: only the lower bound");
+  assert.throws(() => generationSettings({ ...generationParams(), speculativeMode: "mtp", speculativeDepth: "0" }), /at least 1/);
+});
+
+test("sc-24445: a saved depth above the model's max is kept as saved, with a note naming the depth it runs at", () => {
+  const capability = { proposer: "prompt_lookup", max_depth: 7 };
+  assert.equal(speculativeDepthNote("12", capability), "Runs at 7 on this model (it advertises up to 7).");
+  assert.equal(speculativeDepthNote("7", capability), null);
+  assert.equal(speculativeDepthNote("3", capability), null);
+  assert.equal(speculativeDepthNote("12", null), null, "no model in view: nothing to clamp against");
+  assert.equal(speculativeDepthNote("", capability), null);
+  // The saved preference itself is never rewritten: it persists as entered, only the request clamps.
+  const params = { ...generationParams(), speculativeMode: "prompt_lookup", speculativeDepth: "12" };
+  assert.deepEqual(generationSettings(params).speculative, { proposer: "prompt_lookup", depth: 12 });
+  assert.deepEqual(paramsToConversation(params).speculative, { proposer: "prompt_lookup", depth: 12 });
+  assert.deepEqual(request(params).speculative, { proposer: "prompt_lookup", depth: 7 });
+});
+
+test("sc-24445: the control offers the inherited default, off, auto and only the advertised proposers", () => {
+  const values = (options) => options.map(([value]) => value);
+  assert.deepEqual(values(speculativeOptions(capabilities)), ["", "off", "auto", "mtp", "prompt_lookup"]);
+  assert.deepEqual(values(speculativeOptions({})), ["", "off", "auto"]);
+  // Settings (no model in view) offers every proposer and names the runtime's default.
+  const settings = speculativeOptions(null, "", true, "off");
+  assert.deepEqual(values(settings), ["", "off", "auto", "mtp", "prompt_lookup", "draft_model"]);
+  assert.equal(settings[0][1], "Runtime default (off)");
+  // A saved proposer the model does not advertise stays visible, marked unavailable.
+  const unavailable = speculativeOptions({}, "draft_model");
+  assert.equal(unavailable.at(-1)[0], "draft_model");
+  assert.match(unavailable.at(-1)[1], /not available for this model/);
+  assert.deepEqual(generationParams({ speculative: { proposer: "prompt_lookup", depth: 6 } }).speculativeMode, "prompt_lookup");
+  assert.equal(generationParams({ speculative: null }).speculativeMode, "");
+});
+
+test("off and auto reach any model; effort and preservation stay capability-gated", () => {
+  const selected = { reasoningEffort: "xhigh", preserveThinking: "true", speculativeMode: "auto" };
   const unsupported = request(selected, { supports_thinking: true });
-  for (const field of ["reasoning_effort", "preserve_thinking", "mtp"]) {
+  for (const field of ["reasoning_effort", "preserve_thinking"]) {
     assert.equal(Object.hasOwn(unsupported, field), false);
   }
+  // The runtime resolves `auto` to what the model offers (or plain decoding, named) itself.
+  assert.equal(unsupported.speculative, "auto");
   assert.equal(Object.hasOwn(request({ ...selected, disableThinking: true }), "reasoning_effort"), false);
-  assert.deepEqual(request(selected).mtp, { mode: "auto" });
+  assert.equal(request(selected).speculative, "auto");
 });
 
 test("assistant reasoning survives ordinary and tool-call history", () => {
@@ -155,20 +209,22 @@ test("remote UI media is routed through native staging without browser fetch or 
   assert.equal(prepared.url, "data:image/jpeg;base64,AA==");
 });
 
-test("desktop wire fixture explicitly clears global controls and leaves an unknown MTP mode to the backend after restore", async () => {
+test("desktop wire fixture explicitly clears global controls and leaves an unchosen speculative option to the backend after restore", async () => {
   const { readFile } = await import("node:fs/promises");
   const fixture = JSON.parse(await readFile(new URL("generation-wire.json", import.meta.url)));
   const saved = paramsToConversation({ ...generationParams(), disableThinking: true });
-  // Nothing pins a speculative mode the user never chose: the backend's default fills it in.
-  assert.equal(Object.hasOwn(JSON.parse(JSON.stringify(saved)), "mtpMode"), false);
+  // Nothing pins a speculative option the user never chose: the inherited default fills it in.
+  const savedWire = JSON.parse(JSON.stringify(saved));
+  assert.equal(Object.hasOwn(savedWire, "speculative"), false);
+  assert.equal(Object.hasOwn(savedWire, "mtpMode"), false);
   const restored = paramsFromConversation(saved);
   const body = request(restored);
   const { model_defaults: modelDefaults, ...rest } = body;
-  assert.deepEqual({ model_defaults: modelDefaults, ...(Object.hasOwn(rest, "mtp") ? { mtp: rest.mtp } : {}) }, fixture);
+  assert.deepEqual({ model_defaults: modelDefaults, ...(Object.hasOwn(rest, "speculative") ? { speculative: rest.speculative } : {}) }, fixture);
   assert.equal(body.disable_thinking, true);
   // An explicit Off survives persistence.
-  const off = paramsFromConversation(paramsToConversation({ ...generationParams(), mtpMode: "off" }));
-  assert.deepEqual(request(off).mtp, { mode: "off" });
+  const off = paramsFromConversation(paramsToConversation({ ...generationParams(), speculativeMode: "off" }));
+  assert.equal(request(off).speculative, "off");
 });
 
 test("cancel before native registration finishes never starts preparation", async () => {

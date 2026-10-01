@@ -1,0 +1,109 @@
+name: Tests
+
+# Unit and integration tests for the desktop app: the Rust crate (src-tauri) on the Apple Silicon
+# MLX build and the Linux Candle CPU build, and the frontend's node tests + lint. Package
+# validation builds installers but runs none of these.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: npm test + lint
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+  rust:
+    name: cargo test (${{ matrix.target }}, ${{ matrix.backend }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26
+            target: aarch64-apple-darwin
+            backend: mlx
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            backend: cpu
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-${{ matrix.backend }}
+
+      - name: Install Linux build prerequisites
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            wget \
+            xz-utils
+
+      - name: Select the MLX Metal deployment target
+        if: matrix.backend == 'mlx'
+        shell: bash
+        run: echo 'MACOSX_DEPLOYMENT_TARGET=26.2' >> "$GITHUB_ENV"
+
+      # `tauri::generate_context!` embeds the built frontend.
+      - name: Build the frontend
+        run: |
+          npm ci
+          npm run build
+
+      # tauri-build requires the externalBin sidecars to exist. Tests never run them: debug builds
+      # resolve FFmpeg through CHATWORKS_FFMPEG / PATH, so empty placeholders stand in for the
+      # provisioned binaries the package job builds.
+      - name: Stage placeholder FFmpeg sidecars
+        shell: bash
+        run: |
+          for name in ffmpeg ffprobe; do
+            install -m 755 /dev/null "src-tauri/binaries/${name}-${{ matrix.target }}"
+          done
+
+      - name: Test the Rust crate
+        run: cargo test -p chatworks --locked

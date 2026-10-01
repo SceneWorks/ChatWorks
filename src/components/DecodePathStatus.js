@@ -7,8 +7,8 @@ const h = React.createElement;
 
 /// The one-time "speculative decoding is available" notice with its one-click action. Renders
 /// nothing unless `speculativeNotice` says to show it.
-export function SpeculativeNotice({ appSettings, executionBackend, onEnableAuto, onDismiss, busy = false }) {
-  const notice = speculativeNotice(appSettings, executionBackend);
+export function SpeculativeNotice({ appSettings, speculativeDefault, onEnableAuto, onDismiss, busy = false }) {
+  const notice = speculativeNotice(appSettings, speculativeDefault);
   if (!notice.show) return null;
   return h(
     "div",

@@ -40,8 +40,8 @@ check. If any check failed, the test fails at the end.
 | Step | What runs | Checks |
 |---|---|---|
 | 0 | Engine start | The runtime is `candle-cuda` and the load device is `sm_120`. |
-| 1 | Load Qwen3.8-27B through `model_registry::app_load_request`, the same function the Models screen uses, under `AppSettings::default()` | `mtp_mode = auto` with 3 draft tokens and CUDA graphs off. The load request is dense and sends `cuda_graphs: Some(false)`. The settled switch is `Some(false)`. The load report is dense-only. The provider has an MTP head and tool calling. |
-| 2 | Streaming `/v1/chat/completions` request with no `mtp` field | More than one SSE delta and `[DONE]`. The answer names Paris. `chatworks_decode`: `proposer = mtp`, `draft_tokens = 3`, `kv_cache = static`, CUDA graphs disabled (`path = none`). `chatworks_mtp.accepted_tokens > 0`. |
+| 1 | Load Qwen3.8-27B through `model_registry::app_load_request`, the same function the Models screen uses, under `AppSettings::default()` with speculative decoding saved as `auto` (since sc-24445 an unsaved option follows the runtime's default; the harness saves `auto`, what the CUDA build shipped when AT5 was accepted) | `speculative = auto` and CUDA graphs off. The load request is dense and sends `cuda_graphs: Some(false)`. The settled switch is `Some(false)`. The load report is dense-only. The provider has an MTP head and tool calling. |
+| 2 | Streaming `/v1/chat/completions` request with no `speculative` (or legacy `mtp`) field | More than one SSE delta and `[DONE]`. The answer names Paris. `chatworks_decode`: `proposer = mtp`, `draft_tokens = 3`, `kv_cache = static`, CUDA graphs disabled (`path = none`). `chatworks_mtp.accepted_tokens > 0`. |
 | 3 | Tool call, non-streamed and streamed | `finish_reason = tool_calls`. One `get_weather` call whose arguments are JSON matching the schema. Decoded on MTP. |
 | 4 | Three cancels: (a) the HTTP client drops the SSE stream; (b) a `CancelFlag` tripped from the token callback (`generate_with_cancel`); (c) `EngineHandle::cancel`, the path of the Stop button's `stop_generation` | Each stops well short of `max_tokens` on the MTP path with `finish_reason = cancelled`. Nothing is left in flight. A greedy request afterwards is token-identical to the same request on the fresh load. |
 | 5 | **Reload** in place (the served source loaded again), then **Unload**, then serve again | The reload releases the resident copy first (`load_transition.reason = reload`) and keeps one copy on the device. After the unload, device memory is within 1 GiB of the pre-load level. After each load, the greedy request is again token-identical. |
@@ -99,8 +99,8 @@ Use a fresh profile (`CHATWORKS_PROFILE_DIR`, see the README) and the packaged C
 each item once.
 
 **Settings**
-- [ ] Speculative decoding (Multi-token prediction) shows **Automatic**. CUDA graphs
-  (experimental) is off, and the speculative notice does not appear.
+- [ ] Speculative decoding shows **Runtime default**, naming the runtime's default beside it. CUDA
+  graphs (experimental) is off, and the speculative notice does not appear.
 
 **Models → serve Qwen3.8-27B (Dense)**
 - [ ] The **Served model decode path** panel shows:
@@ -113,7 +113,9 @@ each item once.
 - [ ] A prompt streams token by token.
 - [ ] After the reply, the Last-generation rows show:
   - Decode implementation: `mtp`
-  - Proposer: `mtp · 3 drafts`, with an "Accepted N of M drafts" detail
+  - Proposer: `mtp · 3 drafts`, with an "Accepted N of M drafts" detail (with speculative decoding
+    on Auto)
+  - Accepted length: `x.xx drafts per verify step`
   - CUDA graphs: `off`
   - NVFP4 projections: `none (no NVFP4 weights)`
   - KV cache: `static · gqa attention`

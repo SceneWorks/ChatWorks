@@ -62,11 +62,11 @@ test("unreadable settings fall back to the backend's defaults for this build, no
   const state = await loadAppSettingsOrDefaults(async (command) => {
     calls.push(command);
     if (command === "load_app_settings") throw new Error("settings.json: expected value at line 1");
-    if (command === "default_app_settings") return { server: { authEnabled: false }, sampling: { mtpMode: "auto" } };
+    if (command === "default_app_settings") return { server: { authEnabled: false }, sampling: { speculative: "auto" } };
     throw new Error(`unexpected ${command}`);
   });
   assert.deepEqual(calls, ["load_app_settings", "default_app_settings"]);
-  assert.equal(state.settings.sampling.mtpMode, "auto");
+  assert.equal(state.settings.sampling.speculative, "auto");
   assert.equal(state.token, null);
   assert.match(state.error, /^Could not load settings: .*expected value at line 1/);
 });
@@ -75,10 +75,10 @@ test("readable settings never ask for the defaults", async () => {
   const calls = [];
   const state = await loadAppSettingsOrDefaults(async (command) => {
     calls.push(command);
-    if (command === "load_app_settings") return { server: { authEnabled: false }, sampling: { mtpMode: "off" } };
+    if (command === "load_app_settings") return { server: { authEnabled: false }, sampling: { speculative: "off" } };
     throw new Error(`unexpected ${command}`);
   });
   assert.deepEqual(calls, ["load_app_settings"]);
-  assert.equal(state.settings.sampling.mtpMode, "off");
+  assert.equal(state.settings.sampling.speculative, "off");
   assert.equal(state.error, null);
 });

@@ -86,6 +86,14 @@ pub struct ModelEntry {
     /// selection only; `projector_source` remains the one actually loaded.
     #[serde(default)]
     pub projector_sources: Vec<String>,
+    /// The user's draft model for `draft_model` speculation (a snapshot path, epic sc-24432),
+    /// sent as the load's `LoadSpec::draft_source`. `None` loads no draft.
+    #[serde(default)]
+    pub draft_source: Option<String>,
+    /// The user's prefix-cache byte budget for this model, sent as the load's
+    /// `LoadSpec::prefix_cache_bytes`. `None` keeps the runtime's default; `Some(0)` turns it off.
+    #[serde(default)]
+    pub prefix_cache_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -241,6 +249,8 @@ pub fn adopt_cached_hf_model(
         source_bits: candidate.source_bits,
         projector_source: projector_source.clone(),
         projector_sources: candidate.projector_sources,
+        draft_source: None,
+        prefix_cache_bytes: None,
     };
     let manifest = registry_path(app)?;
     let mut registry = read_registry(&manifest)?;
@@ -323,6 +333,43 @@ pub fn load_registered_model(
     registry.selected_id = Some(entry.id);
     write_registry(&manifest, &registry)?;
     Ok(status)
+}
+
+/// Save a registered model's load options (epic sc-24432): its draft model (`None` or blank = no
+/// draft) and prefix-cache budget (`None` = the runtime's default). They apply the next time the
+/// model is loaded.
+pub fn set_model_load_options(
+    app: &AppHandle,
+    model_id: &str,
+    draft_source: Option<String>,
+    prefix_cache_bytes: Option<u64>,
+) -> Result<ModelRegistry, String> {
+    set_model_load_options_in(
+        &registry_path(app)?,
+        model_id,
+        draft_source,
+        prefix_cache_bytes,
+    )
+}
+
+fn set_model_load_options_in(
+    manifest: &Path,
+    model_id: &str,
+    draft_source: Option<String>,
+    prefix_cache_bytes: Option<u64>,
+) -> Result<ModelRegistry, String> {
+    let mut registry = read_registry(manifest)?;
+    let entry = registry
+        .models
+        .iter_mut()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| format!("model {model_id:?} is not in the registry"))?;
+    entry.draft_source = draft_source
+        .map(|source| source.trim().to_string())
+        .filter(|source| !source.is_empty());
+    entry.prefix_cache_bytes = prefix_cache_bytes;
+    write_registry(manifest, &registry)?;
+    Ok(registry)
 }
 
 pub fn hf_token_status() -> Result<HfTokenStatus, String> {
@@ -511,6 +558,8 @@ async fn import_hf_model_inner(
         } else {
             Vec::new()
         },
+        draft_source: None,
+        prefix_cache_bytes: None,
     };
     upsert_model(&mut registry, entry);
     write_registry(&manifest, &registry)?;
@@ -771,10 +820,8 @@ pub(crate) fn ensure_snapshot_weight_format_supported(
         return Ok(());
     }
     let support = probe(&LoadSpec {
-        source: source.to_string_lossy().to_string(),
-        projector_source: None,
         quantize: Some(QuantizeRequest::Nvfp4.into()),
-        cuda_graphs: None,
+        ..LoadSpec::dense(source.to_string_lossy())
     });
     if support.supported {
         return Ok(());
@@ -881,6 +928,8 @@ pub(crate) fn load_request_for(
         quantize: entry.quantize,
         projector_source,
         cuda_graphs,
+        draft_source: entry.draft_source.clone(),
+        prefix_cache_bytes: entry.prefix_cache_bytes,
     })
 }
 
@@ -1567,24 +1616,14 @@ fn cached_model_candidate(path: &Path) -> Result<Option<CachedModelCandidate>, S
 
 fn matching_provider(path: &Path) -> Result<Option<crate::core_llm::TextLlmDescriptor>, String> {
     let source = path.to_string_lossy().to_string();
-    let spec = LoadSpec {
-        source,
-        projector_source: None,
-        quantize: None,
-        cuda_graphs: None,
-    };
+    let spec = LoadSpec::dense(source);
     Ok(crate::inference_runtime::textllms()
         .find(|registration| (registration.can_load)(&spec))
         .map(|registration| (registration.descriptor)()))
 }
 
 fn provider_weightless_vision(path: &Path) -> bool {
-    let spec = LoadSpec {
-        source: path.to_string_lossy().to_string(),
-        projector_source: None,
-        quantize: None,
-        cuda_graphs: None,
-    };
+    let spec = LoadSpec::dense(path.to_string_lossy());
     crate::inference_runtime::textllms()
         .find(|registration| (registration.can_load)(&spec))
         .and_then(|registration| registration.weightless_vision)
@@ -2312,6 +2351,8 @@ mod tests {
             source_bits: None,
             projector_source: None,
             projector_sources: Vec::new(),
+            draft_source: None,
+            prefix_cache_bytes: None,
         };
         let mut settings = crate::app_settings::AppSettings::default();
         settings.runtime.cuda_graphs = true;
@@ -2349,6 +2390,78 @@ mod tests {
                 .cuda_graphs,
             None
         );
+    }
+
+    /// Epic sc-24432 load options: a registered model's saved draft model and prefix-cache budget
+    /// are saved through `set_model_load_options` (a blank draft = none, a `None` budget = the
+    /// runtime's default) and reach its load request, then the runtime's `LoadSpec`.
+    #[test]
+    fn saved_draft_and_prefix_cache_options_reach_the_load_request() {
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "id": "qwen3-32b",
+            "name": "Qwen3-32B",
+            "repo": "Qwen/Qwen3-32B",
+            "revision": "main",
+            "sourceUrl": "https://huggingface.co/Qwen/Qwen3-32B",
+            "localPath": "/snapshots/qwen3-32b",
+            "importedAt": 1,
+            "fileCount": 5,
+        }))
+        .unwrap();
+        assert_eq!(
+            entry.draft_source, None,
+            "an older registry entry has no draft"
+        );
+        assert_eq!(entry.prefix_cache_bytes, None);
+        let dir = TempDir::new("registry-load-options");
+        let manifest = dir.path().join("manifest.json");
+        write_registry(
+            &manifest,
+            &ModelRegistry {
+                models: vec![entry],
+                selected_id: None,
+            },
+        )
+        .unwrap();
+        let no_settings =
+            || -> Result<crate::app_settings::AppSettings, String> { Err("not read".to_string()) };
+
+        let registry = set_model_load_options_in(
+            &manifest,
+            "qwen3-32b",
+            Some(" /snapshots/qwen3-0.6b ".to_string()),
+            Some(256 << 20),
+        )
+        .unwrap();
+        let saved = &read_registry(&manifest).unwrap().models[0];
+        assert_eq!(saved.draft_source.as_deref(), Some("/snapshots/qwen3-0.6b"));
+        assert_eq!(saved.prefix_cache_bytes, Some(256 << 20));
+        assert_eq!(registry.models[0].draft_source, saved.draft_source);
+        let request =
+            load_request_for(saved, None, no_settings, &capabilities(false, false)).unwrap();
+        assert_eq!(
+            request.draft_source.as_deref(),
+            Some("/snapshots/qwen3-0.6b")
+        );
+        assert_eq!(request.prefix_cache_bytes, Some(256 << 20));
+        let spec = request.load_spec();
+        assert_eq!(spec.draft_source.as_deref(), Some("/snapshots/qwen3-0.6b"));
+        assert_eq!(spec.prefix_cache_bytes, Some(256 << 20));
+
+        // Clearing: a blank draft is none, and a `None` budget is the runtime's default.
+        set_model_load_options_in(&manifest, "qwen3-32b", Some("  ".to_string()), None).unwrap();
+        let cleared = &read_registry(&manifest).unwrap().models[0];
+        let request =
+            load_request_for(cleared, None, no_settings, &capabilities(false, false)).unwrap();
+        assert_eq!(request.draft_source, None);
+        assert_eq!(request.prefix_cache_bytes, None);
+        // `Some(0)` (off) is distinct from the runtime's default.
+        set_model_load_options_in(&manifest, "qwen3-32b", None, Some(0)).unwrap();
+        assert_eq!(
+            read_registry(&manifest).unwrap().models[0].prefix_cache_bytes,
+            Some(0)
+        );
+        assert!(set_model_load_options_in(&manifest, "missing", None, None).is_err());
     }
 
     /// sc-24140 feature-end review: an unreadable settings file blocks a load only where the
@@ -3012,6 +3125,8 @@ mod tests {
                 source_bits: None,
                 projector_source: None,
                 projector_sources: Vec::new(),
+                draft_source: None,
+                prefix_cache_bytes: None,
             },
         );
         upsert_model(
@@ -3033,6 +3148,8 @@ mod tests {
                 source_bits: None,
                 projector_source: Some("/tmp/mmproj-F16.gguf".to_string()),
                 projector_sources: vec!["/tmp/mmproj-F16.gguf".to_string()],
+                draft_source: None,
+                prefix_cache_bytes: None,
             },
         );
         assert_eq!(registry.models.len(), 1);
@@ -3081,6 +3198,8 @@ mod tests {
             source_bits: None,
             projector_source: None,
             projector_sources: Vec::new(),
+            draft_source: None,
+            prefix_cache_bytes: None,
         };
         let mut value = serde_json::to_value(ModelRegistry {
             models: vec![entry],
