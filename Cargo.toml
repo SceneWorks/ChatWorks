@@ -17,7 +17,8 @@ all = "warn"
 
 # Candle crates resolve through SceneWorks/inference's vendored copies, exactly as inference's own
 # workspace patches them: upstream candle-kernels lacks the multi-arch kernel vendor the runtime's
-# CUDA build needs. Every rev here equals the runtime-* pin in src-tauri/Cargo.toml (lockstep), so
+# CUDA build needs, and the runtime's vendored candle-core carries its own kernel and op changes. Every rev here equals the runtime-* pin in src-tauri/Cargo.toml (lockstep), so
 # Cargo.lock resolves one inference commit (scripts/check-git-deps.sh).
 [patch."https://github.com/huggingface/candle"]
-candle-kernels = { git = "https://github.com/SceneWorks/inference", rev = "c2c346be352fc05cd34021a857f8253dfb8195f8" }
+candle-core = { git = "https://github.com/SceneWorks/inference", rev = "c5598a8101a58f06690ff67488b34144c10b0570" }
+candle-kernels = { git = "https://github.com/SceneWorks/inference", rev = "c5598a8101a58f06690ff67488b34144c10b0570" }

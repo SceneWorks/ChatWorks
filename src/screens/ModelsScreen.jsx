@@ -44,6 +44,7 @@ export function ModelsScreen() {
   const [adoptingPath, setAdoptingPath] = useState("");
   const [projectorSelections, setProjectorSelections] = useState({});
   const [prefixFields, setPrefixFields] = useState({});
+  const [mtpHeadFields, setMtpHeadFields] = useState({});
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null);
   const [loadingId, setLoadingId] = useState("");
@@ -189,18 +190,21 @@ export function ModelsScreen() {
   }
 
   // A model's load options (epic sc-24432) are saved on its registry entry and sent with its next
-  // load: the draft model (`LoadSpec::draft_source`) and the prefix-cache budget
-  // (`LoadSpec::prefix_cache_bytes`, blank = the runtime's default).
+  // load: the draft model (`LoadSpec::draft_source`), the companion MTP head
+  // (`LoadSpec::mtp_head_source`) and the prefix-cache budget (`LoadSpec::prefix_cache_bytes`,
+  // blank = the runtime's default).
   async function saveLoadOptions(model, changes) {
     setError(null);
     try {
       const options = {
         draftSource: model.draftSource ?? null,
         prefixCacheBytes: model.prefixCacheBytes ?? null,
+        mtpHeadSource: model.mtpHeadSource ?? null,
         ...changes,
       };
       setRegistry(await invoke("set_model_load_options", { modelId: model.id, ...options }));
       setPrefixFields((current) => ({ ...current, [model.id]: undefined }));
+      setMtpHeadFields((current) => ({ ...current, [model.id]: undefined }));
     } catch (cause) {
       setError(String(cause));
     }
@@ -217,6 +221,13 @@ export function ModelsScreen() {
       return;
     }
     if (prefixCacheBytes !== (model.prefixCacheBytes ?? null)) saveLoadOptions(model, { prefixCacheBytes });
+  }
+
+  function commitMtpHeadField(model) {
+    const field = mtpHeadFields[model.id];
+    if (field === undefined) return;
+    const mtpHeadSource = field.trim() || null;
+    if (mtpHeadSource !== (model.mtpHeadSource ?? null)) saveLoadOptions(model, { mtpHeadSource });
   }
 
   async function handleUnload() {
@@ -477,8 +488,18 @@ export function ModelsScreen() {
                       {draftOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                     </select>
                   ) : null}
-                  {/* REPIN(sc-24444): the companion MTP head picker (`mtp_head_source`) goes here,
-                      beside the draft model, once the pinned runtime carries it. */}
+                  <input
+                    aria-label={`Companion MTP head for ${model.name}`}
+                    disabled={Boolean(loadingId)}
+                    onBlur={() => commitMtpHeadField(model)}
+                    onChange={(event) => setMtpHeadFields((current) => ({ ...current, [model.id]: event.target.value }))}
+                    onKeyDown={(event) => { if (event.key === "Enter") commitMtpHeadField(model); }}
+                    placeholder="Companion MTP head path (optional)"
+                    spellCheck={false}
+                    title="A predictor-only MTP head artifact for a model that ships none (for example a packed checkpoint), so the MTP proposer can run. Blank = none. Applies on the next load; a head the runtime cannot attach is named under Load fallbacks."
+                    type="text"
+                    value={mtpHeadFields[model.id] ?? model.mtpHeadSource ?? ""}
+                  />
                   <input
                     aria-label={`Prefix cache budget (MiB) for ${model.name}`}
                     disabled={Boolean(loadingId)}

@@ -74,10 +74,12 @@ export function draftModelOptions(models, model) {
   return options;
 }
 
-/// Whether the served model was loaded with `model`'s saved draft model and prefix-cache budget
-/// (the load options the engine echoes in `loaded.draft_source` / `loaded.prefix_cache_bytes`).
+/// Whether the served model was loaded with `model`'s saved draft model, companion MTP head and
+/// prefix-cache budget (the load options the engine echoes in `loaded.draft_source`,
+/// `loaded.mtp_head_source` and `loaded.prefix_cache_bytes`).
 export function servedWithLoadOptions(model, loaded) {
   return (model.draftSource ?? null) === (loaded?.draft_source ?? null)
+    && (model.mtpHeadSource ?? null) === (loaded?.mtp_head_source ?? null)
     && (model.prefixCacheBytes ?? null) === (loaded?.prefix_cache_bytes ?? null);
 }
 

@@ -202,6 +202,13 @@ function graphsValue(graphs) {
   }
 }
 
+/// The runtime's attention label (`gqa`, `expanded`, `decode_attention`) as read in the status.
+const ATTENTION_LABELS = { decode_attention: "length-aware decode attention" };
+
+function attentionLabel(attention) {
+  return ATTENTION_LABELS[attention] ?? `${attention} attention`;
+}
+
 function pathValue(report, noneLabel) {
   if (!report || report.path === "none") return { value: noneLabel, detail: null };
   return { value: report.path, detail: report.reason ? `fallback: ${report.reason}` : null };
@@ -225,6 +232,12 @@ export function decodePathRows(engineStatus) {
   rows.push({ key: "graph_switch", label: "CUDA-graph switch", ...graphSwitchValue(loaded), section: null });
   if (loaded.load_report?.draft) {
     rows.push({ key: "draft", label: "Draft model", ...draftValue(loaded.load_report.draft), section: null });
+  }
+  const loadFallbacks = loaded.load_report?.fallbacks ?? [];
+  if (loadFallbacks.length) {
+    // Every requested accelerator the load did not attach, in the runtime's words (`mtp_head: …`,
+    // `cuda_graphs: …`); the model itself loaded.
+    rows.push({ key: "load_fallbacks", label: "Load fallbacks", value: loadFallbacks.join("; "), detail: null, section: null });
   }
   if (typeof loaded.load_report?.prefix_cache_bytes === "number") {
     rows.push({
@@ -264,7 +277,7 @@ export function decodePathRows(engineStatus) {
   last({ key: "nvfp4", label: "NVFP4 projections", ...pathValue(decode.nvfp4_projections, "none (no NVFP4 weights)") });
   last({ key: "fused", label: "Fused primitives", ...pathValue(decode.fused_primitives, "none") });
   last({ key: "sampler", label: "Sampler", value: decode.sampler, detail: null });
-  last({ key: "kv_cache", label: "KV cache", value: `${decode.kv_cache} · ${decode.attention} attention`, detail: null });
+  last({ key: "kv_cache", label: "KV cache", value: `${decode.kv_cache} · ${attentionLabel(decode.attention)}`, detail: null });
   if (decode.prefix_cache) last({ key: "prefix_cache", label: "Prefix cache", ...prefixCacheValue(decode) });
   if (Array.isArray(decode.fallbacks)) {
     last({

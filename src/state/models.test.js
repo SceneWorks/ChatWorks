@@ -58,4 +58,6 @@ test("epic sc-24432 load options: draft choices are the other registered models,
   assert.equal(servedWithLoadOptions({ ...target, prefixCacheBytes: 0 }, loaded), false, "draft removed");
   assert.equal(servedWithLoadOptions({ ...target, draftSource: "/m/qwen3-0.6b" }, loaded), false, "budget changed");
   assert.equal(servedWithLoadOptions(target, {}), true, "no options either side");
+  assert.equal(servedWithLoadOptions({ ...target, mtpHeadSource: "/m/head" }, {}), false, "head added");
+  assert.equal(servedWithLoadOptions({ ...target, mtpHeadSource: "/m/head" }, { mtp_head_source: "/m/head" }), true);
 });

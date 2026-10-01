@@ -156,9 +156,12 @@ Native URL cancellation closes the download, kills/reaps an owned decoder, and r
 files. Models exposes **Unload model**, available after UI generation stops; it also cancels an
 external API generation before unloading. Registered files and the saved model selection remain
 available for reloading. Each registered model can name a draft model (another registered model
-sharing its tokenizer, for `draft_model` speculation) and a prefix-cache budget in MiB (blank = the
-runtime's default, `0` = off); both apply on its next load, and the decode-path status shows whether
-the draft is resident or refused (with the runtime's reason) and the budget the load settled. When you load the served model again (**Reload** after a CUDA-graph
+sharing its tokenizer, for `draft_model` speculation), a companion MTP head (a predictor-only
+artifact path, so a model that ships no head can run the `mtp` proposer) and a prefix-cache budget
+in MiB (blank = the runtime's default, `0` = off); all apply on its next load, and the decode-path
+status shows whether the draft is resident or refused (with the runtime's reason), every
+accelerator the load did not attach (`mtp_head: …`, `cuda_graphs: …`) and the budget the load
+settled. When you load the served model again (**Reload** after a CUDA-graph
 change, or the same snapshot in another weight format), the engine unloads the resident copy
 first, so two copies never have to fit on the device. A different model loads beside the served
 one, so a failed switch keeps serving the old model. The exception is a runtime memory refusal:
