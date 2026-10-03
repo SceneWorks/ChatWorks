@@ -2,4 +2,4 @@
 # main: a released runtime tag and its resolved SHA, updated together only after the release and
 # product gates pass. A feature train may pin `rev` + an exact inference commit until its terminal
 # story replaces it with the released tag; scripts/check-git-deps.sh refuses a rev pin on main.
-SceneWorks/inference,rev,c5598a8101a58f06690ff67488b34144c10b0570
+SceneWorks/inference,rev,060588b49bb8298596d2127f32dd2aa9ad52b1b9
