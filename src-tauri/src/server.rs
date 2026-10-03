@@ -1951,16 +1951,6 @@ mod tests {
         for (key, value, expected) in [
             ("reasoning_effort", json!("low"), "reasoning_effort"),
             ("preserve_thinking", json!(true), "preserve_thinking"),
-            (
-                "mtp",
-                json!({"mode":"enabled", "draft_tokens":3}),
-                "`mtp` proposer",
-            ),
-            (
-                "speculative",
-                json!({"proposer": "draft_model", "depth": 2}),
-                "`draft_model` proposer",
-            ),
         ] {
             let mut wire = base.clone();
             wire[key] = value;
@@ -1972,6 +1962,24 @@ mod tests {
                 .generate(generated, |_| {})
                 .unwrap_err()
                 .contains(expected));
+        }
+        // Epic sc-24432 E2 (feature-end review): an explicit proposer the model does not advertise
+        // is admitted by the runtime and decodes plainly with the reason named in the decode
+        // report — an explicit fallback, never a failure.
+        for (key, value) in [
+            ("mtp", json!({"mode":"enabled", "draft_tokens":3})),
+            (
+                "speculative",
+                json!({"proposer": "draft_model", "depth": 2}),
+            ),
+        ] {
+            let mut wire = base.clone();
+            wire[key] = value;
+            let request: OpenAiChatRequest = serde_json::from_value(wire).unwrap();
+            let generated = request
+                .into_generate_for_engine(&defaults, &engine)
+                .unwrap();
+            assert!(engine.generate(generated, |_| {}).is_ok(), "{key}");
         }
     }
 

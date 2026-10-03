@@ -10,7 +10,9 @@
 //!    None`), CUDA graphs settled off, speculative decoding `auto`. Since sc-24445 a fresh install
 //!    saves no speculative option and follows the runtime's default (settled by epic sc-24432's
 //!    defaults table, sc-24446); this harness saves `auto` — what the CUDA build shipped when
-//!    AT5 was accepted — so its MTP-path checks keep their meaning whatever that default is.
+//!    AT5 was accepted — so its MTP-path checks keep their meaning whatever that default is. Since
+//!    sc-24446 an unsaved CUDA-graph switch follows the runtime's default too (on where Candle CUDA
+//!    can capture); this harness saves it off, as AT5 was accepted, for the same reason.
 //! 2. Streaming chat completion with **no `speculative` field**: the saved setting resolves it to the
 //!    MTP head (K = 3, static KV cache, CUDA graphs off with a named reason), and the answer is
 //!    right.
@@ -110,6 +112,7 @@ fn qwen38_fast_path_end_to_end() {
     // from them, the same way `main.rs` does for the desktop app.
     let mut settings = AppSettings::default();
     settings.sampling.speculative = Some(Speculative::Auto);
+    settings.runtime.cuda_graphs = Some(false);
     rec.meta(
         "shipped_settings",
         json!({
@@ -165,8 +168,8 @@ fn qwen38_fast_path_end_to_end() {
     );
     rec.check(
         "1",
-        "runtime.cuda_graphs ships off",
-        !settings.runtime.cuda_graphs,
+        "runtime.cuda_graphs saved off",
+        settings.runtime.cuda_graphs == Some(false),
         json!(settings.runtime.cuda_graphs),
     );
     let qwen38 = registry_entry(&snapshot, "Qwen3.8-27B", "Qwen/Qwen3.8-27B");
@@ -1095,6 +1098,7 @@ fn decode_from(value: &Value) -> Option<DecodeReportPayload> {
         replay_forwards: count("replay_forwards"),
         prefix_hit_tokens: count("prefix_hit_tokens"),
         prefix_cache: path("prefix_cache"),
+        speculative_demoted_at: value["speculative_demoted_at"].as_u64(),
         fallbacks: value["fallbacks"]
             .as_array()
             .map(|items| {

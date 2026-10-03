@@ -69,6 +69,7 @@ pub fn fake_decode_report() -> DecodeReport {
             reason: None,
         },
         fallbacks: Vec::new(),
+        ..DecodeReport::default()
     }
 }
 

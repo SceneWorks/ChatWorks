@@ -45,6 +45,13 @@ export function selectedWeightFormat(options, id) {
   return option ?? options[0];
 }
 
+/// The CUDA-graph switch a load applies (sc-24446): the saved choice when there is one, else the
+/// runtime's per-backend default (`engine_status.cuda_graphs_default`) — an unset setting sends no
+/// switch and the runtime applies that default itself.
+export function effectiveCudaGraphs(savedSetting, runtimeDefault) {
+  return typeof savedSetting === "boolean" ? savedSetting : Boolean(runtimeDefault);
+}
+
 /// Whether the served model runs under a different CUDA-graph switch than the SAVED setting:
 /// graphs are a load option, so it applies only after a reload. Compared against the switch the
 /// runtime settled at load (`loaded.cuda_graphs`, from its load report) — a provider that does
@@ -160,10 +167,15 @@ function proposerValue(decode) {
     return { value: "none (token-at-a-time)", detail: null };
   }
   const drafts = decode.draft_tokens ? ` · ${decode.draft_tokens} drafts` : "";
-  const detail = decode.proposed_tokens > 0
+  const accepted = decode.proposed_tokens > 0
     ? `Accepted ${decode.accepted_tokens} of ${decode.proposed_tokens} drafts in ${decode.target_forwards} forwards`
     : null;
-  return { value: `${decode.proposer}${drafts}`, detail };
+  // sc-24446: the runtime's acceptance monitor demoted `auto` to plain decoding mid-request.
+  const demoted = decode.speculative_demoted_at != null
+    ? `Demoted to plain decoding at token ${decode.speculative_demoted_at}`
+    : null;
+  const detail = [accepted, demoted].filter(Boolean).join(" · ") || null;
+  return { value: `${decode.proposer}${drafts}${demoted ? " → plain" : ""}`, detail };
 }
 
 /// The realized mean accepted length, as the runtime computed it (`accepted / verify_steps`).

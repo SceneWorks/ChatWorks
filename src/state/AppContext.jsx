@@ -26,7 +26,7 @@ export const DEFAULT_APP_SETTINGS = {
     disableThinking: true,
   },
   runtime: {
-    cudaGraphs: false,
+    cudaGraphs: null,
   },
   notices: {
     speculativeOffCarriedOver: false,

@@ -893,10 +893,10 @@ fn check_downloaded_file(
 /// not an environment default, decides) where the runtime honours the switch, and omitted where
 /// it reports the switch unavailable.
 pub(crate) fn load_cuda_graphs(
-    setting: bool,
+    setting: Option<bool>,
     capabilities: &crate::core_llm::BackendCapabilities,
 ) -> Option<bool> {
-    capabilities.cuda_graphs.supported.then_some(setting)
+    setting.filter(|_| capabilities.cuda_graphs.supported)
 }
 
 /// The engine load request the app sends when it serves `entry` on this build's runtime:
@@ -2198,15 +2198,23 @@ mod tests {
     #[test]
     fn the_cuda_graph_setting_maps_to_the_load_request() {
         assert_eq!(
-            load_cuda_graphs(true, &capabilities(true, true)),
+            load_cuda_graphs(Some(true), &capabilities(true, true)),
             Some(true)
         );
         assert_eq!(
-            load_cuda_graphs(false, &capabilities(true, true)),
+            load_cuda_graphs(Some(false), &capabilities(true, true)),
             Some(false)
         );
-        assert_eq!(load_cuda_graphs(true, &capabilities(true, false)), None);
-        assert_eq!(load_cuda_graphs(false, &capabilities(true, false)), None);
+        // Unset: the runtime applies its own default (sc-24446).
+        assert_eq!(load_cuda_graphs(None, &capabilities(true, true)), None);
+        assert_eq!(
+            load_cuda_graphs(Some(true), &capabilities(true, false)),
+            None
+        );
+        assert_eq!(
+            load_cuda_graphs(Some(false), &capabilities(true, false)),
+            None
+        );
     }
 
     /// A StarVector-1B snapshot (`config.json` only): a family the runtime refuses NVFP4 for by
@@ -2373,7 +2381,7 @@ mod tests {
             mtp_head_source: None,
         };
         let mut settings = crate::app_settings::AppSettings::default();
-        settings.runtime.cuda_graphs = true;
+        settings.runtime.cuda_graphs = Some(true);
         let read = |settings: &crate::app_settings::AppSettings| {
             let settings = settings.clone();
             move || Ok(settings)
@@ -2393,15 +2401,23 @@ mod tests {
             Some("/snapshots/mmproj.gguf")
         );
         assert_eq!(request.cuda_graphs, Some(true));
-        settings.runtime.cuda_graphs = false;
+        settings.runtime.cuda_graphs = Some(false);
         assert_eq!(
             load_request_for(&entry, None, read(&settings), &capabilities(true, true))
                 .unwrap()
                 .cuda_graphs,
             Some(false)
         );
+        // Unset follows the runtime's own default (sc-24446): nothing is sent.
+        settings.runtime.cuda_graphs = None;
+        assert_eq!(
+            load_request_for(&entry, None, read(&settings), &capabilities(true, true))
+                .unwrap()
+                .cuda_graphs,
+            None
+        );
         // Where the runtime reports the switch unavailable it is not sent at all.
-        settings.runtime.cuda_graphs = true;
+        settings.runtime.cuda_graphs = Some(true);
         assert_eq!(
             load_request_for(&entry, None, read(&settings), &capabilities(true, false))
                 .unwrap()
