@@ -1701,6 +1701,7 @@ mod tests {
                 } else {
                     FinishReason::Stop
                 }),
+                kv_cache: None,
             })
         }
     }
