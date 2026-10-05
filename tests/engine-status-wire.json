@@ -1,5 +1,6 @@
 {
   "execution_backend": "candle-cuda",
+  "cuda_graphs_default": true,
   "backend_capabilities": {
     "backend": "candle-cuda",
     "device": "cuda:0",
@@ -7,14 +8,24 @@
     "nvfp4": { "supported": true, "reason": null },
     "cuda_graphs": { "supported": true, "reason": null }
   },
+  "speculative_default": "off",
   "loaded": {
     "source": "/models/qwen3.8-27b",
     "quantize": "nvfp4",
     "cuda_graphs": true,
+    "draft_source": "/models/qwen3-0.6b",
+    "prefix_cache_bytes": 1073741824,
+    "mtp_head_source": "/models/qwen3.8-27b-mtp",
     "load_report": {
       "requested": "nvfp4",
       "projections": [{ "kind": "nvfp4", "count": 448, "params": 1000, "resident_bytes": 562 }],
-      "cuda_graphs": true
+      "cuda_graphs": true,
+      "fallbacks": [
+        "cuda_graphs: positions_host_scalar",
+        "mtp_head: the target already carries its own MTP predictor (`/models/qwen3.8-27b-mtp`); the model loaded without a companion head"
+      ],
+      "prefix_cache_bytes": 1073741824,
+      "draft": { "source": "/models/qwen3-0.6b", "refusal": null }
     },
     "last_decode": {
       "path": "mtp",
@@ -31,12 +42,20 @@
         "captured": 0,
         "fallback_reason": "deltanet_state_unstable"
       },
+      "graph_path": "eager",
       "nvfp4_projections": { "path": "mixed", "reason": "rows" },
       "fused_primitives": { "path": "fused", "reason": null },
-      "target_forwards": 2,
+      "target_forwards": 3,
+      "prefill_forwards": 1,
       "proposed_tokens": 4,
       "accepted_tokens": 3,
-      "replay_forwards": 0
+      "verify_steps": 2,
+      "mean_accepted_length": 1.5,
+      "replay_forwards": 0,
+      "prefix_hit_tokens": 0,
+      "prefix_cache": { "path": "miss", "reason": null },
+      "speculative_demoted_at": null,
+      "fallbacks": []
     },
     "decode_reported": true
   }

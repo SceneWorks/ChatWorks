@@ -4,7 +4,12 @@ import { StatusDot } from "@sceneworks/ui";
 import { useApp } from "../state/AppContext";
 import { GenerationControls } from "../components/GenerationControls";
 import { generationParams, generationSettings } from "../state/generation.js";
-import { cudaGraphsControl, dismissSpeculativeNotice, enableSpeculativeAuto } from "../state/decodePath.js";
+import {
+  cudaGraphsControl,
+  dismissSpeculativeNotice,
+  effectiveCudaGraphs,
+  enableSpeculativeAuto,
+} from "../state/decodePath.js";
 import { SpeculativeNotice } from "../components/DecodePathStatus.js";
 import { saveAppCredentialState } from "../state/credentials.js";
 
@@ -21,7 +26,8 @@ export function settingsToForm(settings) {
     maxTokens: String(settings.sampling.maxTokens),
     disableThinking: Boolean(settings.sampling.disableThinking),
     ...generationParams(settings.sampling),
-    cudaGraphs: Boolean(settings.runtime?.cudaGraphs),
+    // `null` follows the runtime's default (sc-24446); a toggle saves an explicit choice.
+    cudaGraphs: typeof settings.runtime?.cudaGraphs === "boolean" ? settings.runtime.cudaGraphs : null,
   };
 }
 
@@ -69,7 +75,7 @@ export function SettingsScreen() {
         ...generationSettings(nextForm),
       },
       runtime: {
-        cudaGraphs: Boolean(nextForm.cudaGraphs),
+        cudaGraphs: typeof nextForm.cudaGraphs === "boolean" ? nextForm.cudaGraphs : null,
       },
       // One-time notices and their dismissals are not form fields; keep them as saved.
       notices: appSettings.notices,
@@ -134,9 +140,10 @@ export function SettingsScreen() {
   // CUDA graphs are a load option on the Candle CUDA runtime (sc-24139): gated on the runtime's
   // own report, and a change applies to the next model load. The pending-reload note compares the
   // SAVED setting with the switch the served model was loaded under.
+  const graphsDefault = Boolean(engineStatus?.cuda_graphs_default);
   const graphs = cudaGraphsControl(
     engineStatus?.backend_capabilities,
-    appSettings.runtime?.cudaGraphs,
+    effectiveCudaGraphs(appSettings.runtime?.cudaGraphs, graphsDefault),
     engineStatus?.loaded,
   );
   const lanWarning = form.host === "0.0.0.0" || form.host === "::" || form.allowLan;
@@ -297,11 +304,13 @@ export function SettingsScreen() {
         <SpeculativeNotice
           appSettings={appSettings}
           busy={busy}
-          executionBackend={engineStatus?.execution_backend}
+          speculativeDefault={engineStatus?.speculative_default}
           onDismiss={() => applyNotice(dismissSpeculativeNotice)}
           onEnableAuto={() => applyNotice(enableSpeculativeAuto)}
         />
-        <GenerationControls params={form} onChange={updateForm} prefix="default-generation" />
+        <GenerationControls params={form} onChange={updateForm} prefix="default-generation"
+          speculativeLimits={engineStatus?.loaded?.provider?.capabilities ?? null}
+          speculativeDefault={engineStatus?.speculative_default ?? null} />
 
         <div className="panel-head section-head">
           <p className="eyebrow">Runtime</p>
@@ -310,17 +319,17 @@ export function SettingsScreen() {
         </div>
         <label className="toggle-row">
           <input
-            checked={Boolean(form.cudaGraphs) && !graphs.disabled}
+            checked={effectiveCudaGraphs(form.cudaGraphs, graphsDefault) && !graphs.disabled}
             disabled={graphs.disabled}
             onChange={(event) => updateForm("cudaGraphs", event.target.checked)}
             type="checkbox"
           />
           <span>
-            CUDA graphs (experimental)
+            CUDA graphs
             <small>
               {graphs.disabled
                 ? `Unavailable: ${graphs.reason}`
-                : `Replays captured decode steps; steps that cannot be captured run eagerly and the decode path names why. ${graphs.note}`}
+                : `Replays captured decode steps; steps that cannot be captured run eagerly and the decode path names why. ${typeof form.cudaGraphs === "boolean" ? "" : `Runtime default (${graphsDefault ? "on" : "off"}). `}${graphs.note}`}
             </small>
           </span>
         </label>

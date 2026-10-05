@@ -3,7 +3,8 @@
 use std::sync::OnceLock;
 
 use crate::core_llm::{
-    BackendCapabilities, FeatureSupport, LoadSpec, TextLlm, TextLlmRegistration, TextLlmRegistry,
+    BackendCapabilities, DecodeBackend, FeatureSupport, LoadSpec, Speculative, TextLlm,
+    TextLlmRegistration, TextLlmRegistry,
 };
 
 #[cfg(all(
@@ -54,6 +55,46 @@ pub(crate) fn backend_capabilities() -> &'static BackendCapabilities {
 /// as NVFP4. ChatWorks keeps no model-family rule of its own.
 pub(crate) fn nvfp4_support(spec: &LoadSpec) -> FeatureSupport {
     platform_runtime::text_nvfp4_support(spec)
+}
+
+/// The runtime's decode-defaults row (epic sc-24432 E5, `core_llm::DecodeBackend`) for the backend
+/// and device a load lands on here, read off the runtime's own capability report: MLX, else the
+/// Candle row for the load device (`cuda:*`, `metal:*`, else the CPU — a CUDA build with no CUDA
+/// device loads on the CPU, and takes the CPU row).
+pub(crate) fn decode_backend() -> DecodeBackend {
+    decode_backend_for(backend_capabilities())
+}
+
+fn decode_backend_for(capabilities: &BackendCapabilities) -> DecodeBackend {
+    if capabilities.backend == "mlx" {
+        DecodeBackend::Mlx
+    } else if capabilities.device.starts_with("cuda") {
+        DecodeBackend::CandleCuda
+    } else if capabilities.device.starts_with("metal") {
+        DecodeBackend::CandleMetal
+    } else {
+        DecodeBackend::CandleCpu
+    }
+}
+
+/// The speculative option a request that names none runs under on this host (epic sc-24432 E5):
+/// the runtime's per-backend defaults table (`core_llm::speculative_default`, sc-24446) for
+/// [`decode_backend`]. The one place ChatWorks reads the default; it keeps no copy of its own.
+pub(crate) fn speculative_default() -> Speculative {
+    crate::core_llm::speculative_default(decode_backend())
+}
+
+/// Whether a load that leaves `LoadSpec::cuda_graphs` unset captures CUDA graphs on this host
+/// (sc-24446): the runtime's defaults-table row for [`decode_backend`], where the runtime offers
+/// the switch at all — a build or stream that can never capture (`flash-attn`, the legacy stream)
+/// reports it unavailable and runs eagerly. A process `CANDLE_LLM_CUDA_GRAPHS` override still wins
+/// at load; the load report says what ran.
+pub(crate) fn cuda_graphs_default() -> bool {
+    cuda_graphs_default_for(backend_capabilities())
+}
+
+fn cuda_graphs_default_for(capabilities: &BackendCapabilities) -> bool {
+    capabilities.cuda_graphs.supported && decode_backend_for(capabilities).defaults().cuda_graphs
 }
 
 pub(crate) const fn execution_backend() -> &'static str {
@@ -162,5 +203,52 @@ mod tests {
             assert!(!caps.cuda_graphs.supported);
             assert!(caps.cuda_graphs.reason.is_some());
         }
+    }
+
+    /// sc-24446: the defaults row follows the runtime's backend and load device, and the CUDA-graph
+    /// default is that row's value only where the runtime offers the switch.
+    #[test]
+    fn decode_defaults_follow_the_runtime_backend_and_device() {
+        use crate::core_llm::{BackendCapabilities, DecodeBackend, FeatureSupport};
+        let caps = |backend: &str, device: &str, graphs: bool| BackendCapabilities {
+            backend: backend.to_string(),
+            device: device.to_string(),
+            cuda_graphs: if graphs {
+                FeatureSupport::available()
+            } else {
+                FeatureSupport::unavailable("cuda_graphs: test")
+            },
+            ..BackendCapabilities::default()
+        };
+        for (backend, device, graphs, row) in [
+            ("mlx", "metal", false, DecodeBackend::Mlx),
+            ("candle-cuda", "cuda:0", true, DecodeBackend::CandleCuda),
+            ("candle-cuda", "cpu", false, DecodeBackend::CandleCpu),
+            ("candle-metal", "metal:0", false, DecodeBackend::CandleMetal),
+            ("candle-cpu", "cpu", false, DecodeBackend::CandleCpu),
+        ] {
+            let caps = caps(backend, device, graphs);
+            assert_eq!(super::decode_backend_for(&caps), row, "{backend} {device}");
+            assert_eq!(
+                super::cuda_graphs_default_for(&caps),
+                graphs && row.defaults().cuda_graphs,
+                "{backend} {device}"
+            );
+        }
+        // A CUDA device whose switch the runtime refuses (flash-attn, legacy stream) runs eagerly.
+        assert!(!super::cuda_graphs_default_for(&caps(
+            "candle-cuda",
+            "cuda:0",
+            false
+        )));
+        // The host's answers are the table's, for the row the linked runtime reports.
+        assert_eq!(
+            super::speculative_default(),
+            crate::core_llm::speculative_default(super::decode_backend())
+        );
+        assert_eq!(
+            super::cuda_graphs_default(),
+            super::cuda_graphs_default_for(super::backend_capabilities())
+        );
     }
 }

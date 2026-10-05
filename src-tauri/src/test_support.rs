@@ -10,10 +10,10 @@
 #![cfg(test)]
 
 use crate::core_llm::{
-    Channel, CudaGraphsReport, DecodeReport, FinishReason, GenerationTimings, LoadReport, LoadSpec,
-    MtpCapabilities, MtpStats, PathReport, ProjectionReport, ProposerKind, Quantize, StreamEvent,
-    TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingMode,
-    Usage,
+    Channel, CudaGraphsReport, DecodeReport, DraftReport, FinishReason, GenerationTimings,
+    LoadReport, LoadSpec, MtpCapabilities, MtpStats, PathReport, ProjectionReport, ProposerKind,
+    Quantize, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
+    TextLlmRequest, ThinkingMode, Usage,
 };
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -30,7 +30,8 @@ pub struct FakeProvider {
 
 /// The decode report the telemetry fake emits: native MTP under the load's CUDA-graph switch,
 /// with the graph runner falling back for a named reason, and NVFP4 projections served by the
-/// decode GEMV after a cuBLASLt prefill (sc-24139).
+/// decode GEMV after a cuBLASLt prefill (sc-24139): one prefill and two verify steps of two
+/// drafts each, three of the four accepted (a mean accepted length of 1.5, sc-24445).
 pub fn fake_decode_report() -> DecodeReport {
     DecodeReport {
         path: "mtp".to_string(),
@@ -47,6 +48,7 @@ pub fn fake_decode_report() -> DecodeReport {
             captured: 0,
             fallback_reason: Some("deltanet_state_unstable".to_string()),
         },
+        graph_path: "eager".to_string(),
         nvfp4_projections: PathReport {
             path: "mixed".to_string(),
             reason: Some("rows".to_string()),
@@ -55,10 +57,19 @@ pub fn fake_decode_report() -> DecodeReport {
             path: "fused".to_string(),
             reason: None,
         },
-        target_forwards: 2,
+        target_forwards: 3,
+        prefill_forwards: 1,
         proposed_tokens: 4,
         accepted_tokens: 3,
+        verify_steps: 2,
         replay_forwards: 0,
+        prefix_hit_tokens: 0,
+        prefix_cache: PathReport {
+            path: "miss".to_string(),
+            reason: None,
+        },
+        fallbacks: Vec::new(),
+        ..DecodeReport::default()
     }
 }
 
@@ -94,6 +105,32 @@ pub fn recording_loader(spec: &LoadSpec) -> crate::core_llm::Result<Box<dyn Text
         }],
         // Settled like the Candle runtime: the request, else its default (off).
         cuda_graphs: Some(spec.cuda_graphs.unwrap_or(false)),
+        // Like a Qwen3.5/3.8 decoder on the Candle runtime: with the switch on, the step cannot
+        // be captured (its `graph_support` refusal), and a companion head is refused because the
+        // fake already carries its own MTP predictor — both in the runtime's own wording.
+        fallbacks: [
+            (spec.cuda_graphs == Some(true))
+                .then(|| "cuda_graphs: positions_host_scalar".to_string()),
+            spec.mtp_head_source.as_ref().map(|head| {
+                format!(
+                    "mtp_head: the target already carries its own MTP predictor (`{head}`); \
+                     the model loaded without a companion head"
+                )
+            }),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+        // The requested budget settles unchanged (no headroom clamp in the fake).
+        prefix_cache_bytes: spec.prefix_cache_bytes,
+        // A named draft is resident unless its source names a refusal.
+        draft: spec.draft_source.as_ref().map(|source| {
+            if source.contains("refused") {
+                DraftReport::refused(source, "draft vocabulary is not the target's")
+            } else {
+                DraftReport::resident(source)
+            }
+        }),
     });
     Ok(Box::new(provider))
 }
@@ -166,6 +203,7 @@ impl TextLlm for FakeProvider {
             }),
             decode: self.emit_telemetry.then(fake_decode_report),
             finish_reason: Some(FinishReason::Stop),
+            kv_cache: None,
         })
     }
 }
@@ -260,6 +298,7 @@ impl TextLlm for FakeToolProvider {
             timings: None,
             decode: None,
             finish_reason: Some(FinishReason::Stop),
+            kv_cache: None,
         })
     }
 }

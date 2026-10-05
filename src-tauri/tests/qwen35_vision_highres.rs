@@ -44,6 +44,9 @@ fn qwen35_vision_high_resolution_prefill_does_not_crash() {
             quantize: None,
             projector_source: None,
             cuda_graphs: None,
+            draft_source: None,
+            prefix_cache_bytes: None,
+            mtp_head_source: None,
         })
         .expect("load 27B");
 
@@ -69,7 +72,7 @@ fn qwen35_vision_high_resolution_prefill_does_not_crash() {
             disable_thinking: None,
             reasoning_effort: None,
             preserve_thinking: None,
-            mtp: chatworks::engine::MtpRequest::Off,
+            speculative: None,
             constraint: None,
             tools: vec![],
         };

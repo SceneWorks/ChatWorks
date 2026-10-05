@@ -259,6 +259,23 @@ fn load_registered_model(
 }
 
 #[tauri::command]
+fn set_model_load_options(
+    app: AppHandle,
+    model_id: String,
+    draft_source: Option<String>,
+    prefix_cache_bytes: Option<u64>,
+    mtp_head_source: Option<String>,
+) -> Result<ModelRegistry, String> {
+    chatworks::model_registry::set_model_load_options(
+        &app,
+        &model_id,
+        draft_source,
+        prefix_cache_bytes,
+        mtp_head_source,
+    )
+}
+
+#[tauri::command]
 fn list_builtin_tools() -> Vec<serde_json::Value> {
     chatworks::tools::builtin_tool_specs()
 }
@@ -398,6 +415,7 @@ fn main() {
             save_app_settings,
             api_auth_token,
             list_registered_models,
+            set_model_load_options,
             import_hf_model,
             list_cached_hf_models,
             adopt_cached_hf_model,

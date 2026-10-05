@@ -8,8 +8,8 @@ import { loadAppSettingsOrDefaults, saveAppCredentialState } from "./credentials
 
 export const AppContext = createContext(null);
 
-/// A placeholder until the backend answers: it carries no speculative mode, so nothing saved from
-/// it can pin one (the backend fills in this build's default).
+/// A placeholder until the backend answers: it carries no speculative option, so nothing saved from
+/// it can pin one (an unsaved option follows the runtime's default).
 export const DEFAULT_APP_SETTINGS = {
   server: {
     host: "127.0.0.1",
@@ -26,7 +26,7 @@ export const DEFAULT_APP_SETTINGS = {
     disableThinking: true,
   },
   runtime: {
-    cudaGraphs: false,
+    cudaGraphs: null,
   },
   notices: {
     speculativeOffCarriedOver: false,

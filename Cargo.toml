@@ -14,3 +14,11 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "warn"
+
+# Candle crates resolve through SceneWorks/inference's vendored copies, exactly as inference's own
+# workspace patches them: upstream candle-kernels lacks the multi-arch kernel vendor the runtime's
+# CUDA build needs, and the runtime's vendored candle-core carries its own kernel and op changes. Every rev here equals the runtime-* pin in src-tauri/Cargo.toml (lockstep), so
+# Cargo.lock resolves one inference commit (scripts/check-git-deps.sh).
+[patch."https://github.com/huggingface/candle"]
+candle-core = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.10.0" }
+candle-kernels = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.10.0" }

@@ -4,11 +4,23 @@ import { listen } from "@tauri-apps/api/event";
 import { CompactSelector, StatusDot } from "@sceneworks/ui";
 import { useApp } from "../state/AppContext";
 import { useConversations } from "../state/ConversationsContext";
-import { formatBytes, isExactGgufUrl, loadNotice, modelSubtitle, modelWeightLabel, unloadServedModel } from "../state/models.js";
+import {
+  draftModelOptions,
+  formatBytes,
+  isExactGgufUrl,
+  loadNotice,
+  modelSubtitle,
+  modelWeightLabel,
+  prefixCacheBytesFromField,
+  prefixCacheField,
+  servedWithLoadOptions,
+  unloadServedModel,
+} from "../state/models.js";
 import { checkHfCredentialStatus } from "../state/credentials.js";
 import {
   dismissSpeculativeNotice,
   enableSpeculativeAuto,
+  effectiveCudaGraphs,
   graphsReloadPending,
   selectedWeightFormat,
   serveAction,
@@ -32,6 +44,8 @@ export function ModelsScreen() {
   const [cachedModels, setCachedModels] = useState([]);
   const [adoptingPath, setAdoptingPath] = useState("");
   const [projectorSelections, setProjectorSelections] = useState({});
+  const [prefixFields, setPrefixFields] = useState({});
+  const [mtpHeadFields, setMtpHeadFields] = useState({});
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null);
   const [loadingId, setLoadingId] = useState("");
@@ -46,7 +60,7 @@ export function ModelsScreen() {
   // "Reload" (graphs are a load option).
   const reloadPending = graphsReloadPending(
     engineStatus?.backend_capabilities,
-    appSettings?.runtime?.cudaGraphs,
+    effectiveCudaGraphs(appSettings?.runtime?.cudaGraphs, engineStatus?.cuda_graphs_default),
     engineStatus?.loaded,
   );
   const selectedModel = registry.models.find((model) => model.id === registry.selectedId) ?? null;
@@ -174,6 +188,47 @@ export function ModelsScreen() {
     } finally {
       setLoadingId("");
     }
+  }
+
+  // A model's load options (epic sc-24432) are saved on its registry entry and sent with its next
+  // load: the draft model (`LoadSpec::draft_source`), the companion MTP head
+  // (`LoadSpec::mtp_head_source`) and the prefix-cache budget (`LoadSpec::prefix_cache_bytes`,
+  // blank = the runtime's default).
+  async function saveLoadOptions(model, changes) {
+    setError(null);
+    try {
+      const options = {
+        draftSource: model.draftSource ?? null,
+        prefixCacheBytes: model.prefixCacheBytes ?? null,
+        mtpHeadSource: model.mtpHeadSource ?? null,
+        ...changes,
+      };
+      setRegistry(await invoke("set_model_load_options", { modelId: model.id, ...options }));
+      setPrefixFields((current) => ({ ...current, [model.id]: undefined }));
+      setMtpHeadFields((current) => ({ ...current, [model.id]: undefined }));
+    } catch (cause) {
+      setError(String(cause));
+    }
+  }
+
+  function commitPrefixField(model) {
+    const field = prefixFields[model.id];
+    if (field === undefined) return;
+    let prefixCacheBytes;
+    try {
+      prefixCacheBytes = prefixCacheBytesFromField(field);
+    } catch (cause) {
+      setError(cause.message);
+      return;
+    }
+    if (prefixCacheBytes !== (model.prefixCacheBytes ?? null)) saveLoadOptions(model, { prefixCacheBytes });
+  }
+
+  function commitMtpHeadField(model) {
+    const field = mtpHeadFields[model.id];
+    if (field === undefined) return;
+    const mtpHeadSource = field.trim() || null;
+    if (mtpHeadSource !== (model.mtpHeadSource ?? null)) saveLoadOptions(model, { mtpHeadSource });
   }
 
   async function handleUnload() {
@@ -398,7 +453,9 @@ export function ModelsScreen() {
                 loadedSource &&
                 model.localPath === loadedSource &&
                 (model.quantize ?? null) === (engineStatus?.loaded?.quantize ?? null) &&
-                (selectedProjector || null) === (engineStatus?.loaded?.projector_source ?? null);
+                (selectedProjector || null) === (engineStatus?.loaded?.projector_source ?? null) &&
+                servedWithLoadOptions(model, engineStatus?.loaded);
+              const draftOptions = draftModelOptions(registry.models, model);
               const action = serveAction(Boolean(isServed), reloadPending);
               return (
                 <li className={isServed ? "model-row served" : "model-row"} key={model.id}>
@@ -421,6 +478,42 @@ export function ModelsScreen() {
                       {model.projectorSources.map((source) => <option key={source} value={source}>{source.split("/").at(-1)}</option>)}
                     </select>
                   ) : null}
+                  {draftOptions.length > 1 ? (
+                    <select
+                      aria-label={`Draft model for ${model.name}`}
+                      disabled={Boolean(loadingId)}
+                      onChange={(event) => saveLoadOptions(model, { draftSource: event.target.value || null })}
+                      title="A smaller model sharing this model's tokenizer, for draft-model speculation. Applies on the next load."
+                      value={model.draftSource ?? ""}
+                    >
+                      {draftOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                    </select>
+                  ) : null}
+                  <input
+                    aria-label={`Companion MTP head for ${model.name}`}
+                    disabled={Boolean(loadingId)}
+                    onBlur={() => commitMtpHeadField(model)}
+                    onChange={(event) => setMtpHeadFields((current) => ({ ...current, [model.id]: event.target.value }))}
+                    onKeyDown={(event) => { if (event.key === "Enter") commitMtpHeadField(model); }}
+                    placeholder="Companion MTP head path (optional)"
+                    spellCheck={false}
+                    title="A predictor-only MTP head artifact for a model that ships none (for example a packed checkpoint), so the MTP proposer can run. Blank = none. Applies on the next load; a head the runtime cannot attach is named under Load fallbacks."
+                    type="text"
+                    value={mtpHeadFields[model.id] ?? model.mtpHeadSource ?? ""}
+                  />
+                  <input
+                    aria-label={`Prefix cache budget (MiB) for ${model.name}`}
+                    disabled={Boolean(loadingId)}
+                    min="0"
+                    onBlur={() => commitPrefixField(model)}
+                    onChange={(event) => setPrefixFields((current) => ({ ...current, [model.id]: event.target.value }))}
+                    onKeyDown={(event) => { if (event.key === "Enter") commitPrefixField(model); }}
+                    placeholder="Prefix cache MiB (default)"
+                    step="1"
+                    title="Cross-turn prefix cache budget in MiB: blank = the runtime's default, 0 = off. Applies on the next load."
+                    type="number"
+                    value={prefixFields[model.id] ?? prefixCacheField(model.prefixCacheBytes)}
+                  />
                   <button
                     className="ghost-btn"
                     disabled={Boolean(loadingId) || action.disabled}
@@ -447,7 +540,7 @@ export function ModelsScreen() {
           title="Served model decode path"
           notice={{
             appSettings,
-            executionBackend: engineStatus?.execution_backend,
+            speculativeDefault: engineStatus?.speculative_default,
             onEnableAuto: () => updateAppSettings(enableSpeculativeAuto).catch((cause) => setError(String(cause))),
             onDismiss: () => updateAppSettings(dismissSpeculativeNotice).catch((cause) => setError(String(cause))),
           }}

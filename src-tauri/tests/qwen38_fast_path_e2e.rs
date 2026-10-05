@@ -7,8 +7,13 @@
 //!
 //! 1. Load Qwen3.8-27B the way the Models screen does ([`app_load_request`] under
 //!    `AppSettings::default()` and the linked runtime's backend capabilities): dense (`quantize:
-//!    None`), CUDA graphs settled off, speculative decoding `auto`.
-//! 2. Streaming chat completion with **no `mtp` field**: the server's default resolves it to the
+//!    None`), CUDA graphs settled off, speculative decoding `auto`. Since sc-24445 a fresh install
+//!    saves no speculative option and follows the runtime's default (settled by epic sc-24432's
+//!    defaults table, sc-24446); this harness saves `auto` — what the CUDA build shipped when
+//!    AT5 was accepted — so its MTP-path checks keep their meaning whatever that default is. Since
+//!    sc-24446 an unsaved CUDA-graph switch follows the runtime's default too (on where Candle CUDA
+//!    can capture); this harness saves it off, as AT5 was accepted, for the same reason.
+//! 2. Streaming chat completion with **no `speculative` field**: the saved setting resolves it to the
 //!    MTP head (K = 3, static KV cache, CUDA graphs off with a named reason), and the answer is
 //!    right.
 //! 3. A tool call, streamed and non-streamed: `finish_reason = tool_calls`, and the arguments are
@@ -51,7 +56,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chatworks::app_settings::AppSettings;
-use chatworks::core_llm::CancelFlag;
+use chatworks::core_llm::{CancelFlag, Speculative};
 use chatworks::engine::{
     DecodeReportPayload, DecodeStatusPayload, EngineHandle, EngineStatus, GenerateRequest,
     GenerateResponse, LoadTransitionReason, StreamPayload,
@@ -105,7 +110,9 @@ fn qwen38_fast_path_end_to_end() {
 
     // The settings a fresh install ships with. The server and the load request are both built
     // from them, the same way `main.rs` does for the desktop app.
-    let settings = AppSettings::default();
+    let mut settings = AppSettings::default();
+    settings.sampling.speculative = Some(Speculative::Auto);
+    settings.runtime.cuda_graphs = Some(false);
     rec.meta(
         "shipped_settings",
         json!({
@@ -155,20 +162,14 @@ fn qwen38_fast_path_end_to_end() {
     // ---- Step 1: load with the shipped defaults ------------------------------------------------
     rec.check(
         "1",
-        "sampling_defaults.mtp_mode == auto",
-        settings.sampling.mtp_mode == "auto",
-        json!(settings.sampling.mtp_mode),
+        "sampling_defaults.speculative == auto",
+        settings.sampling.speculative == Some(Speculative::Auto),
+        json!(settings.sampling.speculative),
     );
     rec.check(
         "1",
-        "sampling_defaults.mtp_draft_tokens == 3",
-        settings.sampling.mtp_draft_tokens == 3,
-        json!(settings.sampling.mtp_draft_tokens),
-    );
-    rec.check(
-        "1",
-        "runtime.cuda_graphs ships off",
-        !settings.runtime.cuda_graphs,
+        "runtime.cuda_graphs saved off",
+        settings.runtime.cuda_graphs == Some(false),
         json!(settings.runtime.cuda_graphs),
     );
     let qwen38 = registry_entry(&snapshot, "Qwen3.8-27B", "Qwen/Qwen3.8-27B");
@@ -241,9 +242,9 @@ fn qwen38_fast_path_end_to_end() {
     rec.observe("2", "request", body.clone());
     rec.check(
         "2",
-        "the request carries no mtp field (server default applies)",
-        body.get("mtp").is_none(),
-        json!(body.get("mtp")),
+        "the request carries no speculative field (the saved setting applies)",
+        body.get("speculative").is_none() && body.get("mtp").is_none(),
+        json!([body.get("speculative"), body.get("mtp")]),
     );
     let stream = stream_chat(&client, &url, &body, None);
     rec.observe("2", "stream", stream.summary());
@@ -567,7 +568,7 @@ fn qwen38_fast_path_end_to_end() {
                 json!({
                     "temperature": settings.sampling.temperature,
                     "top_p": settings.sampling.top_p,
-                    "mtp_mode": settings.sampling.mtp_mode,
+                    "speculative": settings.sampling.speculative,
                 }),
             );
             rec.observe("6", "stream", stream.summary());
@@ -769,9 +770,15 @@ fn check_qwen38_load(rec: &mut Record, step: &str, status: &EngineStatus) {
     rec.check(
         step,
         "the provider advertises an MTP head and tool calling",
-        loaded.provider.capabilities.mtp.is_some() && loaded.provider.capabilities.supports_tools,
+        loaded
+            .provider
+            .capabilities
+            .speculative
+            .iter()
+            .any(|cap| cap.proposer == chatworks::core_llm::SpeculativeProposer::Mtp)
+            && loaded.provider.capabilities.supports_tools,
         json!({
-            "mtp": to_json(&loaded.provider.capabilities.mtp),
+            "speculative": to_json(&loaded.provider.capabilities.speculative),
             "supports_tools": loaded.provider.capabilities.supports_tools,
         }),
     );
@@ -784,16 +791,12 @@ fn cancel_request(settings: &AppSettings) -> GenerateRequest {
 }
 
 fn engine_request(settings: &AppSettings, prompt: &str, max_new_tokens: u32) -> GenerateRequest {
-    let mtp = match settings.sampling.mtp_mode.as_str() {
-        "enabled" => json!({"mode": "enabled", "draft_tokens": settings.sampling.mtp_draft_tokens}),
-        mode => json!({ "mode": mode }),
-    };
     serde_json::from_value(json!({
         "messages": [{"role": "user", "content": prompt}],
         "sampling": {"temperature": 0.0},
         "max_new_tokens": max_new_tokens,
         "disable_thinking": settings.sampling.disable_thinking,
-        "mtp": mtp,
+        "speculative": settings.sampling.speculative,
     }))
     .expect("engine request")
 }
@@ -1083,12 +1086,28 @@ fn decode_from(value: &Value) -> Option<DecodeReportPayload> {
             captured: graphs["captured"].as_u64().unwrap_or(0),
             fallback_reason: graphs["fallback_reason"].as_str().map(str::to_string),
         },
+        graph_path: text("graph_path").unwrap_or_default(),
         nvfp4_projections: path("nvfp4_projections"),
         fused_primitives: path("fused_primitives"),
         target_forwards: count("target_forwards"),
+        prefill_forwards: count("prefill_forwards"),
         proposed_tokens: count("proposed_tokens"),
         accepted_tokens: count("accepted_tokens"),
+        verify_steps: count("verify_steps"),
+        mean_accepted_length: value["mean_accepted_length"].as_f64(),
         replay_forwards: count("replay_forwards"),
+        prefix_hit_tokens: count("prefix_hit_tokens"),
+        prefix_cache: path("prefix_cache"),
+        speculative_demoted_at: value["speculative_demoted_at"].as_u64(),
+        fallbacks: value["fallbacks"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
