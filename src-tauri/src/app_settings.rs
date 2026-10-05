@@ -28,7 +28,12 @@ const API_AUTH_KEYCHAIN_USER: &str = "api-auth-token";
 ///   not `off`, such a carried-over `off` is flagged
 ///   ([`NoticeSettings::speculative_off_carried_over`]) so the UI can offer — once, dismissibly —
 ///   to turn on Auto, without ever changing the saved choice itself.
-pub const CURRENT_SETTINGS_VERSION: u32 = 2;
+/// * **Version 3 (sc-24446)** stores the CUDA-graph switch as `null` for "the runtime's default"
+///   ([`RuntimeSettings::cuda_graphs`]); the runtime's measured default is on where it can capture.
+///   Every pre-version-3 save serialized `cudaGraphs`, and `false` was the shipped default, so a
+///   pre-version-3 `false` cannot be told apart from an untouched setting: it migrates to `null`
+///   (follow the runtime). A saved `true` was always a choice and is kept.
+pub const CURRENT_SETTINGS_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,11 +83,12 @@ pub struct NoticeSettings {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSettings {
-    /// Capture decode steps as CUDA graphs (Candle CUDA only). Off by default: no measured win
-    /// yet, and Qwen3.5/3.8 steps currently fall back eagerly with a named reason. Sent as the
-    /// runtime's `LoadSpec::cuda_graphs` only where the runtime reports the switch as supported.
+    /// Capture decode steps as CUDA graphs (Candle CUDA only). `None` follows the runtime's
+    /// per-backend default (`inference_runtime::cuda_graphs_default`, epic sc-24432 E5: measured
+    /// on where the runtime can capture). Sent as the runtime's `LoadSpec::cuda_graphs` only where
+    /// the runtime reports the switch as supported, and only when explicitly set.
     #[serde(default)]
-    pub cuda_graphs: bool,
+    pub cuda_graphs: Option<bool>,
 }
 
 impl AppSettings {
@@ -103,6 +109,9 @@ impl AppSettings {
             && runtime_default != Speculative::Off
         {
             settings.notices.speculative_off_carried_over = true;
+        }
+        if settings.settings_version < 3 && settings.runtime.cuda_graphs == Some(false) {
+            settings.runtime.cuda_graphs = None;
         }
         settings.normalized()
     }
@@ -566,11 +575,14 @@ mod tests {
         let fresh = AppSettings::default().normalized().unwrap();
         assert_eq!(fresh.settings_version, CURRENT_SETTINGS_VERSION);
         assert_eq!(fresh.sampling.speculative, None);
-        assert!(!fresh.runtime.cuda_graphs, "CUDA graphs ship off");
+        assert_eq!(
+            fresh.runtime.cuda_graphs, None,
+            "CUDA graphs follow the runtime"
+        );
         let saved = serde_json::to_value(&fresh).unwrap();
         assert_eq!(saved["settingsVersion"], CURRENT_SETTINGS_VERSION);
         assert!(saved["sampling"]["speculative"].is_null());
-        assert_eq!(saved["runtime"]["cudaGraphs"], false);
+        assert!(saved["runtime"]["cudaGraphs"].is_null());
         for body in [
             "{}",
             r#"{"server":{"port":8000},"sampling":{"temperature":0.5}}"#,
@@ -580,7 +592,7 @@ mod tests {
         }
         assert_eq!(
             runtime_speculative_default(),
-            crate::core_llm::TextLlmRequest::default().speculative_mode()
+            crate::core_llm::speculative_default(crate::inference_runtime::decode_backend())
         );
     }
 
@@ -650,14 +662,68 @@ mod tests {
     fn the_cuda_graph_toggle_round_trips_through_the_settings_file() {
         let on = r#"{"settingsVersion":1,"runtime":{"cudaGraphs":true}}"#;
         let settings = AppSettings::from_stored_json(on).unwrap();
-        assert!(settings.runtime.cuda_graphs);
+        assert_eq!(settings.runtime.cuda_graphs, Some(true));
         let saved = serde_json::to_string(&settings).unwrap();
-        assert!(
-            AppSettings::from_stored_json(&saved)
-                .unwrap()
-                .runtime
-                .cuda_graphs
-        );
+        for (body, expected) in [
+            (saved.as_str(), Some(true)),
+            (
+                r#"{"settingsVersion":3,"runtime":{"cudaGraphs":false}}"#,
+                Some(false),
+            ),
+            (
+                r#"{"settingsVersion":3,"runtime":{"cudaGraphs":null}}"#,
+                None,
+            ),
+            (r#"{"settingsVersion":3}"#, None),
+        ] {
+            assert_eq!(
+                AppSettings::from_stored_json(body)
+                    .unwrap()
+                    .runtime
+                    .cuda_graphs,
+                expected,
+                "{body}"
+            );
+        }
+    }
+
+    /// sc-24446: a pre-version-3 `cudaGraphs: false` was the always-serialized shipped default, so
+    /// it migrates to "follow the runtime"; a pre-version-3 `true` was a choice and is kept. A
+    /// version-3 `false` is a choice too.
+    #[test]
+    fn a_pre_version_3_cuda_graphs_off_follows_the_runtime_default() {
+        for (body, expected) in [
+            (
+                r#"{"settingsVersion":2,"runtime":{"cudaGraphs":false}}"#,
+                None,
+            ),
+            (
+                r#"{"settingsVersion":1,"runtime":{"cudaGraphs":false}}"#,
+                None,
+            ),
+            (r#"{"runtime":{"cudaGraphs":false}}"#, None),
+            (
+                r#"{"settingsVersion":2,"runtime":{"cudaGraphs":true}}"#,
+                Some(true),
+            ),
+            (
+                r#"{"settingsVersion":3,"runtime":{"cudaGraphs":false}}"#,
+                Some(false),
+            ),
+        ] {
+            let settings = AppSettings::from_stored_json(body).unwrap();
+            assert_eq!(settings.runtime.cuda_graphs, expected, "{body}");
+            assert_eq!(settings.settings_version, CURRENT_SETTINGS_VERSION);
+        }
+        // A save from the UI is not a stored file: an explicit off there is kept.
+        let ui = AppSettings {
+            settings_version: 0,
+            runtime: RuntimeSettings {
+                cuda_graphs: Some(false),
+            },
+            ..AppSettings::default()
+        };
+        assert_eq!(ui.normalized().unwrap().runtime.cuda_graphs, Some(false));
     }
 
     #[test]

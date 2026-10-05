@@ -69,6 +69,7 @@ pub fn fake_decode_report() -> DecodeReport {
             reason: None,
         },
         fallbacks: Vec::new(),
+        ..DecodeReport::default()
     }
 }
 
@@ -202,6 +203,7 @@ impl TextLlm for FakeProvider {
             }),
             decode: self.emit_telemetry.then(fake_decode_report),
             finish_reason: Some(FinishReason::Stop),
+            kv_cache: None,
         })
     }
 }
@@ -296,6 +298,7 @@ impl TextLlm for FakeToolProvider {
             timings: None,
             decode: None,
             finish_reason: Some(FinishReason::Stop),
+            kv_cache: None,
         })
     }
 }

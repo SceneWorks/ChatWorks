@@ -1,5 +1,6 @@
 {
   "execution_backend": "candle-cuda",
+  "cuda_graphs_default": true,
   "backend_capabilities": {
     "backend": "candle-cuda",
     "device": "cuda:0",
@@ -53,6 +54,7 @@
       "replay_forwards": 0,
       "prefix_hit_tokens": 0,
       "prefix_cache": { "path": "miss", "reason": null },
+      "speculative_demoted_at": null,
       "fallbacks": []
     },
     "decode_reported": true

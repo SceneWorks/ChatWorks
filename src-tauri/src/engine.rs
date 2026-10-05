@@ -372,6 +372,7 @@ impl EngineActor {
                 crate::inference_runtime::backend_capabilities(),
             ),
             speculative_default: crate::inference_runtime::speculative_default(),
+            cuda_graphs_default: crate::inference_runtime::cuda_graphs_default(),
             providers: crate::inference_runtime::textllms()
                 .map(|registration| ProviderSummary::from((registration.descriptor)()))
                 .collect(),
@@ -1661,6 +1662,9 @@ pub struct EngineStatus {
     /// The speculative option a request that names none runs under, as the linked runtime
     /// resolves it (epic sc-24432 E5, sc-24445) — what "Runtime default" means in the UI.
     pub speculative_default: Speculative,
+    /// Whether a load with no saved CUDA-graph choice captures graphs on this host — the
+    /// runtime's per-backend default (sc-24446), what an unset CUDA-graph toggle shows.
+    pub cuda_graphs_default: bool,
     pub providers: Vec<ProviderSummary>,
 }
 
@@ -1900,6 +1904,9 @@ pub struct DecodeReportPayload {
     pub prefix_hit_tokens: u64,
     /// The prefix cache's part: `hit` | `miss` | `off` | `bypassed` | `none`, with the reason.
     pub prefix_cache: PathReportPayload,
+    /// The decoded token at which the runtime's acceptance monitor demoted an `auto` proposer to
+    /// plain decoding (sc-24446), or `None` when nothing was demoted.
+    pub speculative_demoted_at: Option<u64>,
     /// Every fallback the request took that no field above names (`speculative: …`).
     pub fallbacks: Vec<String>,
 }
@@ -1925,6 +1932,7 @@ impl From<DecodeReport> for DecodeReportPayload {
             replay_forwards: value.replay_forwards,
             prefix_hit_tokens: value.prefix_hit_tokens,
             prefix_cache: PathReportPayload::from(value.prefix_cache),
+            speculative_demoted_at: value.speculative_demoted_at,
             fallbacks: value.fallbacks,
         }
     }
@@ -2523,7 +2531,7 @@ mod tests {
             assert_eq!(request.speculative, expected, "{extra}");
             let core = request.into_core(CancelFlag::new()).unwrap();
             assert_eq!(core.speculative, expected, "{extra}");
-            assert_eq!(core.mtp, crate::core_llm::MtpMode::Off, "never both");
+            assert_eq!(core.mtp, None, "never both");
         }
         assert!(body(serde_json::json!({"speculative": "off", "mtp": {"mode": "auto"}})).is_err());
         let zero = body(serde_json::json!({"speculative": {"proposer": "mtp", "depth": 0}}))
@@ -2980,6 +2988,7 @@ mod tests {
                 cuda_graphs: FeatureSupport::available(),
             }),
             speculative_default: Speculative::Off,
+            cuda_graphs_default: true,
             providers: Vec::new(),
         };
         let wire = serde_json::to_value(&status).unwrap();
@@ -2989,6 +2998,7 @@ mod tests {
             "execution_backend": wire["execution_backend"],
             "backend_capabilities": wire["backend_capabilities"],
             "speculative_default": wire["speculative_default"],
+            "cuda_graphs_default": wire["cuda_graphs_default"],
             "loaded": {
                 "source": loaded["source"],
                 "quantize": loaded["quantize"],

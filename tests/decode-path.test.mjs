@@ -10,6 +10,7 @@ import {
   cudaGraphsControl,
   decodePathRows,
   dismissSpeculativeNotice,
+  effectiveCudaGraphs,
   enableSpeculativeAuto,
   graphsReloadPending,
   LAST_GENERATION,
@@ -295,6 +296,7 @@ test("the Rust wire shape renders: the view reads tests/engine-status-wire.json 
   assert.match(rows.load_fallbacks.value, /qwen3\.8-27b-mtp/);
   assert.equal(rows.graph_path.value, "eager");
   // AC3 at load, from the engine's own wire shape: the runtime's load fallback is the toggle's reason.
+  assert.equal(effectiveCudaGraphs(null, wire.cuda_graphs_default), true);
   const toggle = cudaGraphsControl(wire.backend_capabilities, false, wire.loaded);
   assert.equal(toggle.disabled, true);
   assert.equal(toggle.reason, "cuda_graphs: positions_host_scalar");
@@ -564,4 +566,32 @@ test("resident NVFP4 weights are labelled lossy beside the served model's name a
   assert.equal(weights(dense).detail, "Resident projections: dense × 505");
   assert.equal(weights({ ...nvfp4, load_report: null }).value, "NVFP4 (lossy)");
   assert.equal(weights({ ...nvfp4, load_report: null }).detail, NVFP4_LOSSY_NOTE);
+});
+
+test("sc-24446: an unset CUDA-graph setting follows the runtime's default; a saved choice wins", () => {
+  assert.equal(effectiveCudaGraphs(null, true), true);
+  assert.equal(effectiveCudaGraphs(undefined, true), true);
+  assert.equal(effectiveCudaGraphs(null, false), false);
+  assert.equal(effectiveCudaGraphs(null, undefined), false);
+  assert.equal(effectiveCudaGraphs(false, true), false);
+  assert.equal(effectiveCudaGraphs(true, false), true);
+  // Served with graphs on under an unset setting whose default is on: nothing to reload.
+  assert.equal(graphsReloadPending(SM120, effectiveCudaGraphs(null, true), { cuda_graphs: true }), false);
+  assert.equal(graphsReloadPending(SM120, effectiveCudaGraphs(false, true), { cuda_graphs: true }), true);
+});
+
+test("sc-24446: a monitor demotion is named on the proposer row", () => {
+  const base = {
+    path: "prompt_lookup", proposer: "prompt_lookup", draft_tokens: 4, proposed_tokens: 8,
+    accepted_tokens: 1, target_forwards: 6, verify_steps: 4, mean_accepted_length: 0.25,
+    cuda_graphs: { enabled: false, path: "none" }, graph_path: "none", fallbacks: [],
+  };
+  const demoted = Object.fromEntries(decodePathRows({ loaded: { last_decode: { ...base, speculative_demoted_at: 24 } } })
+    .map((row) => [row.key, row]));
+  assert.equal(demoted.proposer.value, "prompt_lookup · 4 drafts → plain");
+  assert.equal(demoted.proposer.detail, "Accepted 1 of 8 drafts in 6 forwards · Demoted to plain decoding at token 24");
+  const kept = Object.fromEntries(decodePathRows({ loaded: { last_decode: { ...base, speculative_demoted_at: null } } })
+    .map((row) => [row.key, row]));
+  assert.equal(kept.proposer.value, "prompt_lookup · 4 drafts");
+  assert.equal(kept.proposer.detail, "Accepted 1 of 8 drafts in 6 forwards");
 });

@@ -20,6 +20,7 @@ import { checkHfCredentialStatus } from "../state/credentials.js";
 import {
   dismissSpeculativeNotice,
   enableSpeculativeAuto,
+  effectiveCudaGraphs,
   graphsReloadPending,
   selectedWeightFormat,
   serveAction,
@@ -59,7 +60,7 @@ export function ModelsScreen() {
   // "Reload" (graphs are a load option).
   const reloadPending = graphsReloadPending(
     engineStatus?.backend_capabilities,
-    appSettings?.runtime?.cudaGraphs,
+    effectiveCudaGraphs(appSettings?.runtime?.cudaGraphs, engineStatus?.cuda_graphs_default),
     engineStatus?.loaded,
   );
   const selectedModel = registry.models.find((model) => model.id === registry.selectedId) ?? null;
