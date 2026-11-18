@@ -10,6 +10,7 @@ use tauri::{AppHandle, Emitter};
 
 use crate::engine::{EngineHandle, EngineStatus, LoadModelRequest, QuantizeRequest};
 use crate::fsutil::{now_secs, write_json_atomic};
+use sha2::{Digest, Sha256};
 
 mod block_drafts;
 pub use block_drafts::{block_draft_options, install_block_draft, BlockDraftOption};
@@ -174,6 +175,14 @@ struct HfSibling {
     rfilename: String,
     #[serde(default)]
     size: Option<u64>,
+    /// The Git LFS pointer the `?blobs=true` listing reports for a large file: its content hash.
+    #[serde(default)]
+    lfs: Option<HfLfs>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct HfLfs {
+    sha256: String,
 }
 
 pub fn list_registered_models(app: &AppHandle) -> Result<ModelRegistry, String> {
@@ -462,6 +471,7 @@ async fn import_hf_model_inner(
     let snapshots_dir = data_dir.join("models").join("snapshots");
     let snapshot_dir = snapshots_dir.join(snapshot_dir_name(&model_ref));
     let manifest = registry_path(app)?;
+    let _downloading = SnapshotDownload::claim(&snapshot_dir)?;
     let token = import_token(
         crate::profile::root()?.is_some(),
         read_hf_token(),
@@ -510,7 +520,7 @@ async fn import_hf_model_inner(
     let mut downloaded_bytes = 0_u64;
     for file in &files {
         let target = snapshot_dir.join(&file.rfilename);
-        if file_is_complete(&target, file.size) {
+        if cached_file_matches(&target, file).await {
             downloaded_bytes = downloaded_bytes.saturating_add(file.size.unwrap_or(0));
             emit_progress(
                 app,
@@ -1027,12 +1037,14 @@ impl DownloadContext<'_> {
                 .unwrap_or("download")
         ));
         let mut output = fs::File::create(&part_path).map_err(|error| error.to_string())?;
+        let mut hasher = Sha256::new();
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|error| error.to_string())?;
             output
                 .write_all(&chunk)
                 .map_err(|error| error.to_string())?;
+            hasher.update(&chunk);
             *downloaded_bytes = downloaded_bytes.saturating_add(chunk.len() as u64);
             emit_progress(
                 self.app,
@@ -1047,9 +1059,122 @@ impl DownloadContext<'_> {
             );
         }
         output.flush().map_err(|error| error.to_string())?;
+        drop(output);
+        // A file is renamed into the snapshot only once its bytes are the listed content.
+        if let Err(error) = check_downloaded_content(file, &part_path, &hex(&hasher.finalize())) {
+            let _ = fs::remove_file(&part_path);
+            return Err(error);
+        }
         fs::rename(&part_path, target).map_err(|error| error.to_string())?;
         Ok(())
     }
+}
+
+/// Whether the downloaded bytes at `path` (hashed to `sha256`) are `file` as listed: its size,
+/// and its Git LFS content hash when the listing reports one.
+fn check_downloaded_content(file: &HfSibling, path: &Path, sha256: &str) -> Result<(), String> {
+    let size = fs::metadata(path).map_err(|error| error.to_string())?.len();
+    if let Some(expected) = file.size.filter(|expected| *expected != size) {
+        return Err(format!(
+            "{} downloaded {size} bytes; the repository lists {expected}",
+            file.rfilename
+        ));
+    }
+    match &file.lfs {
+        Some(lfs) if !lfs.sha256.eq_ignore_ascii_case(sha256) => Err(format!(
+            "{} failed its checksum: sha256 {sha256}, the repository lists {}",
+            file.rfilename, lfs.sha256
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// An already-downloaded `path` that is `file` as listed: the right size and, for an LFS file,
+/// the listed sha256 (hashed off the async runtime). A mismatch is downloaded again.
+async fn cached_file_matches(path: &Path, file: &HfSibling) -> bool {
+    if !file_is_complete(path, file.size) {
+        return false;
+    }
+    let Some(lfs) = file.lfs.clone() else {
+        return true;
+    };
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        sha256_file(&path).is_ok_and(|actual| actual.eq_ignore_ascii_case(&lfs.sha256))
+    })
+    .await
+    .unwrap_or(false)
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut input = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1 << 20];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(hex(&hasher.finalize()));
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The snapshot directories this process is downloading into. A second download into the same
+/// snapshot would truncate the first one's `.part` files, so it is refused while one runs.
+static SNAPSHOT_DOWNLOADS: std::sync::Mutex<std::collections::BTreeSet<PathBuf>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// This process's claim on downloading into one snapshot directory, released on drop.
+struct SnapshotDownload(PathBuf);
+
+impl SnapshotDownload {
+    fn claim(dir: &Path) -> Result<Self, String> {
+        let mut active = SNAPSHOT_DOWNLOADS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !active.insert(dir.to_path_buf()) {
+            return Err(format!(
+                "{} is already being downloaded; wait for that download to finish",
+                dir.display()
+            ));
+        }
+        Ok(Self(dir.to_path_buf()))
+    }
+}
+
+impl Drop for SnapshotDownload {
+    fn drop(&mut self) {
+        SNAPSHOT_DOWNLOADS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// Refuse a download of `needed` bytes into `dir` unless its volume keeps `reserve` bytes free.
+fn ensure_free_space(dir: &Path, needed: u64, reserve: u64) -> Result<(), String> {
+    let available = fs2::available_space(dir)
+        .map_err(|error| format!("could not read free space at {}: {error}", dir.display()))?;
+    check_free_space(available, needed, reserve)
+}
+
+fn check_free_space(available: u64, needed: u64, reserve: u64) -> Result<(), String> {
+    let required = needed.saturating_add(reserve);
+    if available < required {
+        const GIB: f64 = (1_u64 << 30) as f64;
+        return Err(format!(
+            "not enough free disk space: the download needs {:.1} GiB plus a {:.1} GiB reserve; \
+             {:.1} GiB is free",
+            needed as f64 / GIB,
+            reserve as f64 / GIB,
+            available as f64 / GIB
+        ));
+    }
+    Ok(())
 }
 
 impl HfModelRef {
@@ -2021,6 +2146,84 @@ mod tests {
     use super::*;
     use crate::fsutil::TempDir;
 
+    fn listed(name: &str, body: &[u8], lfs: bool) -> HfSibling {
+        HfSibling {
+            rfilename: name.to_string(),
+            size: Some(body.len() as u64),
+            lfs: lfs.then(|| HfLfs {
+                sha256: hex(&Sha256::digest(body)),
+            }),
+        }
+    }
+
+    /// A download is renamed into the snapshot only when its bytes are the listed content: a
+    /// right-sized but different (zero-filled) file fails the LFS sha256; a short file fails its
+    /// size. An already-present file is reused only when it matches the same way.
+    #[test]
+    fn downloads_and_cached_files_must_match_the_listed_sha256() {
+        let dir = TempDir::new("hf-sha256");
+        let weights = b"real weights".to_vec();
+        let file = listed("model.safetensors", &weights, true);
+        let path = dir.path().join("model.safetensors.part");
+        fs::write(&path, &weights).unwrap();
+        let digest = sha256_file(&path).unwrap();
+        assert!(check_downloaded_content(&file, &path, &digest).is_ok());
+
+        let zeros = vec![0_u8; weights.len()];
+        fs::write(&path, &zeros).unwrap();
+        let why = check_downloaded_content(&file, &path, &sha256_file(&path).unwrap()).unwrap_err();
+        assert!(why.contains("failed its checksum"), "{why}");
+        fs::write(&path, b"short").unwrap();
+        assert!(
+            check_downloaded_content(&file, &path, &sha256_file(&path).unwrap())
+                .unwrap_err()
+                .contains("downloaded 5 bytes")
+        );
+        // A non-LFS file has no listed hash; its size is still checked.
+        let config = listed("config.json", b"{}", false);
+        fs::write(&path, b"{}").unwrap();
+        assert!(check_downloaded_content(&config, &path, "unused").is_ok());
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let cached = dir.path().join("model.safetensors");
+        fs::write(&cached, &zeros).unwrap();
+        assert!(!runtime.block_on(cached_file_matches(&cached, &file)));
+        fs::write(&cached, &weights).unwrap();
+        assert!(runtime.block_on(cached_file_matches(&cached, &file)));
+        assert!(!runtime.block_on(cached_file_matches(&dir.path().join("missing"), &file)));
+    }
+
+    /// One download per snapshot directory at a time in this process; the claim ends on drop.
+    #[test]
+    fn a_second_download_into_the_same_snapshot_is_refused_while_one_runs() {
+        let dir = TempDir::new("hf-claim");
+        let snapshot = dir.path().join("snapshot");
+        let first = SnapshotDownload::claim(&snapshot).unwrap();
+        let other = SnapshotDownload::claim(&dir.path().join("other")).unwrap();
+        assert!(SnapshotDownload::claim(&snapshot)
+            .err()
+            .unwrap()
+            .contains("already being downloaded"));
+        drop(first);
+        drop(other);
+        assert!(SnapshotDownload::claim(&snapshot).is_ok());
+    }
+
+    #[test]
+    fn a_download_needs_its_size_plus_the_reserve_free() {
+        const GIB: u64 = 1 << 30;
+        assert!(check_free_space(10 * GIB, 4 * GIB, 2 * GIB).is_ok());
+        assert!(check_free_space(6 * GIB, 4 * GIB, 2 * GIB).is_ok());
+        let why = check_free_space(5 * GIB, 4 * GIB, 2 * GIB).unwrap_err();
+        assert!(
+            why.contains("needs 4.0 GiB plus a 2.0 GiB reserve; 5.0 GiB is free"),
+            "{why}"
+        );
+        let dir = TempDir::new("hf-free-space");
+        assert!(ensure_free_space(dir.path(), u64::MAX / 2, 0).is_err());
+        assert!(ensure_free_space(dir.path(), 0, 0).is_ok());
+    }
+
     #[test]
     fn parses_huggingface_urls() {
         let parsed = HfModelRef::parse("https://huggingface.co/Qwen/Qwen3-0.6B/tree/main").unwrap();
@@ -2089,14 +2292,17 @@ mod tests {
             HfSibling {
                 rfilename: "PQ2_0.gguf".to_string(),
                 size: Some(1),
+                lfs: None,
             },
             HfSibling {
                 rfilename: "PTQ1_0.gguf".to_string(),
                 size: Some(1),
+                lfs: None,
             },
             HfSibling {
                 rfilename: "mmproj-F16.gguf".to_string(),
                 size: Some(1),
+                lfs: None,
             },
         ];
         let projector = parse_projector_ref(
@@ -2324,6 +2530,7 @@ mod tests {
         let sibling = |name: &str| HfSibling {
             rfilename: name.to_string(),
             size: None,
+            lfs: None,
         };
         let order: Vec<String> = config_first(vec![
             sibling("added_tokens.json"),
@@ -2739,14 +2946,17 @@ mod tests {
             HfSibling {
                 rfilename: "chat_template.jinja".to_string(),
                 size: Some(8_700),
+                lfs: None,
             },
             HfSibling {
                 rfilename: "config.json".to_string(),
                 size: Some(2_000),
+                lfs: None,
             },
             HfSibling {
                 rfilename: "model-00001-of-00002.safetensors".to_string(),
                 size: Some(26_000_000_000),
+                lfs: None,
             },
         ];
         let parent = serde_json::json!({
@@ -2782,6 +2992,7 @@ mod tests {
         let packed = vec![HfSibling {
             rfilename: "Ternary-Bonsai-2-27B-PQ2_0.gguf".to_string(),
             size: Some(6_700_000_000),
+            lfs: None,
         }];
         assert_eq!(
             guard_cpu_import(&bonsai, &packed, None, true).unwrap_err(),
@@ -2791,6 +3002,7 @@ mod tests {
         let ptq = vec![HfSibling {
             rfilename: "Ternary-Bonsai-2-27B-PTQ1_0.gguf".to_string(),
             size: Some(5_500_000_000),
+            lfs: None,
         }];
         assert!(guard_cpu_import(&bonsai, &ptq, None, true).is_err());
         let bonsai_mlx = HfModelRef::parse("prism-ml/Ternary-Bonsai-2-27B-mlx-2bit").unwrap();

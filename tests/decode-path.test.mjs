@@ -629,6 +629,32 @@ test("SW-7199 AC3: a block-draft decode names the proposer, the draft that ran a
     assert.ok(html.includes(text), `missing ${text} in ${html}`);
   }
 
+  // A DFlash2 draft (its runtime label) at the default 8-bit precision reads the same way.
+  const dflash2 = status(MLX, {
+    quantize: "q4",
+    cuda_graphs: null,
+    draft_source: "/s/dflash2",
+    draft_quantize: null,
+    provider: { capabilities: { speculative: [{ proposer: "block_draft", max_depth: 7, recommended_depth: 4 }] } },
+    load_report: { cuda_graphs: null, projections: [], prefix_cache_bytes: null, fallbacks: [], draft: { source: "/s/dflash2", refusal: null } },
+    last_decode: {
+      ...DECODE,
+      path: "block_draft",
+      proposer: "block_draft",
+      draft_tokens: 4,
+      draft: { source: "/s/dflash2", format: "dflash2", precision: "q8" },
+      proposed_tokens: 8,
+      accepted_tokens: 6,
+      verify_steps: 2,
+      mean_accepted_length: 3,
+    },
+  });
+  const dflash2Rows = Object.fromEntries(decodePathRows(dflash2).map((row) => [row.key, row]));
+  assert.equal(dflash2Rows.proposer.value, "block_draft · 4 drafts");
+  assert.equal(dflash2Rows.decode_draft.value, "dflash2 · 8-bit");
+  assert.equal(dflash2Rows.decode_draft.detail, "/s/dflash2");
+  assert.equal(dflash2Rows.accepted_length.value, "3.00 drafts per verify step");
+
   // A refused block draft is named with the runtime's reason; the model still serves plainly.
   const refusal = "block draft: hidden_size: hidden_size 4096 != target 5120";
   const refused = status(MLX, {

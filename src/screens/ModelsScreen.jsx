@@ -91,7 +91,10 @@ export function ModelsScreen() {
     Promise.all(registry.models.map((model) =>
       invoke("block_draft_options", { modelId: model.id })
         .then((options) => [model.id, options])
-        .catch(() => [model.id, []])))
+        .catch((cause) => {
+          if (!cancelled) setError(`Could not read block drafts for ${model.name}: ${String(cause)}`);
+          return [model.id, []];
+        })))
       .then((entries) => { if (!cancelled) setBlockDrafts(Object.fromEntries(entries)); });
     return () => { cancelled = true; };
   }, [registry]);
