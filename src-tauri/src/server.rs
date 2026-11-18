@@ -1733,6 +1733,7 @@ mod tests {
                 draft_source: None,
                 prefix_cache_bytes: None,
                 mtp_head_source: None,
+                draft_quantize: None,
             })
             .unwrap();
         engine
@@ -1750,6 +1751,7 @@ mod tests {
                 draft_source: None,
                 prefix_cache_bytes: None,
                 mtp_head_source: None,
+                draft_quantize: None,
             })
             .unwrap();
         engine
@@ -1767,6 +1769,7 @@ mod tests {
                 draft_source: None,
                 prefix_cache_bytes: None,
                 mtp_head_source: None,
+                draft_quantize: None,
             })
             .unwrap();
         engine
@@ -1932,6 +1935,56 @@ mod tests {
         );
     }
 
+    /// SW-7199: an API caller's `block_draft` request reaches the runtime unchanged, and the
+    /// response's `chatworks_decode` names the proposer, the draft and its precision that ran.
+    #[test]
+    fn a_block_draft_request_passes_through_and_its_draft_is_reported() {
+        let engine = EngineHandle::spawn_with_loader(crate::test_support::block_draft_loader);
+        engine
+            .load_model(crate::engine::LoadModelRequest {
+                source: "/tmp/sw-7199-server-target".to_string(),
+                display_name: None,
+                quantize: None,
+                projector_source: None,
+                cuda_graphs: None,
+                draft_source: Some("/tmp/sw-7199-server-dspine".to_string()),
+                prefix_cache_bytes: None,
+                mtp_head_source: None,
+                draft_quantize: Some(crate::engine::QuantizeRequest::Q4),
+            })
+            .unwrap();
+        let request: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hello"}],
+            "speculative": {"proposer": "block_draft", "depth": 3},
+        }))
+        .unwrap();
+        let generated = request
+            .into_generate_for_engine(
+                &SamplingDefaults {
+                    system_prompt: String::new(),
+                    max_tokens: 8,
+                    ..Default::default()
+                },
+                &engine,
+            )
+            .unwrap();
+        assert_eq!(
+            generated.speculative,
+            Some(Speculative::proposer(SpeculativeProposer::BlockDraft, 3))
+        );
+        let response = OpenAiChatResponse::from_generate(
+            "test".to_string(),
+            engine.generate(generated, |_| {}).unwrap(),
+        );
+        let decode = &serde_json::to_value(response).unwrap()["chatworks_decode"];
+        assert_eq!(decode["proposer"], "block_draft");
+        assert_eq!(decode["draft_tokens"], 3);
+        assert_eq!(decode["draft"]["source"], "/tmp/sw-7199-server-dspine");
+        assert_eq!(decode["draft"]["format"], "dspine");
+        assert_eq!(decode["draft"]["precision"], "q4");
+        assert_eq!(decode["mean_accepted_length"], 2.5);
+    }
+
     #[test]
     fn inherited_controls_resolve_through_loaded_engine_but_explicit_unsupported_controls_error() {
         let engine = loaded_fake_engine();
@@ -1972,6 +2025,10 @@ mod tests {
             (
                 "speculative",
                 json!({"proposer": "draft_model", "depth": 2}),
+            ),
+            (
+                "speculative",
+                json!({"proposer": "block_draft", "depth": 4}),
             ),
         ] {
             let mut wire = base.clone();
@@ -2624,6 +2681,7 @@ mod tests {
                 draft_source: None,
                 prefix_cache_bytes: None,
                 mtp_head_source: None,
+                draft_quantize: None,
             })
             .unwrap();
         let request = |prompt| {

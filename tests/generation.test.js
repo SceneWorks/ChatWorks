@@ -3,8 +3,8 @@ import test from "node:test";
 import { chatRequestBody, toOpenAiMessage } from "../src/api/sse.js";
 import { paramsFromConversation, paramsToConversation } from "../src/state/conversations.js";
 import {
-  applySamplingPreset, clampSpeculativeDepth, generationParams, generationSettings, speculativeDepthNote,
-  speculativeOptions,
+  applySamplingPreset, clampSpeculativeDepth, generationOverrides, generationParams, generationSettings,
+  proposerUnavailableNote, speculativeDepthNote, speculativeOptions,
 } from "../src/state/generation.js";
 import { appendAttachmentPlaceholders, settleAttachment, registerPreparation } from "../src/state/attachments.js";
 import { isExactGgufUrl, modelSubtitle, unloadServedModel } from "../src/state/models.js";
@@ -97,7 +97,7 @@ test("sc-24445: the control offers the inherited default, off, auto and only the
   assert.deepEqual(values(speculativeOptions({})), ["", "off", "auto"]);
   // Settings (no model in view) offers every proposer and names the runtime's default.
   const settings = speculativeOptions(null, "", true, "off");
-  assert.deepEqual(values(settings), ["", "off", "auto", "mtp", "prompt_lookup", "draft_model"]);
+  assert.deepEqual(values(settings), ["", "off", "auto", "mtp", "prompt_lookup", "draft_model", "block_draft"]);
   assert.equal(settings[0][1], "Runtime default (off)");
   // A saved proposer the model does not advertise stays visible, marked unavailable.
   const unavailable = speculativeOptions({}, "draft_model");
@@ -327,4 +327,34 @@ test("local video decoder failure names the file without a remote CORS explanati
     URL.createObjectURL = previousCreate;
     URL.revokeObjectURL = previousRevoke;
   }
+});
+
+test("SW-7199 AC1: a model with a resident block draft offers block_draft and sends it, clamped to its depth", () => {
+  const blockDraft = { ...capabilities, speculative: [...capabilities.speculative, { proposer: "block_draft", max_depth: 15, recommended_depth: 4 }] };
+  assert.ok(speculativeOptions(blockDraft).some(([value, label]) => value === "block_draft" && label === "Block draft"));
+  assert.ok(!speculativeOptions(capabilities).some(([value]) => value === "block_draft"), "auto-only models never list it");
+  const params = { ...generationParams({ speculative: { proposer: "block_draft", depth: 20 } }), disableThinking: false };
+  assert.deepEqual(generationOverrides(params, blockDraft).speculative, { proposer: "block_draft", depth: 15 });
+  // Not advertised (no draft loaded, or refused): the request runs off.
+  assert.equal(generationOverrides(params, capabilities).speculative, "off");
+});
+
+test("SW-7199 AC1: a chosen draft proposer the model cannot run is explained from the load", () => {
+  const loaded = (draft, extra = {}) => ({
+    provider: { capabilities },
+    draft_source: draft?.source ?? null,
+    load_report: { draft },
+    ...extra,
+  });
+  assert.equal(proposerUnavailableNote("mtp", loaded(null)), null, "advertised");
+  assert.equal(proposerUnavailableNote("auto", loaded(null)), null);
+  assert.equal(proposerUnavailableNote("block_draft", null), null, "no model served");
+  assert.match(proposerUnavailableNote("block_draft", loaded(null)), /no block draft is loaded with it — install one under Models/);
+  assert.match(
+    proposerUnavailableNote("block_draft", loaded({ source: "/d/dspine", refusal: "block draft: hidden_size: hidden_size 4096 != target 5120" })),
+    /refused its draft \(block draft: hidden_size: hidden_size 4096 != target 5120\)\. Decoding runs without a proposer\./,
+  );
+  assert.match(proposerUnavailableNote("block_draft", loaded({ source: "/m/qwen3-0.6b", refusal: null })), /its draft is not a block draft/);
+  assert.match(proposerUnavailableNote("draft_model", loaded(null)), /no draft model is loaded/);
+  assert.match(proposerUnavailableNote("prompt_lookup", { provider: { capabilities: {} } }), /does not advertise it/);
 });

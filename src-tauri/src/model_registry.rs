@@ -11,6 +11,9 @@ use tauri::{AppHandle, Emitter};
 use crate::engine::{EngineHandle, EngineStatus, LoadModelRequest, QuantizeRequest};
 use crate::fsutil::{now_secs, write_json_atomic};
 
+mod block_drafts;
+pub use block_drafts::{block_draft_options, install_block_draft, BlockDraftOption};
+
 const HF_HOST: &str = "huggingface.co";
 const HF_KEYCHAIN_SERVICE: &str = "net.trefry.chatworks.huggingface";
 const HF_KEYCHAIN_USER: &str = "token";
@@ -90,6 +93,10 @@ pub struct ModelEntry {
     /// sent as the load's `LoadSpec::draft_source`. `None` loads no draft.
     #[serde(default)]
     pub draft_source: Option<String>,
+    /// The load precision of a block draft named by `draft_source` (feature SW-F360), sent as the
+    /// load's `LoadSpec::draft_quantize`: `q8` or `q4`. `None` is the runtime's default (8-bit).
+    #[serde(default)]
+    pub draft_quantize: Option<QuantizeRequest>,
     /// The user's prefix-cache byte budget for this model, sent as the load's
     /// `LoadSpec::prefix_cache_bytes`. `None` keeps the runtime's default; `Some(0)` turns it off.
     #[serde(default)]
@@ -257,6 +264,7 @@ pub fn adopt_cached_hf_model(
         draft_source: None,
         prefix_cache_bytes: None,
         mtp_head_source: None,
+        draft_quantize: None,
     };
     let manifest = registry_path(app)?;
     let mut registry = read_registry(&manifest)?;
@@ -342,14 +350,16 @@ pub fn load_registered_model(
 }
 
 /// Save a registered model's load options (epic sc-24432): its draft model and companion MTP head
-/// (`None` or blank = none) and prefix-cache budget (`None` = the runtime's default). They apply
-/// the next time the model is loaded.
+/// (`None` or blank = none), prefix-cache budget (`None` = the runtime's default) and block-draft
+/// precision (`None` = the runtime's 8-bit default; SW-F360). They apply the next time the model
+/// is loaded.
 pub fn set_model_load_options(
     app: &AppHandle,
     model_id: &str,
     draft_source: Option<String>,
     prefix_cache_bytes: Option<u64>,
     mtp_head_source: Option<String>,
+    draft_quantize: Option<QuantizeRequest>,
 ) -> Result<ModelRegistry, String> {
     set_model_load_options_in(
         &registry_path(app)?,
@@ -357,6 +367,7 @@ pub fn set_model_load_options(
         draft_source,
         prefix_cache_bytes,
         mtp_head_source,
+        draft_quantize,
     )
 }
 
@@ -373,7 +384,15 @@ fn set_model_load_options_in(
     draft_source: Option<String>,
     prefix_cache_bytes: Option<u64>,
     mtp_head_source: Option<String>,
+    draft_quantize: Option<QuantizeRequest>,
 ) -> Result<ModelRegistry, String> {
+    // A block draft loads at 8 or 4 bits only (the runtime's `BlockDraftPrecision`).
+    if !matches!(
+        draft_quantize,
+        None | Some(QuantizeRequest::Q8) | Some(QuantizeRequest::Q4)
+    ) {
+        return Err("a block draft loads at 8-bit (q8) or 4-bit (q4) precision".to_string());
+    }
     let mut registry = read_registry(manifest)?;
     let entry = registry
         .models
@@ -383,6 +402,7 @@ fn set_model_load_options_in(
     entry.draft_source = optional_path(draft_source);
     entry.prefix_cache_bytes = prefix_cache_bytes;
     entry.mtp_head_source = optional_path(mtp_head_source);
+    entry.draft_quantize = draft_quantize;
     write_registry(manifest, &registry)?;
     Ok(registry)
 }
@@ -576,6 +596,7 @@ async fn import_hf_model_inner(
         draft_source: None,
         prefix_cache_bytes: None,
         mtp_head_source: None,
+        draft_quantize: None,
     };
     upsert_model(&mut registry, entry);
     write_registry(&manifest, &registry)?;
@@ -947,6 +968,7 @@ pub(crate) fn load_request_for(
         draft_source: entry.draft_source.clone(),
         prefix_cache_bytes: entry.prefix_cache_bytes,
         mtp_head_source: entry.mtp_head_source.clone(),
+        draft_quantize: entry.draft_quantize,
     })
 }
 
@@ -2379,6 +2401,7 @@ mod tests {
             draft_source: None,
             prefix_cache_bytes: None,
             mtp_head_source: None,
+            draft_quantize: None,
         };
         let mut settings = crate::app_settings::AppSettings::default();
         settings.runtime.cuda_graphs = Some(true);
@@ -2467,6 +2490,7 @@ mod tests {
             Some(" /snapshots/qwen3-0.6b ".to_string()),
             Some(256 << 20),
             Some(" /snapshots/qwen3.8-27b-mtp ".to_string()),
+            Some(QuantizeRequest::Q4),
         )
         .unwrap();
         let saved = &read_registry(&manifest).unwrap().models[0];
@@ -2476,9 +2500,11 @@ mod tests {
             saved.mtp_head_source.as_deref(),
             Some("/snapshots/qwen3.8-27b-mtp")
         );
+        assert_eq!(saved.draft_quantize, Some(QuantizeRequest::Q4));
         assert_eq!(registry.models[0].draft_source, saved.draft_source);
         let request =
             load_request_for(saved, None, no_settings, &capabilities(false, false)).unwrap();
+        assert_eq!(request.draft_quantize, Some(QuantizeRequest::Q4));
         assert_eq!(
             request.draft_source.as_deref(),
             Some("/snapshots/qwen3-0.6b")
@@ -2495,6 +2521,7 @@ mod tests {
             spec.mtp_head_source.as_deref(),
             Some("/snapshots/qwen3.8-27b-mtp")
         );
+        assert_eq!(spec.draft_quantize, Some(crate::core_llm::Quantize::Q4));
 
         // Clearing: a blank draft or head is none, and a `None` budget is the runtime's default.
         set_model_load_options_in(
@@ -2503,6 +2530,7 @@ mod tests {
             Some("  ".to_string()),
             None,
             Some(" ".to_string()),
+            None,
         )
         .unwrap();
         let cleared = &read_registry(&manifest).unwrap().models[0];
@@ -2511,13 +2539,25 @@ mod tests {
         assert_eq!(request.draft_source, None);
         assert_eq!(request.prefix_cache_bytes, None);
         assert_eq!(request.mtp_head_source, None);
+        assert_eq!(request.draft_quantize, None, "the runtime's 8-bit default");
+        // A block draft runs at 8 or 4 bits only.
+        assert!(set_model_load_options_in(
+            &manifest,
+            "qwen3-32b",
+            None,
+            None,
+            None,
+            Some(QuantizeRequest::Nvfp4)
+        )
+        .unwrap_err()
+        .contains("q8"));
         // `Some(0)` (off) is distinct from the runtime's default.
-        set_model_load_options_in(&manifest, "qwen3-32b", None, Some(0), None).unwrap();
+        set_model_load_options_in(&manifest, "qwen3-32b", None, Some(0), None, None).unwrap();
         assert_eq!(
             read_registry(&manifest).unwrap().models[0].prefix_cache_bytes,
             Some(0)
         );
-        assert!(set_model_load_options_in(&manifest, "missing", None, None, None).is_err());
+        assert!(set_model_load_options_in(&manifest, "missing", None, None, None, None).is_err());
     }
 
     /// sc-24140 feature-end review: an unreadable settings file blocks a load only where the
@@ -3184,6 +3224,7 @@ mod tests {
                 draft_source: None,
                 prefix_cache_bytes: None,
                 mtp_head_source: None,
+                draft_quantize: None,
             },
         );
         upsert_model(
@@ -3208,6 +3249,7 @@ mod tests {
                 draft_source: None,
                 prefix_cache_bytes: None,
                 mtp_head_source: None,
+                draft_quantize: None,
             },
         );
         assert_eq!(registry.models.len(), 1);
@@ -3259,6 +3301,7 @@ mod tests {
             draft_source: None,
             prefix_cache_bytes: None,
             mtp_head_source: None,
+            draft_quantize: None,
         };
         let mut value = serde_json::to_value(ModelRegistry {
             models: vec![entry],

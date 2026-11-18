@@ -1,7 +1,7 @@
 // Optional controls retain the model default until the user chooses an override.
 //
 // Speculative decoding is the runtime's proposer-agnostic option (sc-24445):
-// `"off" | "auto" | {proposer: "mtp" | "prompt_lookup" | "draft_model", depth}`. In the form it is
+// `"off" | "auto" | {proposer: "mtp" | "prompt_lookup" | "draft_model" | "block_draft", depth}`. In the form it is
 // `speculativeMode` (`""`, `off`, `auto` or a proposer) plus `speculativeDepth`. An unchosen mode is
 // `""`, never a UI constant: a request then omits `speculative` (the server applies the saved
 // setting) and a saved setting stores `null` (the runtime's own default applies, epic sc-24432 E5).
@@ -11,6 +11,9 @@ export const SPECULATIVE_PROPOSERS = [
   ["mtp", "MTP head"],
   ["prompt_lookup", "Prompt lookup"],
   ["draft_model", "Draft model"],
+  // A DSpine / DFlash2 block draft installed beside a Qwen3.8-27B model (SW-F360). `auto` never
+  // picks it; the user chooses it.
+  ["block_draft", "Block draft"],
 ];
 
 /// The draft depth a proposer starts at when the form has none (the legacy MTP default).
@@ -72,6 +75,27 @@ export function speculativeOptions(capabilities, selected = "", defaults = false
     options.push([selected, `${label} (not available for this model)`]);
   }
   return options;
+}
+
+/// Why the chosen proposer will not run on the served model, or `null` when it is advertised (or
+/// no proposer is chosen). A draft-backed proposer names the load's own reason: the draft the
+/// runtime refused, or that no draft was loaded. The request then runs `off` ([`speculativeRequest`]).
+export function proposerUnavailableNote(mode, loaded) {
+  if (!mode || mode === "off" || mode === "auto" || !loaded) return null;
+  if (proposerCapability(loaded.provider?.capabilities, mode)) return null;
+  const draftBacked = mode === "draft_model" || mode === "block_draft";
+  const draft = loaded.load_report?.draft;
+  let why = "this model does not advertise it";
+  if (draftBacked && draft?.refusal) {
+    why = `the runtime refused its draft (${draft.refusal})`;
+  } else if (draftBacked && !loaded.draft_source) {
+    why = mode === "block_draft"
+      ? "no block draft is loaded with it — install one under Models, then reload"
+      : "no draft model is loaded with it — choose one under Models, then reload";
+  } else if (draftBacked && draft && !draft.refusal) {
+    why = `its draft is not a ${mode === "block_draft" ? "block draft" : "draft model"}`;
+  }
+  return `Not available: ${why}. Decoding runs without a proposer.`;
 }
 
 /// A speculative option as a short label: `off`, `auto`, or `prompt_lookup · depth 4`.

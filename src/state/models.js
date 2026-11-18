@@ -61,10 +61,14 @@ export function prefixCacheBytesFromField(value) {
   return Math.round(mib * MIB);
 }
 
-/// The draft-model choices for `model`: none, then every other registered model by its snapshot
-/// path. A saved draft that is no longer registered stays visible.
-export function draftModelOptions(models, model) {
+/// The draft-model choices for `model`: none, every block draft installed for it that it can use
+/// (`block_draft_options`, SW-F360), then every other registered model by its snapshot path. A
+/// saved draft that is no longer registered or installed stays visible.
+export function draftModelOptions(models, model, blockDrafts = []) {
   const options = [["", "No draft model"]];
+  for (const draft of usableBlockDrafts(blockDrafts)) {
+    options.push([draft.installedPath, `${draft.label} block draft`]);
+  }
   for (const other of models) {
     if (other.id !== model.id && other.localPath) options.push([other.localPath, other.name]);
   }
@@ -74,11 +78,39 @@ export function draftModelOptions(models, model) {
   return options;
 }
 
-/// Whether the served model was loaded with `model`'s saved draft model, companion MTP head and
-/// prefix-cache budget (the load options the engine echoes in `loaded.draft_source`,
-/// `loaded.mtp_head_source` and `loaded.prefix_cache_bytes`).
+/// The installed block drafts `model` can use.
+function usableBlockDrafts(blockDrafts) {
+  return blockDrafts.filter((draft) => draft.installedPath && !draft.unavailable);
+}
+
+/// Whether `model`'s saved draft is one of its installed block drafts (its precision then applies).
+export function savedBlockDraft(model, blockDrafts = []) {
+  return blockDrafts.find((draft) => draft.installedPath && draft.installedPath === model.draftSource) ?? null;
+}
+
+/// The precisions a block draft loads at (`LoadSpec::draft_quantize`): blank = the runtime's 8-bit
+/// default.
+export const BLOCK_DRAFT_PRECISION_OPTIONS = [["", "8-bit draft (default)"], ["q4", "4-bit draft"]];
+
+/// What a catalog block draft offers `model`: its reason when the model cannot use it, "use" when
+/// installed, else "install".
+export function blockDraftAction(draft, model) {
+  if (draft.unavailable) return { kind: "unavailable", label: draft.unavailable };
+  if (draft.installedPath) {
+    return draft.installedPath === model.draftSource
+      ? { kind: "selected", label: "In use — loads with the model" }
+      : { kind: "use", label: "Use" };
+  }
+  return { kind: "install", label: "Install" };
+}
+
+/// Whether the served model was loaded with `model`'s saved draft model (and block-draft
+/// precision), companion MTP head and prefix-cache budget (the load options the engine echoes in
+/// `loaded.draft_source`, `loaded.draft_quantize`, `loaded.mtp_head_source` and
+/// `loaded.prefix_cache_bytes`).
 export function servedWithLoadOptions(model, loaded) {
   return (model.draftSource ?? null) === (loaded?.draft_source ?? null)
+    && (model.draftQuantize ?? null) === (loaded?.draft_quantize ?? null)
     && (model.mtpHeadSource ?? null) === (loaded?.mtp_head_source ?? null)
     && (model.prefixCacheBytes ?? null) === (loaded?.prefix_cache_bytes ?? null);
 }

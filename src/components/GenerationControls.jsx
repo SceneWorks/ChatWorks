@@ -1,11 +1,15 @@
-import { proposerCapability, speculativeDepthNote, speculativeOptions } from "../state/generation.js";
+import {
+  proposerCapability, proposerUnavailableNote, speculativeDepthNote, speculativeOptions,
+} from "../state/generation.js";
 
 /// `speculativeLimits`: the capabilities whose per-proposer `max_depth` bounds the depth control
 /// when `capabilities` is null (Settings shows every control, bounded by the served model).
 /// `speculativeDefault`: the runtime's own default (`engine_status.speculative_default`), named
-/// beside "Runtime default".
+/// beside "Runtime default". `loaded`: the served model's status, which says why a chosen proposer
+/// does not run on it (a refused or missing draft).
 export function GenerationControls({
-  params, onChange, capabilities, speculativeLimits = null, speculativeDefault = null, prefix = "generation",
+  params, onChange, capabilities, speculativeLimits = null, speculativeDefault = null, loaded = null,
+  prefix = "generation",
 }) {
   const defaults = capabilities == null;
   const proposer = params.speculativeMode && !["off", "auto"].includes(params.speculativeMode)
@@ -14,6 +18,7 @@ export function GenerationControls({
   // The depth control shows (and saves) the user's own depth; where the model advertises less for
   // the chosen proposer, a note says what it runs at (the request is clamped, sc-24445).
   const depthNote = speculativeDepthNote(params.speculativeDepth, depthCapability);
+  const unavailableNote = defaults ? null : proposerUnavailableNote(proposer, loaded);
   const recommendedEfforts = capabilities?.reasoning_efforts ?? ["low", "medium", "xhigh"];
   // A saved/API-supplied compatibility alias must remain visible and pass through unchanged even
   // when a model deliberately omits it from its recommended distinct levels.
@@ -48,6 +53,7 @@ export function GenerationControls({
             value={params.speculativeDepth ?? ""}
             onChange={(event) => onChange("speculativeDepth", event.target.value)} />
           {depthNote && <small className="field-note">{depthNote}</small>}
+          {unavailableNote && <small className="field-note" role="status">{unavailableNote}</small>}
         </div>
       )}
       {[["topK", "Top K", 0, 1], ["presencePenalty", "Presence penalty", undefined, 0.05], ["repetitionPenalty", "Repetition penalty", 0.01, 0.05],

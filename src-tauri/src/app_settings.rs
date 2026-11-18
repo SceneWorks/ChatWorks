@@ -544,6 +544,10 @@ mod tests {
                 r#"{"proposer":"draft_model","depth":2}"#,
                 Some(Speculative::proposer(SpeculativeProposer::DraftModel, 2)),
             ),
+            (
+                r#"{"proposer":"block_draft","depth":4}"#,
+                Some(Speculative::proposer(SpeculativeProposer::BlockDraft, 4)),
+            ),
             ("null", None),
         ] {
             let body = format!(r#"{{"settingsVersion":2,"sampling":{{"speculative":{wire}}}}}"#);

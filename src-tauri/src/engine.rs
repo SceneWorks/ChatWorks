@@ -9,11 +9,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::core_llm::{
-    BackendCapabilities, CancelFlag, Channel, Constraint, Content, CudaGraphsReport, DecodeReport,
-    DraftReport, FeatureSupport, FinishReason, GenerationTimings, ImageRef, LoadReport, LoadSpec,
-    Message, MtpStats, PathReport, ProjectionReport, ProposerCapabilities, Quantize,
-    ReasoningEffort, Role, Sampling, Speculative, StreamEvent, TextLlm, TextLlmCapabilities,
-    TextLlmDescriptor, TextLlmRequest, ThinkingMode, ToolCall, ToolSpec, Usage, VideoRef,
+    BackendCapabilities, CancelFlag, Channel, Constraint, Content, CudaGraphsReport, DecodeDraft,
+    DecodeReport, DraftReport, FeatureSupport, FinishReason, GenerationTimings, ImageRef,
+    LoadReport, LoadSpec, Message, MtpStats, PathReport, ProjectionReport, ProposerCapabilities,
+    Quantize, ReasoningEffort, Role, Sampling, Speculative, StreamEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest, ThinkingMode, ToolCall, ToolSpec,
+    Usage, VideoRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -262,6 +263,7 @@ impl EngineActor {
             quantize: request.quantize,
             projector_source: request.projector_source,
             draft_source: request.draft_source,
+            draft_quantize: request.draft_quantize,
             prefix_cache_bytes: request.prefix_cache_bytes,
             mtp_head_source: request.mtp_head_source,
             provider,
@@ -428,6 +430,7 @@ struct LoadedModel {
     quantize: Option<QuantizeRequest>,
     projector_source: Option<String>,
     draft_source: Option<String>,
+    draft_quantize: Option<QuantizeRequest>,
     prefix_cache_bytes: Option<u64>,
     mtp_head_source: Option<String>,
     provider: Box<dyn TextLlm>,
@@ -449,6 +452,7 @@ impl LoadedModel {
             cuda_graphs: self.settled_cuda_graphs(),
             projector_source: self.projector_source.clone(),
             draft_source: self.draft_source.clone(),
+            draft_quantize: self.draft_quantize,
             prefix_cache_bytes: self.prefix_cache_bytes,
             mtp_head_source: self.mtp_head_source.clone(),
             provider: ProviderSummary::from(self.descriptor.clone()),
@@ -508,6 +512,11 @@ pub struct LoadModelRequest {
     /// (`mtp_head: …`).
     #[serde(default)]
     pub mtp_head_source: Option<String>,
+    /// The load precision of a block draft `draft_source` names (`LoadSpec::draft_quantize`,
+    /// feature SW-F360): `q8` or `q4`; `None` keeps the runtime's 8-bit default. The runtime
+    /// refuses any other precision by name in the load report; an ordinary draft model ignores it.
+    #[serde(default)]
+    pub draft_quantize: Option<QuantizeRequest>,
 }
 
 impl LoadModelRequest {
@@ -521,6 +530,7 @@ impl LoadModelRequest {
             quantize: self.quantize.map(Into::into),
             cuda_graphs: self.cuda_graphs,
             draft_source: self.draft_source.clone(),
+            draft_quantize: self.draft_quantize.map(Into::into),
             prefix_cache_bytes: self.prefix_cache_bytes,
             mtp_head_source: self.mtp_head_source.clone(),
         }
@@ -1701,6 +1711,10 @@ pub struct LoadedModelStatus {
     /// The draft model the load REQUESTED (its fate is in `load_report.draft`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub draft_source: Option<String>,
+    /// The block-draft precision the load REQUESTED (`None` = the runtime's 8-bit default); the
+    /// precision that ran is `last_decode.draft.precision`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft_quantize: Option<QuantizeRequest>,
     /// The prefix-cache budget the load REQUESTED (`None` = the runtime's default); the settled
     /// budget is `load_report.prefix_cache_bytes`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1877,9 +1891,12 @@ impl From<CudaGraphsReport> for CudaGraphsReportPayload {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DecodeReportPayload {
     pub path: String,
-    /// `none` | `mtp` | `prompt_lookup` | `draft_model`.
+    /// `none` | `mtp` | `prompt_lookup` | `draft_model` | `block_draft`.
     pub proposer: String,
     pub draft_tokens: Option<u32>,
+    /// The draft weights the proposer ran on (a block draft's source, format and precision;
+    /// SW-F360), or `None` for a proposer without its own reported weights.
+    pub draft: Option<DecodeDraftPayload>,
     /// `device` | `host:<reason>` | `none`.
     pub sampler: String,
     pub kv_cache: String,
@@ -1917,6 +1934,7 @@ impl From<DecodeReport> for DecodeReportPayload {
             path: value.path,
             proposer: value.proposer.label().to_string(),
             draft_tokens: value.draft_tokens,
+            draft: value.draft.map(DecodeDraftPayload::from),
             sampler: value.sampler,
             kv_cache: value.kv_cache,
             attention: value.attention,
@@ -1934,6 +1952,25 @@ impl From<DecodeReport> for DecodeReportPayload {
             prefix_cache: PathReportPayload::from(value.prefix_cache),
             speculative_demoted_at: value.speculative_demoted_at,
             fallbacks: value.fallbacks,
+        }
+    }
+}
+
+/// The draft a decode ran its proposer on (SW-F360): the runtime's `DecodeDraft`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DecodeDraftPayload {
+    pub source: String,
+    /// `dspine` | `dflash2`.
+    pub format: String,
+    /// `q8` | `q4`.
+    pub precision: String,
+}
+impl From<DecodeDraft> for DecodeDraftPayload {
+    fn from(value: DecodeDraft) -> Self {
+        Self {
+            source: value.source,
+            format: value.format,
+            precision: value.precision,
         }
     }
 }
@@ -2207,6 +2244,7 @@ mod tests {
                 draft_source: None,
                 prefix_cache_bytes: None,
                 mtp_head_source: None,
+                draft_quantize: None,
             })
             .unwrap();
         assert_eq!(status.loaded.unwrap().name, "fake-model");
@@ -2260,6 +2298,7 @@ mod tests {
             draft_source: None,
             prefix_cache_bytes: None,
             mtp_head_source: None,
+            draft_quantize: None,
         }
     }
 
@@ -2470,6 +2509,7 @@ mod tests {
                 draft_source: None,
                 prefix_cache_bytes: None,
                 mtp_head_source: None,
+                draft_quantize: None,
             })
             .unwrap();
         let err = engine.generate(request, |_| {}).unwrap_err();
@@ -2729,6 +2769,7 @@ mod tests {
                     draft_source: None,
                     prefix_cache_bytes: None,
                     mtp_head_source: None,
+                    draft_quantize: None,
                 })
                 .unwrap();
             assert_eq!(
@@ -2774,6 +2815,123 @@ mod tests {
         assert_eq!(spec.draft_source.as_deref(), Some("/tmp/draft"));
         assert_eq!(spec.prefix_cache_bytes, Some(0));
         assert_eq!(spec.mtp_head_source.as_deref(), Some("/tmp/mtp-head"));
+        // SW-F360: a block draft's precision reaches `LoadSpec::draft_quantize`; omitted, the
+        // runtime's 8-bit default applies.
+        assert_eq!(spec.draft_quantize, None);
+        let q4: LoadModelRequest = serde_json::from_value(serde_json::json!({
+            "source": "/tmp/m", "draft_source": "/tmp/dspine", "draft_quantize": "q4"
+        }))
+        .unwrap();
+        assert_eq!(q4.load_spec().draft_quantize, Some(Quantize::Q4));
+    }
+
+    /// SW-7199: a block draft named by the load reaches the runtime with its precision, is shown
+    /// resident (or refused with the runtime's reason, the model still loaded), and the decode
+    /// status names the proposer, the draft and the accepted tokens per pass that ran (AC1, AC3).
+    /// Unloading releases the draft, and a reload finds the previous draft released before it is
+    /// admitted again (AC2).
+    #[test]
+    fn a_block_draft_loads_reports_and_releases_with_its_model() {
+        use crate::core_llm::SpeculativeProposer;
+        use crate::test_support::{
+            block_draft_loader, block_drafts_resident_at_load, resident_block_drafts,
+        };
+        const TARGET: &str = "/tmp/sw-7199-qwen3.8-27b";
+        const DRAFT: &str = "/tmp/sw-7199-dspine";
+        let resident = || resident_block_drafts().lock().unwrap().get(TARGET).copied();
+        let engine = EngineHandle::spawn_with_loader(block_draft_loader);
+        let load = |draft: &str, precision: Option<QuantizeRequest>| {
+            engine.load_model(LoadModelRequest {
+                source: TARGET.to_string(),
+                display_name: None,
+                quantize: Some(QuantizeRequest::Q4),
+                projector_source: None,
+                cuda_graphs: None,
+                draft_source: Some(draft.to_string()),
+                prefix_cache_bytes: None,
+                mtp_head_source: None,
+                draft_quantize: precision,
+            })
+        };
+
+        let loaded = load(DRAFT, None).unwrap().loaded.unwrap();
+        assert_eq!(resident(), Some(1));
+        assert_eq!(loaded.draft_source.as_deref(), Some(DRAFT));
+        assert_eq!(loaded.draft_quantize, None);
+        let report = loaded.load_report.unwrap();
+        assert_eq!(report.draft.unwrap().refusal, None);
+        assert!(loaded
+            .provider
+            .capabilities
+            .speculative
+            .iter()
+            .any(|cap| cap.proposer == SpeculativeProposer::BlockDraft));
+        let mut request = hello_request();
+        request.speculative = Some(Speculative::proposer(SpeculativeProposer::BlockDraft, 4));
+        engine.generate(request.clone(), |_| {}).unwrap();
+        let decode = engine
+            .status()
+            .unwrap()
+            .loaded
+            .unwrap()
+            .last_decode
+            .unwrap();
+        assert_eq!(decode.proposer, "block_draft");
+        assert_eq!(decode.draft_tokens, Some(4));
+        assert_eq!(
+            decode.draft,
+            Some(DecodeDraftPayload {
+                source: DRAFT.to_string(),
+                format: "dspine".to_string(),
+                precision: "q8".to_string(),
+            })
+        );
+        assert_eq!(decode.mean_accepted_length, Some(2.5));
+        let wire = serde_json::to_value(&decode).unwrap();
+        assert_eq!(wire["draft"]["format"], "dspine");
+
+        // Reload at 4 bits: the previous draft is released before the new load is admitted.
+        let loaded = load(DRAFT, Some(QuantizeRequest::Q4))
+            .unwrap()
+            .loaded
+            .unwrap();
+        assert_eq!(loaded.draft_quantize, Some(QuantizeRequest::Q4));
+        assert_eq!(resident(), Some(1));
+        engine.generate(request.clone(), |_| {}).unwrap();
+        let decode = engine
+            .status()
+            .unwrap()
+            .loaded
+            .unwrap()
+            .last_decode
+            .unwrap();
+        assert_eq!(decode.draft.unwrap().precision, "q4");
+
+        engine.unload_model().unwrap();
+        assert_eq!(resident(), Some(0), "unloading releases the draft");
+
+        // A missing draft is refused with the runtime's reason; the model loads and serves.
+        let loaded = load("/tmp/sw-7199-missing-dspine", None)
+            .unwrap()
+            .loaded
+            .unwrap();
+        assert_eq!(resident(), Some(0));
+        let report = loaded.load_report.unwrap();
+        let refusal = report.draft.unwrap().refusal.unwrap();
+        assert!(refusal.starts_with("block draft: format:"), "{refusal}");
+        assert!(report.fallbacks.iter().any(|f| f == &refusal));
+        assert!(!loaded
+            .provider
+            .capabilities
+            .speculative
+            .iter()
+            .any(|cap| cap.proposer == SpeculativeProposer::BlockDraft));
+        engine.unload_model().unwrap();
+        assert_eq!(
+            block_drafts_resident_at_load().lock().unwrap()[TARGET],
+            vec![0, 0, 0],
+            "every load found no draft of this model still resident"
+        );
     }
 
     /// Epic sc-24432: the load's draft model and prefix-cache budget reach the status twice — as
@@ -2800,6 +2958,7 @@ mod tests {
                     draft_source: Some(draft.to_string()),
                     prefix_cache_bytes: Some(64 << 20),
                     mtp_head_source: None,
+                    draft_quantize: None,
                 })
                 .unwrap()
                 .loaded
@@ -2832,6 +2991,7 @@ mod tests {
                 draft_source: None,
                 prefix_cache_bytes: None,
                 mtp_head_source: Some("/tmp/sc-24445-mtp-head".to_string()),
+                draft_quantize: None,
             })
             .unwrap()
             .loaded
@@ -2870,6 +3030,7 @@ mod tests {
                 draft_source: None,
                 prefix_cache_bytes: None,
                 mtp_head_source: None,
+                draft_quantize: None,
             })
             .unwrap();
         let loaded = status.loaded.unwrap();
@@ -2938,6 +3099,7 @@ mod tests {
                 draft_source: None,
                 prefix_cache_bytes: None,
                 mtp_head_source: None,
+                draft_quantize: None,
             })
             .unwrap()
             .loaded
@@ -2972,6 +3134,7 @@ mod tests {
                 draft_source: Some("/models/qwen3-0.6b".to_string()),
                 prefix_cache_bytes: Some(1 << 30),
                 mtp_head_source: Some("/models/qwen3.8-27b-mtp".to_string()),
+                draft_quantize: None,
             })
             .unwrap();
         engine.generate(hello_request(), |_| {}).unwrap();
@@ -3037,6 +3200,7 @@ mod tests {
                 draft_source: None,
                 prefix_cache_bytes: None,
                 mtp_head_source: None,
+                draft_quantize: None,
             })
             .unwrap_err();
         assert!(
@@ -3065,6 +3229,7 @@ mod tests {
                 draft_source: None,
                 prefix_cache_bytes: None,
                 mtp_head_source: None,
+                draft_quantize: None,
             })
             .unwrap();
         engine

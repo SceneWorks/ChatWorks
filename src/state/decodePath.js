@@ -149,11 +149,29 @@ function graphSwitchValue(loaded) {
   return { value: loaded.cuda_graphs ? "on" : "off", detail: "Settled by the runtime at load." };
 }
 
-/// The draft model the load named (epic sc-24432): resident, or refused with the runtime's reason.
-function draftValue(draft) {
-  return draft.refusal
-    ? { value: "refused", detail: `${draft.source}: ${draft.refusal}` }
-    : { value: "resident", detail: draft.source };
+/// The draft the load named (epic sc-24432; a block draft, SW-F360): resident, or refused with the
+/// runtime's reason. A block draft's requested precision is named beside it (8-bit by default).
+function draftValue(draft, loaded) {
+  if (draft.refusal) return { value: "refused", detail: `${draft.source}: ${draft.refusal}` };
+  const precision = isBlockDraft(loaded) ? ` · ${BLOCK_DRAFT_PRECISIONS[loaded.draft_quantize ?? "q8"] ?? loaded.draft_quantize}` : "";
+  return { value: `resident${precision}`, detail: draft.source };
+}
+
+/// The block-draft precisions a load can request (`LoadSpec::draft_quantize`).
+const BLOCK_DRAFT_PRECISIONS = { q8: "8-bit", q4: "4-bit" };
+
+/// Whether the served model's draft is a block draft: the runtime advertises `block_draft` exactly
+/// while one is resident.
+function isBlockDraft(loaded) {
+  return (loaded?.provider?.capabilities?.speculative ?? []).some((item) => item.proposer === "block_draft");
+}
+
+/// The draft weights the last generation's proposer ran on (SW-F360): format and precision.
+function decodeDraftValue(draft) {
+  return {
+    value: `${draft.format} · ${BLOCK_DRAFT_PRECISIONS[draft.precision] ?? draft.precision}`,
+    detail: draft.source,
+  };
 }
 
 /// The prefix-cache budget the load settled (epic sc-24432), beside the budget it asked for.
@@ -243,7 +261,12 @@ export function decodePathRows(engineStatus) {
   rows.push({ key: "weights", label: "Weights", ...weightsValue(loaded), section: null });
   rows.push({ key: "graph_switch", label: "CUDA-graph switch", ...graphSwitchValue(loaded), section: null });
   if (loaded.load_report?.draft) {
-    rows.push({ key: "draft", label: "Draft model", ...draftValue(loaded.load_report.draft), section: null });
+    rows.push({
+      key: "draft",
+      label: isBlockDraft(loaded) ? "Block draft" : "Draft model",
+      ...draftValue(loaded.load_report.draft, loaded),
+      section: null,
+    });
   }
   const loadFallbacks = loaded.load_report?.fallbacks ?? [];
   if (loadFallbacks.length) {
@@ -279,6 +302,7 @@ export function decodePathRows(engineStatus) {
   }
   last({ key: "implementation", label: "Decode implementation", value: decode.path, detail: null });
   last({ key: "proposer", label: "Proposer", ...proposerValue(decode) });
+  if (decode.draft) last({ key: "decode_draft", label: "Draft", ...decodeDraftValue(decode.draft) });
   if ("mean_accepted_length" in decode) {
     last({ key: "accepted_length", label: "Accepted length", ...acceptedLengthValue(decode) });
   }
