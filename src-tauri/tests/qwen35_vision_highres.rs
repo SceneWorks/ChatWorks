@@ -47,6 +47,7 @@ fn qwen35_vision_high_resolution_prefill_does_not_crash() {
             draft_source: None,
             prefix_cache_bytes: None,
             mtp_head_source: None,
+            draft_quantize: None,
         })
         .expect("load 27B");
 

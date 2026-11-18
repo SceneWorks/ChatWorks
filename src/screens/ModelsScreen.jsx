@@ -27,6 +27,7 @@ import {
   weightFormatOptions,
 } from "../state/decodePath.js";
 import { DecodePathStatus } from "../components/DecodePathStatus.js";
+import { BlockDraftControls } from "../components/BlockDraftControls.jsx";
 
 export function ModelsScreen() {
   const { engineStatus, refreshEngineStatus, appSettings, updateAppSettings } = useApp();
@@ -49,6 +50,9 @@ export function ModelsScreen() {
   const [error, setError] = useState(null);
   const [notice, setNotice] = useState(null);
   const [loadingId, setLoadingId] = useState("");
+  // Each registered model's block-draft catalog (SW-F360), and the draft being installed.
+  const [blockDrafts, setBlockDrafts] = useState({});
+  const [installing, setInstalling] = useState(null);
 
   const loadedSource = engineStatus?.loaded?.source ?? null;
   // The weight formats this runtime can load; NVFP4 is disabled with the runtime's own reason
@@ -81,6 +85,39 @@ export function ModelsScreen() {
   useEffect(() => {
     refreshRegistry();
   }, [refreshRegistry]);
+
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all(registry.models.map((model) =>
+      invoke("block_draft_options", { modelId: model.id })
+        .then((options) => [model.id, options])
+        .catch((cause) => {
+          if (!cancelled) setError(`Could not read block drafts for ${model.name}: ${String(cause)}`);
+          return [model.id, []];
+        })))
+      .then((entries) => { if (!cancelled) setBlockDrafts(Object.fromEntries(entries)); });
+    return () => { cancelled = true; };
+  }, [registry]);
+
+  async function handleInstallBlockDraft(model, draft) {
+    if (installing) return;
+    setInstalling({ modelId: model.id, format: draft.format });
+    setError(null);
+    setNotice(null);
+    setProgress(null);
+    try {
+      setRegistry(await invoke("install_block_draft", {
+        modelId: model.id,
+        format: draft.format,
+        jobId: `block-draft-${draft.format}-${Date.now()}`,
+      }));
+      setNotice(`${draft.label} installed for ${model.name}; it loads with the model's next load.`);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setInstalling(null);
+    }
+  }
 
   async function checkTokenStatus() {
     try {
@@ -201,6 +238,7 @@ export function ModelsScreen() {
         draftSource: model.draftSource ?? null,
         prefixCacheBytes: model.prefixCacheBytes ?? null,
         mtpHeadSource: model.mtpHeadSource ?? null,
+        draftQuantize: model.draftQuantize ?? null,
         ...changes,
       };
       setRegistry(await invoke("set_model_load_options", { modelId: model.id, ...options }));
@@ -455,7 +493,8 @@ export function ModelsScreen() {
                 (model.quantize ?? null) === (engineStatus?.loaded?.quantize ?? null) &&
                 (selectedProjector || null) === (engineStatus?.loaded?.projector_source ?? null) &&
                 servedWithLoadOptions(model, engineStatus?.loaded);
-              const draftOptions = draftModelOptions(registry.models, model);
+              const modelBlockDrafts = blockDrafts[model.id] ?? [];
+              const draftOptions = draftModelOptions(registry.models, model, modelBlockDrafts);
               const action = serveAction(Boolean(isServed), reloadPending);
               return (
                 <li className={isServed ? "model-row served" : "model-row"} key={model.id}>
@@ -483,12 +522,21 @@ export function ModelsScreen() {
                       aria-label={`Draft model for ${model.name}`}
                       disabled={Boolean(loadingId)}
                       onChange={(event) => saveLoadOptions(model, { draftSource: event.target.value || null })}
-                      title="A smaller model sharing this model's tokenizer, for draft-model speculation. Applies on the next load."
+                      title="A smaller model sharing this model's tokenizer (draft-model speculation), or an installed block draft (block-draft speculation). Applies on the next load."
                       value={model.draftSource ?? ""}
                     >
                       {draftOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
                     </select>
                   ) : null}
+                  <BlockDraftControls
+                    disabled={Boolean(loadingId)}
+                    drafts={modelBlockDrafts}
+                    installing={installing?.modelId === model.id ? installing.format : installing ? "other" : null}
+                    model={model}
+                    onInstall={(draft) => handleInstallBlockDraft(model, draft)}
+                    onPrecision={(draftQuantize) => saveLoadOptions(model, { draftQuantize })}
+                    onUse={(draft) => saveLoadOptions(model, { draftSource: draft.installedPath })}
+                  />
                   <input
                     aria-label={`Companion MTP head for ${model.name}`}
                     disabled={Boolean(loadingId)}

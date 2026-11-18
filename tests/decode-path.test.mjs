@@ -595,3 +595,80 @@ test("sc-24446: a monitor demotion is named on the proposer row", () => {
   assert.equal(kept.proposer.value, "prompt_lookup · 4 drafts");
   assert.equal(kept.proposer.detail, "Accepted 1 of 8 drafts in 6 forwards");
 });
+
+test("SW-7199 AC3: a block-draft decode names the proposer, the draft that ran and the accepted tokens per pass", () => {
+  const served = status(MLX, {
+    quantize: "q4",
+    cuda_graphs: null,
+    draft_source: "/s/dspine",
+    draft_quantize: "q4",
+    provider: { capabilities: { speculative: [{ proposer: "block_draft", max_depth: 15, recommended_depth: 4 }] } },
+    load_report: { cuda_graphs: null, projections: [], prefix_cache_bytes: null, fallbacks: [], draft: { source: "/s/dspine", refusal: null } },
+    last_decode: {
+      ...DECODE,
+      path: "block_draft",
+      proposer: "block_draft",
+      draft_tokens: 4,
+      draft: { source: "/s/dspine", format: "dspine", precision: "q4" },
+      proposed_tokens: 8,
+      accepted_tokens: 5,
+      verify_steps: 2,
+      mean_accepted_length: 2.5,
+    },
+  });
+  const rows = Object.fromEntries(decodePathRows(served).map((row) => [row.key, row]));
+  assert.equal(rows.draft.label, "Block draft");
+  assert.equal(rows.draft.value, "resident · 4-bit");
+  assert.equal(rows.proposer.value, "block_draft · 4 drafts");
+  assert.equal(rows.decode_draft.value, "dspine · 4-bit");
+  assert.equal(rows.decode_draft.detail, "/s/dspine");
+  assert.equal(rows.decode_draft.section, LAST_GENERATION);
+  assert.equal(rows.accepted_length.value, "2.50 drafts per verify step");
+  const html = ReactDOMServer.renderToStaticMarkup(React.createElement(DecodePathStatus, { engineStatus: served }));
+  for (const text of ['data-row="decode_draft"', "dspine · 4-bit", "Block draft"]) {
+    assert.ok(html.includes(text), `missing ${text} in ${html}`);
+  }
+
+  // A DFlash2 draft (its runtime label) at the default 8-bit precision reads the same way.
+  const dflash2 = status(MLX, {
+    quantize: "q4",
+    cuda_graphs: null,
+    draft_source: "/s/dflash2",
+    draft_quantize: null,
+    provider: { capabilities: { speculative: [{ proposer: "block_draft", max_depth: 7, recommended_depth: 4 }] } },
+    load_report: { cuda_graphs: null, projections: [], prefix_cache_bytes: null, fallbacks: [], draft: { source: "/s/dflash2", refusal: null } },
+    last_decode: {
+      ...DECODE,
+      path: "block_draft",
+      proposer: "block_draft",
+      draft_tokens: 4,
+      draft: { source: "/s/dflash2", format: "dflash2", precision: "q8" },
+      proposed_tokens: 8,
+      accepted_tokens: 6,
+      verify_steps: 2,
+      mean_accepted_length: 3,
+    },
+  });
+  const dflash2Rows = Object.fromEntries(decodePathRows(dflash2).map((row) => [row.key, row]));
+  assert.equal(dflash2Rows.proposer.value, "block_draft · 4 drafts");
+  assert.equal(dflash2Rows.decode_draft.value, "dflash2 · 8-bit");
+  assert.equal(dflash2Rows.decode_draft.detail, "/s/dflash2");
+  assert.equal(dflash2Rows.accepted_length.value, "3.00 drafts per verify step");
+
+  // A refused block draft is named with the runtime's reason; the model still serves plainly.
+  const refusal = "block draft: hidden_size: hidden_size 4096 != target 5120";
+  const refused = status(MLX, {
+    quantize: null,
+    cuda_graphs: null,
+    draft_source: "/s/dspine",
+    provider: { capabilities: { speculative: [] } },
+    load_report: { cuda_graphs: null, projections: [], prefix_cache_bytes: null, fallbacks: [refusal], draft: { source: "/s/dspine", refusal } },
+    last_decode: { ...DECODE, proposer: "none", draft_tokens: null, draft: null },
+  });
+  const refusedRows = Object.fromEntries(decodePathRows(refused).map((row) => [row.key, row]));
+  assert.equal(refusedRows.draft.value, "refused");
+  assert.equal(refusedRows.draft.detail, `/s/dspine: ${refusal}`);
+  assert.equal(refusedRows.load_fallbacks.value, refusal);
+  assert.equal(refusedRows.proposer.value, "none (token-at-a-time)");
+  assert.ok(!("decode_draft" in refusedRows));
+});
