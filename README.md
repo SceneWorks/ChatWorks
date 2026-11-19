@@ -134,7 +134,9 @@ for the Tauri app.
 
 The desktop sends the chat's speculative-decoding choice explicitly, as the runtime's
 proposer-agnostic option: `"off"`, `"auto"` (the model's MTP head where it has one, else prompt
-lookup; on Apple Silicon (MLX) at q4 or q8, a resident block draft instead of MTP where the runtime measured it faster; CUDA keeps MTP), or `{"proposer": "mtp" | "prompt_lookup" | "draft_model", "depth": N}`. Only the proposers
+lookup; on Apple Silicon (MLX) at q4 or q8, a resident block draft instead of MTP where the
+runtime measured it faster; CUDA keeps MTP), or
+`{"proposer": "mtp" | "prompt_lookup" | "draft_model", "depth": N}`. Only the proposers
 the loaded model advertises are offered; a saved proposer the model does not advertise runs
 `"off"`. A saved depth is kept as saved, and the request clamps it to that proposer's advertised
 maximum (the control notes the depth it runs at). A fresh chat takes the choice from Settings; a Settings value that was never chosen
