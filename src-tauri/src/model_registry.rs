@@ -313,7 +313,7 @@ pub fn load_registered_model(
     projector_source: Option<String>,
 ) -> Result<EngineStatus, String> {
     let manifest = registry_path(app)?;
-    let mut registry = read_registry(&manifest)?;
+    let registry = read_registry(&manifest)?;
     let entry_index = registry
         .models
         .iter()
@@ -350,12 +350,36 @@ pub fn load_registered_model(
     let status = engine.load_model(request)?;
     // A present empty string from the picker is an intentional "Text only" selection. Keep it
     // distinct from an omitted command argument, which preserves an existing association.
-    if requested_projector.is_some() {
-        registry.models[entry_index].projector_source = projector_source;
-    }
-    registry.selected_id = Some(entry.id);
-    write_registry(&manifest, &registry)?;
+    record_loaded_model(
+        &manifest,
+        &entry.id,
+        requested_projector.is_some().then_some(projector_source),
+    )?;
     Ok(status)
+}
+
+/// Record a finished load of `model_id` in the manifest: select it and, when the load was given
+/// one, save its projector. The manifest is read again here, after the load, so a change saved
+/// while the model was loading (a block draft installed, load options edited) is kept; only the
+/// fields the load owns are written. A model removed during the load is not added back.
+fn record_loaded_model(
+    manifest: &Path,
+    model_id: &str,
+    projector_source: Option<Option<String>>,
+) -> Result<(), String> {
+    let mut registry = read_registry(manifest)?;
+    let Some(entry) = registry
+        .models
+        .iter_mut()
+        .find(|model| model.id == model_id)
+    else {
+        return Ok(());
+    };
+    if let Some(projector_source) = projector_source {
+        entry.projector_source = projector_source;
+    }
+    registry.selected_id = Some(model_id.to_string());
+    write_registry(manifest, &registry)
 }
 
 /// Save a registered model's load options (epic sc-24432): its draft model and companion MTP head
@@ -1029,13 +1053,7 @@ impl DownloadContext<'_> {
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        let part_path = target.with_extension(format!(
-            "{}.part",
-            target
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .unwrap_or("download")
-        ));
+        let part_path = part_path(target);
         let mut output = fs::File::create(&part_path).map_err(|error| error.to_string())?;
         let mut hasher = Sha256::new();
         let mut stream = response.bytes_stream();
@@ -1068,6 +1086,18 @@ impl DownloadContext<'_> {
         fs::rename(&part_path, target).map_err(|error| error.to_string())?;
         Ok(())
     }
+}
+
+/// Where `DownloadContext::download_file` writes `target`'s bytes before they are checked. Each
+/// download truncates it and starts over, so a partial left by an interrupted one is not resumed.
+fn part_path(target: &Path) -> PathBuf {
+    target.with_extension(format!(
+        "{}.part",
+        target
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("download")
+    ))
 }
 
 /// Whether the downloaded bytes at `path` (hashed to `sha256`) are `file` as listed: its size,

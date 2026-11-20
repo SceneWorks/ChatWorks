@@ -315,3 +315,97 @@ fn an_installed_draft_becomes_the_models_draft_source() {
     );
     assert!(set_block_draft(&manifest, "missing", "/x").is_err());
 }
+
+/// A Prism/Bonsai MLX target (`prism_hadamard_qwen35` wrapping Qwen3.8-27B text geometry) is read
+/// through its `text_config`: DFlash2 fits its packed head, DSpine keeps the packed-head refusal.
+#[test]
+fn a_prism_target_reads_its_text_config_and_only_dspine_is_refused() {
+    let dir = TempDir::new("block-draft-prism");
+    let snapshots = dir.path().join("snapshots");
+    let mut prism = entry_with_config(
+        dir.path(),
+        serde_json::json!({
+            "schema_version": 2, "model_type": "prism_hadamard_qwen35",
+            "base_model_type": "qwen3_5",
+            "components": {"text": true, "vision": true, "mtp": false},
+            "quantization": {"bits": 2, "group_size": 128, "mode": "affine"},
+            "vision_config": {"model_type": "qwen3_5"},
+            "text_config": {"model_type": "qwen3_5_text", "hidden_size": 5120,
+                "num_hidden_layers": 64, "vocab_size": 248320},
+        }),
+    );
+    prism.pack = Some("bonsai2-packed".to_string());
+    assert_eq!(draft_target(&prism).unwrap(), QWEN38_27B);
+
+    let options = options_for(&prism, &snapshots, "mlx", &["dspine", "dflash2"]);
+    assert_eq!(option(&options, "dflash2").unavailable, None);
+    assert!(option(&options, "dspine")
+        .unavailable
+        .as_deref()
+        .unwrap()
+        .contains("packed (Prism)"));
+}
+
+/// A retry after an interrupted download: each missing file's partial is removed before the
+/// free-space check, so the check asks only for the files' listed sizes on a reclaimed volume.
+#[test]
+fn a_retry_removes_partials_before_measuring_the_missing_bytes() {
+    let dir = TempDir::new("block-draft-partials");
+    let sibling = |name: &str, size: u64| -> HfSibling {
+        serde_json::from_value(serde_json::json!({"rfilename": name, "size": size})).unwrap()
+    };
+    let files = [sibling("config.json", 4), sibling("model.safetensors", 10)];
+    write(&dir.path().join("config.json"), "{ab}");
+    let weights = dir.path().join("model.safetensors");
+    let partial = part_path(&weights);
+    assert_eq!(partial, dir.path().join("model.safetensors.part"));
+    write(&partial, "123456");
+    // A complete file's stray partial is not one this download will write; it is left alone.
+    write(&part_path(&dir.path().join("config.json")), "x");
+
+    assert_eq!(clear_partials_and_measure_missing(dir.path(), &files), 10);
+    assert!(!partial.exists(), "the interrupted partial is reclaimed");
+    assert!(dir.path().join("config.json").exists());
+    assert!(dir.path().join("config.json.part").exists());
+}
+
+/// A load that read the manifest before a draft install finished records only what it owns:
+/// the install's `draft_source` survives, and the load still selects the model and saves the
+/// projector it was given.
+#[test]
+fn a_load_finishing_after_a_draft_install_keeps_the_installed_draft() {
+    let dir = TempDir::new("block-draft-load-race");
+    let target = entry_with_config(dir.path(), qwen38_vlm());
+    let manifest = dir.path().join("manifest.json");
+    write_registry(
+        &manifest,
+        &ModelRegistry {
+            models: vec![target],
+            selected_id: None,
+        },
+    )
+    .unwrap();
+    // The load reads the manifest, the install saves the draft, then the load finishes.
+    let _read_at_load_start = read_registry(&manifest).unwrap();
+    set_block_draft(&manifest, "target", "/snapshots/dflash2").unwrap();
+    super::super::record_loaded_model(&manifest, "target", Some(Some("/mmproj".into()))).unwrap();
+
+    let saved = read_registry(&manifest).unwrap();
+    assert_eq!(
+        saved.models[0].draft_source.as_deref(),
+        Some("/snapshots/dflash2")
+    );
+    assert_eq!(saved.models[0].projector_source.as_deref(), Some("/mmproj"));
+    assert_eq!(saved.selected_id.as_deref(), Some("target"));
+
+    // Without a projector argument the saved association is kept; a removed model is not re-added.
+    super::super::record_loaded_model(&manifest, "target", None).unwrap();
+    assert_eq!(
+        read_registry(&manifest).unwrap().models[0]
+            .projector_source
+            .as_deref(),
+        Some("/mmproj")
+    );
+    super::super::record_loaded_model(&manifest, "gone", None).unwrap();
+    assert_eq!(read_registry(&manifest).unwrap().models.len(), 1);
+}

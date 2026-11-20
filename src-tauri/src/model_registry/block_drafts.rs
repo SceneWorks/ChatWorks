@@ -15,9 +15,9 @@ use tauri::AppHandle;
 
 use super::{
     app_data_dir, cached_file_matches, emit_progress, ensure_free_space, env_hf_token,
-    fetch_hf_files, file_is_complete, import_token, read_hf_token, read_registry, registry_path,
-    snapshot_dir_name, sum_known_sizes, write_registry, DownloadContext, HfModelRef,
-    ImportProgress, ModelEntry, ModelRegistry, SnapshotDownload,
+    fetch_hf_files, file_is_complete, import_token, part_path, read_hf_token, read_registry,
+    registry_path, snapshot_dir_name, sum_known_sizes, write_registry, DownloadContext, HfModelRef,
+    HfSibling, ImportProgress, ModelEntry, ModelRegistry, SnapshotDownload,
 };
 use crate::core_llm::{
     block_draft_refusal_reason, BlockDraftConfig, BlockDraftFormat, BlockDraftRefusal,
@@ -199,7 +199,8 @@ fn pinned_config(draft: &BlockDraftCatalogEntry) -> Result<BlockDraftConfig, Str
 
 /// What a registered model offers a block draft (`BlockDraftTarget`), read as the runtime reads
 /// it at load: a Qwen3.5/3.8 hybrid (`qwen3_5`) target's text geometry from `config.json` (the
-/// VLM wrapper's `text_config` or a text-only fine-tune's root) and its tokenizer's vocabulary
+/// `text_config` of the VLM wrapper or of a packed Prism/Bonsai wrapper, `prism_hadamard_qwen35`,
+/// or a text-only fine-tune's root) and its tokenizer's vocabulary
 /// (added tokens included) from `tokenizer.json`, or the config's `vocab_size` without one.
 fn draft_target(entry: &ModelEntry) -> Result<BlockDraftTarget, String> {
     let snapshot = Path::new(&entry.local_path);
@@ -212,7 +213,12 @@ fn draft_target(entry: &ModelEntry) -> Result<BlockDraftTarget, String> {
     let body = fs::read_to_string(snapshot.join("config.json")).map_err(|_| not_a_target())?;
     let config: serde_json::Value = serde_json::from_str(&body).map_err(|_| not_a_target())?;
     let text = match config.get("text_config") {
-        Some(text) if config["model_type"] == "qwen3_5" => text,
+        Some(text)
+            if config["model_type"] == "qwen3_5"
+                || config["model_type"] == "prism_hadamard_qwen35" =>
+        {
+            text
+        }
         _ => &config,
     };
     if text["model_type"] != "qwen3_5_text" {
@@ -361,11 +367,7 @@ async fn download_draft(
     let _downloading = SnapshotDownload::claim(dir)?;
     let total_bytes = sum_known_sizes(&files);
     fs::create_dir_all(dir).map_err(|error| error.to_string())?;
-    let missing = files
-        .iter()
-        .filter(|file| !file_is_complete(&dir.join(&file.rfilename), file.size))
-        .map(|file| file.size.unwrap_or(0))
-        .fold(0_u64, u64::saturating_add);
+    let missing = clear_partials_and_measure_missing(dir, &files);
     ensure_free_space(dir, missing, DOWNLOAD_RESERVE_BYTES)?;
     // The marker is rewritten only once every file below matches the listing.
     let _ = fs::remove_file(dir.join(VERIFIED_MARKER));
@@ -397,6 +399,21 @@ async fn download_draft(
     }
     fs::write(dir.join(VERIFIED_MARKER), draft.revision).map_err(|error| error.to_string())?;
     Ok(())
+}
+
+/// The bytes still to download into `dir` for `files`, after removing the partial (`.part`) file
+/// an interrupted download left for each missing one. `download_file` truncates a partial and
+/// starts over, so its space is reclaimed before the free-space check rather than counted twice.
+/// The caller holds the snapshot's `SnapshotDownload` claim, so no running download owns them.
+fn clear_partials_and_measure_missing(dir: &Path, files: &[HfSibling]) -> u64 {
+    files
+        .iter()
+        .filter(|file| !file_is_complete(&dir.join(&file.rfilename), file.size))
+        .map(|file| {
+            let _ = fs::remove_file(part_path(&dir.join(&file.rfilename)));
+            file.size.unwrap_or(0)
+        })
+        .fold(0_u64, u64::saturating_add)
 }
 
 /// The runtime's own reading of an installed draft: `draft`'s block-draft format, with a config
