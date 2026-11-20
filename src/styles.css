@@ -252,6 +252,31 @@
   font-weight: 800;
 }
 
+/* A model's block drafts (SW-F360): collapsed by default, one line per catalog draft. */
+.block-drafts {
+  min-width: 0;
+  font-size: 13px;
+}
+
+.block-drafts ul {
+  display: grid;
+  gap: 6px;
+  margin: 6px 0;
+  padding: 0;
+  list-style: none;
+}
+
+.block-drafts li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--gap-2);
+}
+
+.block-drafts .field-note {
+  margin-top: 0;
+}
+
 .model-row-name,
 .model-row-meta {
   overflow: hidden;

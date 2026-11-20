@@ -28,6 +28,7 @@ fn qwen35_tool_loop_over_openai_server() {
             draft_source: None,
             prefix_cache_bytes: None,
             mtp_head_source: None,
+            draft_quantize: None,
         })
         .expect("load 27B");
 

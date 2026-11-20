@@ -1075,6 +1075,22 @@ fn decode_from(value: &Value) -> Option<DecodeReportPayload> {
         draft_tokens: value["draft_tokens"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok()),
+        draft: value["draft"]
+            .is_object()
+            .then(|| chatworks::engine::DecodeDraftPayload {
+                source: value["draft"]["source"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                format: value["draft"]["format"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                precision: value["draft"]["precision"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            }),
         sampler: text("sampler")?,
         kv_cache: text("kv_cache")?,
         attention: text("attention").unwrap_or_default(),

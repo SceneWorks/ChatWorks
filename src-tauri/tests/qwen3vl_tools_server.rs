@@ -42,6 +42,7 @@ fn qwen3vl_tool_calling_over_openai_server() {
             draft_source: None,
             prefix_cache_bytes: None,
             mtp_head_source: None,
+            draft_quantize: None,
         })
         .expect("load Qwen3-VL");
     // The provider must advertise tool calling once loaded (the qwen3_vl chat template renders a

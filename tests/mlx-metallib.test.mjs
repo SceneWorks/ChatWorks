@@ -8,7 +8,7 @@ import { collect, stageMlxMetallib, verifyMlxMetallib } from '../scripts/package
 
 const revision = 'd5a7fc018d713a37091e1cd102873eab355a00c6';
 
-function fixture(t) {
+function fixture(t, layout = 'classic') {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'chatworks-mlx-package-'));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   for (const [relative, body] of Object.entries({
@@ -27,14 +27,15 @@ function fixture(t) {
   const build = path.join(root, 'build');
   const app = path.join(build, 'release/bundle/macos/ChatWorks.app');
   const binary = path.join(app, 'Contents/MacOS/chatworks');
-  const output = path.join(build, 'release/build/pmetal-mlx-sys-aabbccdd/output');
-  const out = path.dirname(output);
+  const out = path.join(build, layout === 'classic' ? 'release/build/pmetal-mlx-sys-aabbccdd' : 'release/build/pmetal-mlx-sys/aabbccdd');
+  const output = path.join(out, layout === 'classic' ? 'output' : 'run/stdout');
   const source = path.join(out, 'out/build/lib/mlx.metallib');
-  const compiled = path.join(out, 'out/build/_deps/mlx-build/mlx/backend/metal/kernels/mlx.metallib');
+  const compiled = path.join(out, `out/build/_deps/pmetal-${'a'.repeat(64)}/mlx-build/mlx/backend/metal/kernels/mlx.metallib`);
   const manifest = path.join(path.dirname(source), 'pmetal-mlx-prebuilt.txt');
   fs.mkdirSync(path.dirname(binary), { recursive: true });
   fs.mkdirSync(path.dirname(source), { recursive: true });
   fs.mkdirSync(path.dirname(compiled), { recursive: true });
+  fs.mkdirSync(path.dirname(output), { recursive: true });
   fs.writeFileSync(binary, `Mach-O fixture: ${path.dirname(compiled)}//mlx.metallib`);
   fs.writeFileSync(source, 'same build Metal kernels');
   fs.writeFileSync(compiled, 'same build Metal kernels');
@@ -75,4 +76,13 @@ test('MLX staging rejects stale, nonmatching, or wrong-target build outputs', { 
   fs.writeFileSync(f.source, 'same build Metal kernels');
   fs.writeFileSync(f.manifest, fs.readFileSync(f.manifest, 'utf8').replace('deployment_target=26.2', 'deployment_target=14.0'));
   assert.throws(() => stageMlxMetallib(f.root, f.build), /release contract/);
+});
+
+test('MLX staging binds the build-script dir in Cargo\'s nested build-dir layout', { skip: process.platform === 'win32' }, t => {
+  const f = fixture(t, 'nested');
+  const staged = stageMlxMetallib(f.root, f.build);
+  assert.equal(staged.build_script_output, 'release/build/pmetal-mlx-sys/aabbccdd/run/stdout');
+  assert.deepEqual(verifyMlxMetallib(f.app, f.build, f.root), staged);
+  fs.writeFileSync(f.binary, 'app without embedded MLX build path');
+  assert.throws(() => stageMlxMetallib(f.root, f.build), /found 0\nexamined:\n .*pmetal-mlx-sys\/aabbccdd: 0 executable-embedded/);
 });

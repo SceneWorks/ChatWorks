@@ -423,3 +423,158 @@ pub fn resident_loader(spec: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextL
         namespace,
     }))
 }
+
+/// Block drafts resident in a [`block_draft_loader`] provider, keyed by the target's source: one
+/// while the provider holding it lives, zero once it is dropped (SW-7199 AC2).
+pub fn resident_block_drafts() -> &'static Mutex<HashMap<String, usize>> {
+    static RESIDENT: OnceLock<Mutex<HashMap<String, usize>>> = OnceLock::new();
+    RESIDENT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The resident block-draft count a [`block_draft_loader`] saw for a target each time it was
+/// asked to load it: a reload must find the previous draft already released.
+pub fn block_drafts_resident_at_load() -> &'static Mutex<HashMap<String, Vec<usize>>> {
+    static SEEN: OnceLock<Mutex<HashMap<String, Vec<usize>>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A block draft's residency, released when the provider holding it drops.
+struct ResidentBlockDraft {
+    target: String,
+}
+
+impl ResidentBlockDraft {
+    fn admit(target: &str) -> Self {
+        *resident_block_drafts()
+            .lock()
+            .unwrap()
+            .entry(target.to_string())
+            .or_default() += 1;
+        Self {
+            target: target.to_string(),
+        }
+    }
+}
+
+impl Drop for ResidentBlockDraft {
+    fn drop(&mut self) {
+        if let Some(count) = resident_block_drafts()
+            .lock()
+            .unwrap()
+            .get_mut(&self.target)
+        {
+            *count -= 1;
+        }
+    }
+}
+
+/// A telemetry fake with a block draft beside it, like the MLX runtime (SW-F360): a draft source
+/// containing `missing` is refused with the runtime's unreadable-config reason, a precision other
+/// than 8 or 4 bits is refused by name, and a resident draft advertises `block_draft` and reports
+/// its source, format and precision on every block-draft decode.
+pub struct BlockDraftFake {
+    inner: FakeProvider,
+    draft: Option<(crate::core_llm::DecodeDraft, ResidentBlockDraft)>,
+}
+
+pub fn block_draft_loader(spec: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
+    use crate::core_llm::{
+        BlockDraftPrecision, BlockDraftRefusal, DecodeDraft, ProposerCapabilities,
+        SpeculativeProposer,
+    };
+    let resident = resident_block_drafts()
+        .lock()
+        .unwrap()
+        .get(&spec.source)
+        .copied()
+        .unwrap_or(0);
+    block_drafts_resident_at_load()
+        .lock()
+        .unwrap()
+        .entry(spec.source.clone())
+        .or_default()
+        .push(resident);
+    let mut inner = telemetry_provider();
+    let mut load_report = LoadReport::default();
+    let mut draft = None;
+    if let Some(source) = spec.draft_source.as_deref() {
+        let outcome = if source.contains("missing") {
+            Err(BlockDraftRefusal::Format(format!(
+                "read {source}/config.json: not found"
+            )))
+        } else {
+            BlockDraftPrecision::from_request(spec.draft_quantize)
+        };
+        match outcome {
+            Ok(precision) => {
+                inner
+                    .descriptor
+                    .capabilities
+                    .speculative
+                    .push(ProposerCapabilities {
+                        proposer: SpeculativeProposer::BlockDraft,
+                        max_depth: 8,
+                        recommended_depth: 4,
+                    });
+                load_report.record_draft(DraftReport::resident(source));
+                draft = Some((
+                    DecodeDraft {
+                        source: source.to_string(),
+                        format: "dspine".to_string(),
+                        precision: precision.label().to_string(),
+                    },
+                    ResidentBlockDraft::admit(&spec.source),
+                ));
+            }
+            Err(refusal) => {
+                load_report.record_draft(DraftReport::refused(source, refusal.to_string()))
+            }
+        }
+    }
+    inner.load_report = Some(load_report);
+    Ok(Box::new(BlockDraftFake { inner, draft }))
+}
+
+impl TextLlm for BlockDraftFake {
+    fn descriptor(&self) -> &TextLlmDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn load_report(&self) -> Option<LoadReport> {
+        self.inner.load_report()
+    }
+
+    fn validate(&self, req: &TextLlmRequest) -> crate::core_llm::Result<()> {
+        self.inner.validate(req)
+    }
+
+    fn generate(
+        &self,
+        req: &TextLlmRequest,
+        on_event: &mut dyn FnMut(StreamEvent),
+    ) -> crate::core_llm::Result<TextLlmOutput> {
+        let mut output = self.inner.generate(req, on_event)?;
+        if let (
+            crate::core_llm::Speculative::Proposer {
+                proposer: crate::core_llm::SpeculativeProposer::BlockDraft,
+                depth,
+            },
+            Some((draft, _)),
+        ) = (req.speculative_mode(), &self.draft)
+        {
+            // Two verify passes of `depth` drafts, five accepted in all.
+            output.decode = Some(DecodeReport {
+                path: "block_draft".to_string(),
+                proposer: ProposerKind::BlockDraft,
+                draft_tokens: Some(depth),
+                draft: Some(draft.clone()),
+                proposed_tokens: u64::from(depth) * 2,
+                accepted_tokens: 5,
+                verify_steps: 2,
+                target_forwards: 3,
+                ..fake_decode_report()
+            });
+        }
+        Ok(output)
+    }
+}

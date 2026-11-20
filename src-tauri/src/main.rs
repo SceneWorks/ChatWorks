@@ -13,7 +13,7 @@ use chatworks::conversations::{
 };
 use chatworks::engine::{
     prepare_remote_media as prepare_remote_media_inner, EngineHandle, EngineStatus,
-    GenerateRequest, GenerateResponse, LoadModelRequest, PreparedMedia,
+    GenerateRequest, GenerateResponse, LoadModelRequest, PreparedMedia, QuantizeRequest,
 };
 use chatworks::model_registry::{
     adopt_cached_hf_model as adopt_cached_hf_model_inner, clear_hf_token as clear_hf_token_inner,
@@ -265,6 +265,7 @@ fn set_model_load_options(
     draft_source: Option<String>,
     prefix_cache_bytes: Option<u64>,
     mtp_head_source: Option<String>,
+    draft_quantize: Option<QuantizeRequest>,
 ) -> Result<ModelRegistry, String> {
     chatworks::model_registry::set_model_load_options(
         &app,
@@ -272,7 +273,26 @@ fn set_model_load_options(
         draft_source,
         prefix_cache_bytes,
         mtp_head_source,
+        draft_quantize,
     )
+}
+
+#[tauri::command]
+fn block_draft_options(
+    app: AppHandle,
+    model_id: String,
+) -> Result<Vec<chatworks::model_registry::BlockDraftOption>, String> {
+    chatworks::model_registry::block_draft_options(&app, &model_id)
+}
+
+#[tauri::command]
+async fn install_block_draft(
+    app: AppHandle,
+    model_id: String,
+    format: String,
+    job_id: String,
+) -> Result<ModelRegistry, String> {
+    chatworks::model_registry::install_block_draft(app, model_id, format, job_id).await
 }
 
 #[tauri::command]
@@ -416,6 +436,8 @@ fn main() {
             api_auth_token,
             list_registered_models,
             set_model_load_options,
+            block_draft_options,
+            install_block_draft,
             import_hf_model,
             list_cached_hf_models,
             adopt_cached_hf_model,

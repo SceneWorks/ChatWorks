@@ -715,7 +715,8 @@ export function ChatScreen() {
           </label>
         ) : null}
         <GenerationControls params={params} onChange={updateParam}
-          capabilities={engineStatus?.loaded?.provider?.capabilities ?? {}} />
+          capabilities={engineStatus?.loaded?.provider?.capabilities ?? {}}
+          loaded={engineStatus?.loaded ?? null} />
         <DecodePathStatus
           engineStatus={engineStatus}
           notice={{

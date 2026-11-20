@@ -12,6 +12,8 @@ Release notes for ChatWorks. The newest unreleased changes come first.
   with N draft tokens as the MTP proposer at depth N, and legacy `mtpMode: auto` now means the
   runtime's `auto` — the model's MTP head where it has one, otherwise prompt lookup — instead of
   "MTP or nothing". A setting that was never chosen follows the runtime's own default.
+- On Apple Silicon (MLX) at q4 or q8, `auto` prefers a resident block draft over the MTP head where the
+  runtime measured the block draft faster; CUDA keeps MTP (inference pin bump, SW-7200).
 - Seeded non-greedy (temperature > 0) outputs change: sampling moved to the device, so the same
   seed draws different tokens than before. The output distribution is unchanged; greedy output
   is unaffected.

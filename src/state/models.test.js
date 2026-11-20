@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  draftModelOptions, loadNotice, modelSubtitle, modelWeightLabel, prefixCacheBytesFromField, prefixCacheField,
-  servedWithLoadOptions,
+  blockDraftAction, draftModelOptions, loadNotice, modelSubtitle, modelWeightLabel, prefixCacheBytesFromField,
+  prefixCacheField, savedBlockDraft, servedWithLoadOptions,
 } from "./models.js";
 
 test("cached source labels follow the detected format and quantization", () => {
@@ -60,4 +60,25 @@ test("epic sc-24432 load options: draft choices are the other registered models,
   assert.equal(servedWithLoadOptions(target, {}), true, "no options either side");
   assert.equal(servedWithLoadOptions({ ...target, mtpHeadSource: "/m/head" }, {}), false, "head added");
   assert.equal(servedWithLoadOptions({ ...target, mtpHeadSource: "/m/head" }, { mtp_head_source: "/m/head" }), true);
+});
+
+test("SW-7199: installed block drafts are draft choices, explained when unusable, and their precision is a load option", () => {
+  const target = { id: "qwen38", name: "Qwen3.8-27B", localPath: "/m/qwen3.8-27b" };
+  const drafts = [
+    { format: "dspine", label: "DSpine (b16)", installedPath: "/s/dspine", unavailable: null },
+    { format: "dflash2", label: "DFlash2", installedPath: null, unavailable: "This build's inference runtime does not read DFlash2 drafts." },
+  ];
+  assert.deepEqual(draftModelOptions([target], target, drafts), [["", "No draft model"], ["/s/dspine", "DSpine (b16) block draft"]]);
+  assert.deepEqual(blockDraftAction(drafts[0], target), { kind: "use", label: "Use" });
+  assert.deepEqual(blockDraftAction(drafts[1], target), { kind: "unavailable", label: drafts[1].unavailable });
+  assert.equal(blockDraftAction({ ...drafts[1], unavailable: null }, target).kind, "install");
+  const using = { ...target, draftSource: "/s/dspine" };
+  assert.equal(blockDraftAction(drafts[0], using).kind, "selected");
+  assert.equal(savedBlockDraft(using, drafts), drafts[0]);
+  assert.equal(savedBlockDraft(target, drafts), null);
+  // A different saved precision offers a reload, like any load option.
+  const loaded = { draft_source: "/s/dspine", draft_quantize: null };
+  assert.equal(servedWithLoadOptions(using, loaded), true);
+  assert.equal(servedWithLoadOptions({ ...using, draftQuantize: "q4" }, loaded), false, "precision changed");
+  assert.equal(servedWithLoadOptions({ ...using, draftQuantize: "q4" }, { ...loaded, draft_quantize: "q4" }), true);
 });
