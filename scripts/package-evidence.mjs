@@ -61,10 +61,18 @@ function linkedMlxBuild(root, targetDir, app) {
   const buildDir = path.join(targetDir, 'release/build');
   const matches = [];
   const examined = [];
-  for (const name of fs.readdirSync(buildDir).filter(name => /^pmetal-mlx-sys-[a-f0-9]+$/.test(name))) {
+  // Cargo's build-script dirs: build/pmetal-mlx-sys-<hash>/{out,output} (classic layout) or
+  // build/pmetal-mlx-sys/<hash>/{out,run/stdout} (the build-dir layout Cargo 1.100 produces).
+  const nested = path.join(buildDir, 'pmetal-mlx-sys');
+  const candidates = [
+    ...fs.readdirSync(buildDir).filter(name => /^pmetal-mlx-sys-[a-f0-9]+$/.test(name)),
+    ...(fs.existsSync(nested) ? fs.readdirSync(nested).filter(hash => /^[a-f0-9]+$/.test(hash))
+      .map(hash => path.join('pmetal-mlx-sys', hash)) : []),
+  ];
+  for (const name of candidates) {
     const reject = reason => examined.push(`${path.join(buildDir, name)}: ${reason}`);
-    const output = path.join(buildDir, name, 'output');
-    if (!fs.existsSync(output)) { reject('no build-script output'); continue; }
+    const output = ['output', 'run/stdout'].map(file => path.join(buildDir, name, file)).find(file => fs.existsSync(file));
+    if (!output) { reject('no build-script output'); continue; }
     const sources = [...fs.readFileSync(output, 'utf8').matchAll(/^cargo:metallib=(.+)$/gm)];
     if (sources.length !== 1) { reject(`${sources.length} cargo:metallib lines`); continue; }
     const source = sources[0][1].trim();
@@ -90,7 +98,7 @@ function linkedMlxBuild(root, targetDir, app) {
   }
   if (matches.length !== 1) {
     throw new Error(`Expected one linked MLX metallib build; found ${matches.length}\n`
-      + `examined:\n  ${examined.join('\n  ') || `(no pmetal-mlx-sys-* dirs in ${buildDir})`}\n`
+      + `examined:\n  ${examined.join('\n  ') || `(no pmetal-mlx-sys build-script dirs in ${buildDir})`}\n`
       + `executable ${executable} embeds:\n  ${embeddedMetallibPaths(binary).join('\n  ') || '(no MLX kernels metallib path)'}`);
   }
   const { output, source, manifestFile, compiled } = matches[0];
