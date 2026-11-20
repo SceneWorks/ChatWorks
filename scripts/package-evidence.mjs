@@ -64,17 +64,22 @@ function linkedMlxBuild(root, targetDir, app) {
     const source = sources[0][1].trim();
     const expected = path.join(buildDir, name, 'out/build/lib/mlx.metallib');
     if (source !== expected || !fs.existsSync(source) || !fs.statSync(source).isFile()) continue;
-    const kernels = path.join(buildDir, name, 'out/build/_deps/mlx-build/mlx/backend/metal/kernels');
+    // mlx-sys stages MLX's CMake build under _deps/pmetal-<source fingerprint>/ (the fingerprint its
+    // build manifest records), so the executable embeds that build's kernels path.
+    const manifestFile = path.join(path.dirname(source), 'pmetal-mlx-prebuilt.txt');
+    if (!fs.existsSync(manifestFile)) continue;
+    const fingerprint = fs.readFileSync(manifestFile, 'utf8').match(/^fingerprint=([a-f0-9]{64})$/m)?.[1];
+    if (!fingerprint) continue;
+    const kernels = path.join(buildDir, name, `out/build/_deps/pmetal-${fingerprint}/mlx-build/mlx/backend/metal/kernels`);
     if (![`${kernels}/mlx.metallib`, `${kernels}//mlx.metallib`]
       .some(value => binary.includes(Buffer.from(value)))) continue;
-    matches.push({ output, source, compiled: path.join(kernels, 'mlx.metallib') });
+    matches.push({ output, source, manifestFile, compiled: path.join(kernels, 'mlx.metallib') });
   }
   if (matches.length !== 1) throw new Error(`Expected one linked MLX metallib build; found ${matches.length}`);
-  const { output, source, compiled } = matches[0];
+  const { output, source, manifestFile, compiled } = matches[0];
   if (!fs.existsSync(compiled) || hash(source) !== hash(compiled)) {
     throw new Error('MLX metadata library differs from the executable-linked Metal kernels');
   }
-  const manifestFile = path.join(path.dirname(source), 'pmetal-mlx-prebuilt.txt');
   const manifest = mlxManifest(manifestFile);
   return { output, source, manifestFile, manifest, revision: mlxRevision(root) };
 }

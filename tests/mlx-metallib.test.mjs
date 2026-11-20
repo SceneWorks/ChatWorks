@@ -30,7 +30,7 @@ function fixture(t) {
   const output = path.join(build, 'release/build/pmetal-mlx-sys-aabbccdd/output');
   const out = path.dirname(output);
   const source = path.join(out, 'out/build/lib/mlx.metallib');
-  const compiled = path.join(out, 'out/build/_deps/mlx-build/mlx/backend/metal/kernels/mlx.metallib');
+  const compiled = path.join(out, `out/build/_deps/pmetal-${'a'.repeat(64)}/mlx-build/mlx/backend/metal/kernels/mlx.metallib`);
   const manifest = path.join(path.dirname(source), 'pmetal-mlx-prebuilt.txt');
   fs.mkdirSync(path.dirname(binary), { recursive: true });
   fs.mkdirSync(path.dirname(source), { recursive: true });
