@@ -1146,6 +1146,113 @@ fn decode_from(value: &Value) -> Option<DecodeReportPayload> {
             }
         }),
         speculative_demoted_at: value["speculative_demoted_at"].as_u64(),
+        speculative_monitor: value["speculative_monitor"].is_object().then(|| {
+            let m = &value["speculative_monitor"];
+            chatworks::engine::SpeculativeMonitorPayload {
+                window: m["window"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0),
+                verifies: m["verifies"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0),
+                accepted: m["accepted"].as_u64().unwrap_or(0),
+                observed_mean_accepted: m["observed_mean_accepted"].as_f64().unwrap_or(0.0),
+                timed_steps: m["timed_steps"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0),
+                timed_tokens: m["timed_tokens"].as_u64().unwrap_or(0),
+                timed_ms: m["timed_ms"].as_f64().unwrap_or(0.0),
+                plain_step_ms: m["plain_step_ms"].as_f64(),
+                speculative_step_ms: m["speculative_step_ms"].as_f64(),
+                verify_cost_ratio: m["verify_cost_ratio"].as_f64(),
+                measured_gain: m["measured_gain"].as_f64(),
+                basis: m["basis"].as_str().unwrap_or_default().to_string(),
+                demoted: m["demoted"].as_bool().unwrap_or(false),
+            }
+        }),
+        adaptive_speculative: value["adaptive_speculative"].is_object().then(|| {
+            let a = &value["adaptive_speculative"];
+            chatworks::engine::AdaptiveSpeculativeReportPayload {
+                adaptive: a["adaptive"].as_bool().unwrap_or(false),
+                candidates: a["candidates"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                initial_proposer: a["initial_proposer"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                initial_depth: a["initial_depth"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0),
+                final_proposer: a["final_proposer"].as_str().unwrap_or_default().to_string(),
+                final_depth: a["final_depth"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0),
+                depth_changes: a["depth_changes"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0),
+                proposer_switches: a["proposer_switches"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0),
+                events: a["events"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .map(|e| chatworks::engine::AdaptiveSpeculativeEventPayload {
+                                token_offset: e["token_offset"].as_u64().unwrap_or(0),
+                                verify_step: e["verify_step"].as_u64().unwrap_or(0),
+                                kind: e["kind"].as_str().unwrap_or_default().to_string(),
+                                from_proposer: e["from_proposer"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                from_depth: e["from_depth"]
+                                    .as_u64()
+                                    .and_then(|n| u32::try_from(n).ok())
+                                    .unwrap_or(0),
+                                to_proposer: e["to_proposer"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string(),
+                                to_depth: e["to_depth"]
+                                    .as_u64()
+                                    .and_then(|n| u32::try_from(n).ok())
+                                    .unwrap_or(0),
+                                reason: e["reason"].as_str().unwrap_or_default().to_string(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                plain_reason: a["plain_reason"].as_str().map(str::to_string),
+                cost: a["cost"].is_object().then(|| {
+                    let c = &a["cost"];
+                    chatworks::engine::AdaptiveCostSummaryPayload {
+                        proposal_ms: c["proposal_ms"].as_f64().unwrap_or(0.0),
+                        verify_ms: c["verify_ms"].as_f64().unwrap_or(0.0),
+                        rollback_ms: c["rollback_ms"].as_f64().unwrap_or(0.0),
+                        sync_ms: c["sync_ms"].as_f64().unwrap_or(0.0),
+                        total_ms: c["total_ms"].as_f64().unwrap_or(0.0),
+                        ms_per_committed_token: c["ms_per_committed_token"].as_f64(),
+                        host_syncs: c["host_syncs"].as_u64().unwrap_or(0),
+                        committed_tokens: c["committed_tokens"].as_u64().unwrap_or(0),
+                    }
+                }),
+            }
+        }),
         fallbacks: value["fallbacks"]
             .as_array()
             .map(|items| {

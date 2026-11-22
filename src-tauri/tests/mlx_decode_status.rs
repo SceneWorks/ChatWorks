@@ -231,6 +231,8 @@ fn an_mlx_chat_response_reports_proposer_accepted_length_and_sampler() {
         "mean_accepted_length",
         "verify_steps",
         "sampler",
+        "speculative_monitor",
+        "adaptive_speculative",
         "fallbacks",
     ] {
         assert!(
@@ -239,5 +241,80 @@ fn an_mlx_chat_response_reports_proposer_accepted_length_and_sampler() {
             wire["last_decode"]
         );
     }
+    // SW-7238 AC2: Auto reports structured adaptive telemetry on the pinned runtime.
+    let adaptive = decode
+        .adaptive_speculative
+        .as_ref()
+        .expect("pinned runtime populates adaptive_speculative for auto");
+    assert!(adaptive.adaptive, "{adaptive:?}");
+    assert_eq!(adaptive.initial_proposer, "prompt_lookup", "{adaptive:?}");
+    assert!(!adaptive.candidates.is_empty(), "{adaptive:?}");
+    assert!(!adaptive.events.is_empty(), "{adaptive:?}");
+
+    // SW-7238 AC1: Explicit Off and explicit {proposer, depth} are authoritative on the pinned
+    // runtime (non-adaptive, zero depth changes / proposer switches).
+    let off_request: GenerateRequest = serde_json::from_value(json!({
+        "messages": [{"role": "user", "content": "hello world hello world"}],
+        "sampling": {"temperature": 0.0},
+        "max_new_tokens": 8,
+        "seed": 7,
+        "speculative": "off",
+    }))
+    .unwrap();
+    let off_decode = engine
+        .generate(off_request, |_| {})
+        .expect("off generation")
+        .decode
+        .expect("off decode report");
+    assert_eq!(off_decode.proposer, "none", "{off_decode:?}");
+    assert_eq!(off_decode.draft_tokens, None, "{off_decode:?}");
+    let off_adaptive = off_decode
+        .adaptive_speculative
+        .as_ref()
+        .expect("explicit off still carries adaptive_speculative");
+    assert!(!off_adaptive.adaptive, "{off_adaptive:?}");
+    assert_eq!(off_adaptive.initial_proposer, "none", "{off_adaptive:?}");
+    assert_eq!(off_adaptive.final_proposer, "none", "{off_adaptive:?}");
+    assert_eq!(off_adaptive.depth_changes, 0, "{off_adaptive:?}");
+    assert_eq!(off_adaptive.proposer_switches, 0, "{off_adaptive:?}");
+
+    let explicit_request: GenerateRequest = serde_json::from_value(json!({
+        "messages": [{"role": "user", "content": "hello world hello world hello world hello"}],
+        "sampling": {"temperature": 0.0},
+        "max_new_tokens": 12,
+        "seed": 7,
+        "speculative": {"proposer": "prompt_lookup", "depth": 2},
+    }))
+    .unwrap();
+    let explicit_decode = engine
+        .generate(explicit_request, |_| {})
+        .expect("explicit generation")
+        .decode
+        .expect("explicit decode report");
+    assert_eq!(
+        explicit_decode.proposer, "prompt_lookup",
+        "{explicit_decode:?}"
+    );
+    assert_eq!(explicit_decode.draft_tokens, Some(2), "{explicit_decode:?}");
+    let explicit_adaptive = explicit_decode
+        .adaptive_speculative
+        .as_ref()
+        .expect("explicit proposer carries adaptive_speculative");
+    assert!(!explicit_adaptive.adaptive, "{explicit_adaptive:?}");
+    assert_eq!(
+        explicit_adaptive.initial_proposer, "prompt_lookup",
+        "{explicit_adaptive:?}"
+    );
+    assert_eq!(explicit_adaptive.initial_depth, 2, "{explicit_adaptive:?}");
+    assert_eq!(
+        explicit_adaptive.final_proposer, "prompt_lookup",
+        "{explicit_adaptive:?}"
+    );
+    assert_eq!(explicit_adaptive.final_depth, 2, "{explicit_adaptive:?}");
+    assert_eq!(explicit_adaptive.depth_changes, 0, "{explicit_adaptive:?}");
+    assert_eq!(
+        explicit_adaptive.proposer_switches, 0,
+        "{explicit_adaptive:?}"
+    );
     engine.unload_model().unwrap();
 }

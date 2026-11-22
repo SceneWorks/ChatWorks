@@ -10,11 +10,13 @@
 #![cfg(test)]
 
 use crate::core_llm::{
-    Channel, CudaGraphsReport, DecodeReport, DraftReport, FinishReason, GenerationTimings,
-    LoadReport, LoadSpec, MtpCapabilities, MtpStats, PathReport, PrefixCheckpointCapabilities,
-    PrefixCheckpointMode, PrefixCheckpointPolicy, PrefixCheckpointReport, PrefixDocumentSpan,
-    ProjectionReport, ProposerKind, Quantize, StreamEvent, TextLlm, TextLlmCapabilities,
-    TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingMode, Usage,
+    AdaptiveCostSummary, AdaptiveEventKind, AdaptiveSpeculativeEvent, AdaptiveSpeculativeReport,
+    Channel, CudaGraphsReport, DecodeReport, DemotionBasis, DraftReport, FinishReason,
+    GenerationTimings, LoadReport, LoadSpec, MonitorDecision, MtpCapabilities, MtpStats,
+    PathReport, PrefixCheckpointCapabilities, PrefixCheckpointMode, PrefixCheckpointPolicy,
+    PrefixCheckpointReport, PrefixDocumentSpan, ProjectionReport, ProposerCapabilities,
+    ProposerKind, Quantize, Speculative, SpeculativeProposer, StreamEvent, TextLlm,
+    TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingMode, Usage,
     MAX_CHECKPOINTS_PER_REQUEST,
 };
 use std::collections::HashMap;
@@ -83,6 +85,40 @@ pub fn fake_decode_report() -> DecodeReport {
             protected_bytes: 0,
             evicted_entries: 0,
             fallbacks: Vec::new(),
+        }),
+        adaptive_speculative: Some(AdaptiveSpeculativeReport {
+            adaptive: true,
+            candidates: vec![
+                ProposerKind::Mtp,
+                ProposerKind::PromptLookup,
+                ProposerKind::None,
+            ],
+            initial_proposer: ProposerKind::Mtp,
+            initial_depth: 2,
+            final_proposer: ProposerKind::Mtp,
+            final_depth: 2,
+            depth_changes: 0,
+            proposer_switches: 0,
+            events: vec![AdaptiveSpeculativeEvent {
+                token_offset: 0,
+                verify_step: 0,
+                kind: AdaptiveEventKind::Selected,
+                from_proposer: ProposerKind::Mtp,
+                from_depth: 2,
+                to_proposer: ProposerKind::Mtp,
+                to_depth: 2,
+                reason: "auto selected `mtp` at depth 2".to_string(),
+            }],
+            plain_reason: None,
+            cost: Some(AdaptiveCostSummary {
+                proposal_ns: 1_500_000,
+                verify_ns: 6_000_000,
+                rollback_ns: 0,
+                sync_ns: 500_000,
+                total_ns: 8_000_000,
+                host_syncs: 2,
+                committed_tokens: 4,
+            }),
         }),
         fallbacks: Vec::new(),
         ..DecodeReport::default()
@@ -812,6 +848,305 @@ impl TextLlm for PrefixCheckpointFake {
                 }),
                 ..fake_decode_report()
             }),
+            finish_reason: Some(FinishReason::Stop),
+            kv_cache: None,
+        })
+    }
+}
+
+/// Weightless fake exercising SW-F357 adaptive speculative telemetry and explicit control
+/// preservation across desktop IPC and OpenAI HTTP (streaming + non-streaming).
+pub struct AdaptiveSpeculativeFake {
+    descriptor: TextLlmDescriptor,
+}
+
+pub fn adaptive_speculative_loader(_: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
+    let mut descriptor = thinking_descriptor("fake-adaptive-speculative", 64);
+    descriptor.capabilities.speculative = vec![
+        ProposerCapabilities {
+            proposer: SpeculativeProposer::Mtp,
+            max_depth: 7,
+            recommended_depth: 3,
+        },
+        ProposerCapabilities {
+            proposer: SpeculativeProposer::PromptLookup,
+            max_depth: 7,
+            recommended_depth: 4,
+        },
+    ];
+    Ok(Box::new(AdaptiveSpeculativeFake { descriptor }))
+}
+
+impl TextLlm for AdaptiveSpeculativeFake {
+    fn descriptor(&self) -> &TextLlmDescriptor {
+        &self.descriptor
+    }
+
+    fn validate(&self, req: &TextLlmRequest) -> crate::core_llm::Result<()> {
+        self.descriptor
+            .capabilities
+            .validate_request(&self.descriptor.id, req)
+    }
+
+    fn generate(
+        &self,
+        req: &TextLlmRequest,
+        on_event: &mut dyn FnMut(StreamEvent),
+    ) -> crate::core_llm::Result<TextLlmOutput> {
+        self.validate(req)?;
+        let prompt = req
+            .messages
+            .last()
+            .map(crate::core_llm::Message::text_content)
+            .unwrap_or_default();
+        let decode = match req.speculative_mode() {
+            Speculative::Off => DecodeReport {
+                path: "reference".to_string(),
+                proposer: ProposerKind::None,
+                draft_tokens: None,
+                proposed_tokens: 0,
+                accepted_tokens: 0,
+                verify_steps: 4,
+                target_forwards: 5,
+                adaptive_speculative: Some(AdaptiveSpeculativeReport::explicit(
+                    ProposerKind::None,
+                    0,
+                    None,
+                    None,
+                )),
+                speculative_monitor: None,
+                speculative_demoted_at: None,
+                fallbacks: Vec::new(),
+                ..fake_decode_report()
+            },
+            Speculative::Proposer { proposer: _, depth } => {
+                let resolved = crate::core_llm::resolve_speculative(
+                    req.speculative_mode(),
+                    &self.descriptor.capabilities,
+                );
+                let effective_proposer = resolved.plan.proposer();
+                let effective_depth = resolved.plan.depth().unwrap_or(0);
+                let fallbacks: Vec<String> = resolved.fallback.into_iter().collect();
+                DecodeReport {
+                    path: if effective_proposer == ProposerKind::None {
+                        "reference".to_string()
+                    } else {
+                        effective_proposer.label().to_string()
+                    },
+                    proposer: effective_proposer,
+                    draft_tokens: (effective_depth > 0).then_some(effective_depth),
+                    proposed_tokens: u64::from(effective_depth) * 2,
+                    accepted_tokens: u64::from(effective_depth),
+                    verify_steps: 2,
+                    target_forwards: 3,
+                    adaptive_speculative: Some(AdaptiveSpeculativeReport::explicit(
+                        effective_proposer,
+                        if effective_proposer == ProposerKind::None {
+                            0
+                        } else {
+                            depth.min(effective_depth)
+                        },
+                        fallbacks.first().cloned(),
+                        None,
+                    )),
+                    speculative_monitor: None,
+                    speculative_demoted_at: None,
+                    fallbacks,
+                    ..fake_decode_report()
+                }
+            }
+            Speculative::Auto => match prompt.as_str() {
+                "adaptive-switch" => DecodeReport {
+                    path: "prompt_lookup".to_string(),
+                    proposer: ProposerKind::PromptLookup,
+                    draft_tokens: Some(4),
+                    proposed_tokens: 36,
+                    accepted_tokens: 24,
+                    verify_steps: 10,
+                    target_forwards: 11,
+                    speculative_demoted_at: None,
+                    speculative_monitor: Some(MonitorDecision {
+                        window: 1,
+                        verifies: 10,
+                        accepted: 24,
+                        timed_steps: 8,
+                        timed_tokens: 32,
+                        timed_ns: 64_000_000,
+                        plain_step_ns: Some(4_000_000),
+                        basis: DemotionBasis::Measured,
+                        demoted: false,
+                    }),
+                    adaptive_speculative: Some(AdaptiveSpeculativeReport {
+                        adaptive: true,
+                        candidates: vec![
+                            ProposerKind::Mtp,
+                            ProposerKind::PromptLookup,
+                            ProposerKind::None,
+                        ],
+                        initial_proposer: ProposerKind::Mtp,
+                        initial_depth: 3,
+                        final_proposer: ProposerKind::PromptLookup,
+                        final_depth: 4,
+                        depth_changes: 1,
+                        proposer_switches: 1,
+                        events: vec![
+                            AdaptiveSpeculativeEvent {
+                                token_offset: 0,
+                                verify_step: 0,
+                                kind: AdaptiveEventKind::Selected,
+                                from_proposer: ProposerKind::Mtp,
+                                from_depth: 3,
+                                to_proposer: ProposerKind::Mtp,
+                                to_depth: 3,
+                                reason: "auto selected `mtp` at depth 3".to_string(),
+                            },
+                            AdaptiveSpeculativeEvent {
+                                token_offset: 16,
+                                verify_step: 5,
+                                kind: AdaptiveEventKind::DepthIncreased,
+                                from_proposer: ProposerKind::Mtp,
+                                from_depth: 3,
+                                to_proposer: ProposerKind::Mtp,
+                                to_depth: 4,
+                                reason: "acceptance 0.85 >= 0.75".to_string(),
+                            },
+                            AdaptiveSpeculativeEvent {
+                                token_offset: 32,
+                                verify_step: 9,
+                                kind: AdaptiveEventKind::ProposerSwitched,
+                                from_proposer: ProposerKind::Mtp,
+                                from_depth: 4,
+                                to_proposer: ProposerKind::PromptLookup,
+                                to_depth: 4,
+                                reason: "probe `prompt_lookup` beat incumbent by 22%".to_string(),
+                            },
+                        ],
+                        plain_reason: None,
+                        cost: Some(AdaptiveCostSummary {
+                            proposal_ns: 4_000_000,
+                            verify_ns: 52_000_000,
+                            rollback_ns: 2_000_000,
+                            sync_ns: 6_000_000,
+                            total_ns: 64_000_000,
+                            host_syncs: 10,
+                            committed_tokens: 34,
+                        }),
+                    }),
+                    fallbacks: Vec::new(),
+                    ..fake_decode_report()
+                },
+                "adaptive-fallback" => DecodeReport {
+                    path: "prompt_lookup".to_string(),
+                    proposer: ProposerKind::PromptLookup,
+                    draft_tokens: Some(4),
+                    proposed_tokens: 16,
+                    accepted_tokens: 1,
+                    verify_steps: 8,
+                    target_forwards: 9,
+                    speculative_demoted_at: Some(24),
+                    speculative_monitor: Some(MonitorDecision {
+                        window: 1,
+                        verifies: 8,
+                        accepted: 1,
+                        timed_steps: 8,
+                        timed_tokens: 9,
+                        timed_ns: 100_000_000,
+                        plain_step_ns: Some(8_000_000),
+                        basis: DemotionBasis::Measured,
+                        demoted: true,
+                    }),
+                    adaptive_speculative: Some(AdaptiveSpeculativeReport {
+                        adaptive: true,
+                        candidates: vec![ProposerKind::PromptLookup, ProposerKind::None],
+                        initial_proposer: ProposerKind::PromptLookup,
+                        initial_depth: 4,
+                        final_proposer: ProposerKind::None,
+                        final_depth: 0,
+                        depth_changes: 0,
+                        proposer_switches: 1,
+                        events: vec![
+                            AdaptiveSpeculativeEvent {
+                                token_offset: 0,
+                                verify_step: 0,
+                                kind: AdaptiveEventKind::Selected,
+                                from_proposer: ProposerKind::PromptLookup,
+                                from_depth: 4,
+                                to_proposer: ProposerKind::PromptLookup,
+                                to_depth: 4,
+                                reason: "auto selected `prompt_lookup` at depth 4".to_string(),
+                            },
+                            AdaptiveSpeculativeEvent {
+                                token_offset: 24,
+                                verify_step: 8,
+                                kind: AdaptiveEventKind::FallbackToPlain,
+                                from_proposer: ProposerKind::PromptLookup,
+                                from_depth: 4,
+                                to_proposer: ProposerKind::None,
+                                to_depth: 0,
+                                reason: "measured gain 0.72 below break-even".to_string(),
+                            },
+                        ],
+                        plain_reason: Some("measured gain 0.72 below break-even".to_string()),
+                        cost: Some(AdaptiveCostSummary {
+                            proposal_ns: 500_000,
+                            verify_ns: 95_000_000,
+                            rollback_ns: 1_500_000,
+                            sync_ns: 3_000_000,
+                            total_ns: 100_000_000,
+                            host_syncs: 8,
+                            committed_tokens: 9,
+                        }),
+                    }),
+                    fallbacks: Vec::new(),
+                    ..fake_decode_report()
+                },
+                "adaptive-plain" => {
+                    let reason = "speculative: auto found no proposer this model can run \
+                                  (it advertises none; decoded without a proposer)"
+                        .to_string();
+                    DecodeReport {
+                        path: "reference".to_string(),
+                        proposer: ProposerKind::None,
+                        draft_tokens: None,
+                        proposed_tokens: 0,
+                        accepted_tokens: 0,
+                        verify_steps: 4,
+                        target_forwards: 5,
+                        speculative_demoted_at: None,
+                        speculative_monitor: None,
+                        adaptive_speculative: Some(AdaptiveSpeculativeReport::auto_stayed_plain(
+                            reason.clone(),
+                            vec![ProposerKind::None],
+                        )),
+                        fallbacks: vec![reason],
+                        ..fake_decode_report()
+                    }
+                }
+                _ => fake_decode_report(),
+            },
+        };
+        on_event(StreamEvent::Token {
+            id: 1,
+            text: "ok".to_string(),
+            index: 0,
+            channel: Channel::Content,
+        });
+        let usage = Usage {
+            prompt_tokens: 4,
+            generated_tokens: 1,
+        };
+        on_event(StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+            usage,
+        });
+        Ok(TextLlmOutput {
+            text: "ok".to_string(),
+            thinking: None,
+            tool_calls: Vec::new(),
+            usage,
+            mtp: None,
+            timings: None,
+            decode: Some(decode),
             finish_reason: Some(FinishReason::Stop),
             kv_cache: None,
         })

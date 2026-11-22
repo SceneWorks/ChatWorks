@@ -180,20 +180,151 @@ function prefixBudgetValue(settled, requested) {
   return { value: settled === 0 ? "off" : formatBytes(settled), detail: `${asked}; settled by the runtime at load.` };
 }
 
-function proposerValue(decode) {
-  if (decode.proposer === "none") {
-    return { value: "none (token-at-a-time)", detail: null };
+function formatProposerDepth(proposer, depth) {
+  if (!proposer || proposer === "none") return "plain";
+  return depth ? `${proposer} · ${depth} drafts` : proposer;
+}
+
+function pluralize(count, singular, plural = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function speculativeFallbackReason(decode) {
+  if (!Array.isArray(decode?.fallbacks)) return null;
+  return decode.fallbacks.find((item) => typeof item === "string" && item.startsWith("speculative:")) ?? null;
+}
+
+function formatMonitorSummary(monitor) {
+  if (!monitor) return null;
+  const parts = [`window ${monitor.window} (${monitor.basis})`];
+  if (typeof monitor.measured_gain === "number") {
+    parts.push(`gain ${monitor.measured_gain.toFixed(2)}×`);
   }
-  const drafts = decode.draft_tokens ? ` · ${decode.draft_tokens} drafts` : "";
+  if (typeof monitor.observed_mean_accepted === "number") {
+    parts.push(`accept ${monitor.observed_mean_accepted.toFixed(2)}/step`);
+  }
+  if (typeof monitor.plain_step_ms === "number" && typeof monitor.speculative_step_ms === "number") {
+    parts.push(`${formatMs(monitor.speculative_step_ms)} vs ${formatMs(monitor.plain_step_ms)} plain`);
+  }
+  return parts.join(" · ");
+}
+
+function formatAdaptiveEvent(event) {
+  const at = `t=${event.token_offset}`;
+  const reason = event.reason ? ` (${event.reason})` : "";
+  switch (event.kind) {
+    case "depth_increased":
+    case "depth_decreased":
+      return `${at}: depth ${event.from_depth}→${event.to_depth}${reason}`;
+    case "proposer_switched":
+      return `${at}: switch ${formatProposerDepth(event.from_proposer, event.from_depth)}→${formatProposerDepth(event.to_proposer, event.to_depth)}${reason}`;
+    case "probe_started":
+      return `${at}: probe ${formatProposerDepth(event.to_proposer, event.to_depth)}${reason}`;
+    case "probe_reverted":
+      return `${at}: revert ${formatProposerDepth(event.from_proposer, event.from_depth)}→${formatProposerDepth(event.to_proposer, event.to_depth)}${reason}`;
+    case "fallback_to_plain":
+      return `${at}: fallback→plain${reason}`;
+    case "stayed_plain":
+      return `${at}: stayed plain${reason}`;
+    default:
+      return `${at}: ${event.kind}${reason}`;
+  }
+}
+
+function formatAdaptiveCost(cost) {
+  if (!cost || !(cost.total_ms > 0)) return null;
+  const sub = [];
+  if (typeof cost.ms_per_committed_token === "number") {
+    sub.push(`${formatMs(cost.ms_per_committed_token)}/tok`);
+  }
+  if (cost.proposal_ms > 0) sub.push(`propose ${formatMs(cost.proposal_ms)}`);
+  if (cost.verify_ms > 0) sub.push(`verify ${formatMs(cost.verify_ms)}`);
+  if (cost.rollback_ms > 0) sub.push(`rollback ${formatMs(cost.rollback_ms)}`);
+  if (cost.sync_ms > 0) sub.push(`sync ${formatMs(cost.sync_ms)}`);
+  if (cost.host_syncs > 0) sub.push(pluralize(cost.host_syncs, "sync"));
+  return sub.length ? `${formatMs(cost.total_ms)} total (${sub.join(", ")})` : `${formatMs(cost.total_ms)} total`;
+}
+
+function proposerValue(decode) {
+  const adaptive = decode.adaptive_speculative ?? null;
+  const fallbackReason = speculativeFallbackReason(decode);
+  const plainReason = adaptive?.plain_reason ?? fallbackReason;
+  const ranNone = decode.proposer === "none" && (!adaptive || adaptive.initial_proposer === "none");
+  if (ranNone) {
+    return { value: "none (token-at-a-time)", detail: plainReason ?? null };
+  }
+  const startProposer = adaptive?.initial_proposer ?? decode.proposer;
+  const startDepth = adaptive?.initial_depth ?? decode.draft_tokens ?? 0;
+  const endProposer = adaptive?.final_proposer ?? (decode.speculative_demoted_at != null ? "none" : decode.proposer);
+  const endDepth = adaptive?.final_depth ?? (decode.speculative_demoted_at != null ? 0 : decode.draft_tokens ?? 0);
+  const adaptedTransition = adaptive != null && (startProposer !== endProposer || startDepth !== endDepth);
+  const value = adaptedTransition
+    ? `${formatProposerDepth(startProposer, startDepth)} → ${formatProposerDepth(endProposer, endDepth)}`
+    : `${formatProposerDepth(decode.proposer, decode.draft_tokens)}${decode.speculative_demoted_at != null ? " → plain" : ""}`;
   const accepted = decode.proposed_tokens > 0
     ? `Accepted ${decode.accepted_tokens} of ${decode.proposed_tokens} drafts in ${decode.target_forwards} forwards`
+    : null;
+  const depthChanges = adaptive?.depth_changes > 0
+    ? pluralize(adaptive.depth_changes, "depth change")
+    : null;
+  const switches = adaptive?.proposer_switches > 0
+    ? pluralize(adaptive.proposer_switches, "proposer switch", "proposer switches")
     : null;
   // sc-24446: the runtime's acceptance monitor demoted `auto` to plain decoding mid-request.
   const demoted = decode.speculative_demoted_at != null
     ? `Demoted to plain decoding at token ${decode.speculative_demoted_at}`
     : null;
-  const detail = [accepted, demoted].filter(Boolean).join(" · ") || null;
-  return { value: `${decode.proposer}${drafts}${demoted ? " → plain" : ""}`, detail };
+  const fellBackReason = endProposer === "none" ? plainReason : null;
+  const detail = [accepted, depthChanges, switches, demoted, fellBackReason].filter(Boolean).join(" · ") || null;
+  return { value, detail };
+}
+
+function speculativeDecisionValue(decode) {
+  const adaptive = decode.adaptive_speculative ?? null;
+  const monitor = decode.speculative_monitor ?? null;
+  let value;
+  const details = [];
+  if (adaptive) {
+    const mode = adaptive.adaptive ? "auto (adaptive)" : "explicit";
+    const changes = [];
+    if (adaptive.depth_changes > 0) changes.push(pluralize(adaptive.depth_changes, "depth change"));
+    if (adaptive.proposer_switches > 0) {
+      changes.push(pluralize(adaptive.proposer_switches, "proposer switch", "proposer switches"));
+    }
+    if (adaptive.initial_proposer === "none" && adaptive.final_proposer === "none") {
+      value = adaptive.adaptive ? `${mode} · stayed plain` : `${mode} · plain`;
+    } else if (adaptive.final_proposer === "none") {
+      const from = formatProposerDepth(adaptive.initial_proposer, adaptive.initial_depth);
+      value = `${mode} · ${from} → plain (fell back)`;
+    } else if (changes.length) {
+      const from = formatProposerDepth(adaptive.initial_proposer, adaptive.initial_depth);
+      const to = formatProposerDepth(adaptive.final_proposer, adaptive.final_depth);
+      const path = from === to ? to : `${from} → ${to}`;
+      value = `${mode} · ${path} (${changes.join(", ")})`;
+    } else {
+      value = `${mode} · ${formatProposerDepth(adaptive.final_proposer, adaptive.final_depth)} (steady)`;
+    }
+    if (adaptive.adaptive && Array.isArray(adaptive.candidates) && adaptive.candidates.length) {
+      details.push(`Candidates: ${adaptive.candidates.join(", ")}`);
+    }
+    if (adaptive.plain_reason) {
+      details.push(`Reason: ${adaptive.plain_reason}`);
+    }
+    const events = Array.isArray(adaptive.events) ? adaptive.events : [];
+    const transitions = events.filter((event) => event.kind !== "selected" && event.kind !== "stayed_plain");
+    if (transitions.length) {
+      details.push(`Changes: ${transitions.map(formatAdaptiveEvent).join("; ")}`);
+    } else if (!adaptive.plain_reason && events.length === 1 && events[0].reason) {
+      details.push(events[0].reason);
+    }
+    const cost = formatAdaptiveCost(adaptive.cost);
+    if (cost) details.push(`Cost: ${cost}`);
+  } else if (monitor) {
+    value = monitor.demoted ? "auto · demoted to plain" : "auto · kept proposer";
+  }
+  const monitorSummary = formatMonitorSummary(monitor);
+  if (monitorSummary) details.push(`Monitor: ${monitorSummary}`);
+  return { value, detail: details.join(" · ") || null };
 }
 
 /// The realized mean accepted length, as the runtime computed it (`accepted / verify_steps`).
@@ -335,6 +466,9 @@ export function decodePathRows(engineStatus) {
   }
   last({ key: "implementation", label: "Decode implementation", value: decode.path, detail: null });
   last({ key: "proposer", label: "Proposer", ...proposerValue(decode) });
+  if (decode.adaptive_speculative || decode.speculative_monitor) {
+    last({ key: "speculative_decision", label: "Speculative decision", ...speculativeDecisionValue(decode) });
+  }
   if (decode.draft) last({ key: "decode_draft", label: "Draft", ...decodeDraftValue(decode.draft) });
   if ("mean_accepted_length" in decode) {
     last({ key: "accepted_length", label: "Accepted length", ...acceptedLengthValue(decode) });
@@ -388,7 +522,7 @@ export function speculativeNotice(appSettings, speculativeDefault) {
   return {
     show,
     message: "Speculative decoding is available — turn on Auto",
-    detail: "Your earlier settings kept it off. Auto uses the model's own MTP head where it has one, prompt lookup where it does not, and ordinary decoding where neither runs.",
+    detail: "Your earlier settings kept it off. Auto adaptively chooses among eligible proposers and draft depths, falling back to ordinary decoding when plain decoding is faster or no proposer applies.",
     actionLabel: "Turn on Auto",
     dismissLabel: "Dismiss",
   };
