@@ -235,7 +235,10 @@ fn desktop_rewind_and_pinned_document_reuse_checkpoints_on_pinned_mlx_runtime() 
     let engine = EngineHandle::spawn();
     let status = load_tiny_model(&engine, &snapshot.0);
     assert_eq!(status.execution_backend, "mlx");
-    assert_eq!(status.prefix_checkpoints_default, PrefixCheckpointMode::Off);
+    assert_eq!(
+        status.prefix_checkpoints_default,
+        PrefixCheckpointMode::Auto
+    );
     let loaded = status.loaded.expect("served model");
     let pc_caps = loaded
         .provider

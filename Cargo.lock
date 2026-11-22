@@ -352,9 +352,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "candle-checkpoint"
+version = "0.0.0"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
+dependencies = [
+ "candle-core",
+ "candle-nn",
+ "candle-quant-kernels",
+ "safetensors 0.7.0",
+ "sceneworks-gen-core",
+ "serde_json",
+]
+
+[[package]]
 name = "candle-core"
 version = "0.10.2"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
  "byteorder",
  "candle-kernels",
@@ -382,7 +395,7 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.10.2"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -394,7 +407,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.10.2"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
  "cudaforge",
 ]
@@ -402,7 +415,7 @@ dependencies = [
 [[package]]
 name = "candle-layers"
 version = "0.1.0"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -419,8 +432,9 @@ dependencies = [
 [[package]]
 name = "candle-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
+ "candle-checkpoint",
  "candle-core",
  "candle-flash-attn",
  "candle-layers",
@@ -453,12 +467,13 @@ dependencies = [
 [[package]]
 name = "candle-quant-kernels"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
  "candle-core",
  "candle-nn",
  "float8",
  "half",
+ "sceneworks-gen-core",
 ]
 
 [[package]]
@@ -722,7 +737,7 @@ dependencies = [
 [[package]]
 name = "core-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
  "libc",
  "minijinja",
@@ -2827,7 +2842,7 @@ dependencies = [
 [[package]]
 name = "mlx-layers"
 version = "0.1.0"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
  "core-llm",
  "pmetal-mlx-rs",
@@ -2840,7 +2855,7 @@ dependencies = [
 [[package]]
 name = "mlx-llm"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
  "core-llm",
  "half",
@@ -3991,7 +4006,7 @@ dependencies = [
 [[package]]
 name = "runtime-catalog"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
  "core-llm",
  "sceneworks-gen-core",
@@ -4001,7 +4016,7 @@ dependencies = [
 [[package]]
 name = "runtime-cpu"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
  "candle-llm",
  "runtime-catalog",
@@ -4010,7 +4025,7 @@ dependencies = [
 [[package]]
 name = "runtime-cuda"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
  "candle-llm",
  "runtime-catalog",
@@ -4019,7 +4034,7 @@ dependencies = [
 [[package]]
 name = "runtime-macos"
 version = "0.0.0"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
  "mlx-llm",
  "runtime-catalog",
@@ -4133,7 +4148,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core"
 version = "0.1.0"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
  "core-llm",
  "libc",
@@ -4151,7 +4166,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core-moss-image-policy"
 version = "0.1.0"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
  "sceneworks-gen-core-pag-policy",
  "serde",
@@ -4160,7 +4175,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-gen-core-pag-policy"
 version = "0.1.0"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
  "serde",
 ]
@@ -4168,7 +4183,7 @@ dependencies = [
 [[package]]
 name = "sceneworks-load-progress"
 version = "0.1.0"
-source = "git+https://github.com/SceneWorks/inference?rev=0f2dd4838aedfa4b8f83c4223e4952413ddecae2#0f2dd4838aedfa4b8f83c4223e4952413ddecae2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 
 [[package]]
 name = "schemars"
