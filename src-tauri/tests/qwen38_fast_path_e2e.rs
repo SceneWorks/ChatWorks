@@ -1114,6 +1114,37 @@ fn decode_from(value: &Value) -> Option<DecodeReportPayload> {
         replay_forwards: count("replay_forwards"),
         prefix_hit_tokens: count("prefix_hit_tokens"),
         prefix_cache: path("prefix_cache"),
+        prefix_checkpoints: value["prefix_checkpoints"].is_object().then(|| {
+            let pc = &value["prefix_checkpoints"];
+            chatworks::engine::PrefixCheckpointReportPayload {
+                policy: pc["policy"].as_str().unwrap_or_default().to_string(),
+                reused_tokens: pc["reused_tokens"].as_u64().unwrap_or(0),
+                reread_tokens: pc["reread_tokens"].as_u64().unwrap_or(0),
+                matched_kind: pc["matched_kind"].as_str().map(str::to_string),
+                checkpoints_captured: pc["checkpoints_captured"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0),
+                captured_bytes: pc["captured_bytes"].as_u64().unwrap_or(0),
+                restore_ms: pc["restore_ms"].as_f64().unwrap_or(0.0),
+                capture_ms: pc["capture_ms"].as_f64().unwrap_or(0.0),
+                resident_bytes: pc["resident_bytes"].as_u64().unwrap_or(0),
+                protected_bytes: pc["protected_bytes"].as_u64().unwrap_or(0),
+                evicted_entries: pc["evicted_entries"]
+                    .as_u64()
+                    .and_then(|n| u32::try_from(n).ok())
+                    .unwrap_or(0),
+                fallbacks: pc["fallbacks"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            }
+        }),
         speculative_demoted_at: value["speculative_demoted_at"].as_u64(),
         fallbacks: value["fallbacks"]
             .as_array()

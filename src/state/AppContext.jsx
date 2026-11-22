@@ -24,6 +24,7 @@ export const DEFAULT_APP_SETTINGS = {
     topP: 0.9,
     maxTokens: 512,
     disableThinking: true,
+    prefixCheckpoints: null,
   },
   runtime: {
     cudaGraphs: null,

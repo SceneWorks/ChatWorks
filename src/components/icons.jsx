@@ -57,3 +57,22 @@ export function CheckIcon({ size = 18, ...rest }) {
     </svg>
   );
 }
+
+export function PinIcon({ size = 16, ...rest }) {
+  return (
+    <svg
+      aria-hidden="true"
+      fill="none"
+      height={size}
+      stroke="currentColor"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      strokeWidth="1.7"
+      viewBox="0 0 24 24"
+      width={size}
+      {...rest}
+    >
+      <path d="M12 17v5 M9 3h6l-1 7 3 3v2H7v-2l3-3-1-7z" />
+    </svg>
+  );
+}

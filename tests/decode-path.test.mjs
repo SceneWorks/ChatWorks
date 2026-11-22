@@ -307,6 +307,10 @@ test("the Rust wire shape renders: the view reads tests/engine-status-wire.json 
   assert.equal(rows.proposer.detail, "Accepted 3 of 4 drafts in 3 forwards");
   assert.equal(rows.accepted_length.value, "1.50 drafts per verify step");
   assert.equal(rows.prefix_cache.value, "miss");
+  assert.equal(rows.prefix_cache.detail, "2 recomputed");
+  assert.equal(rows.prefix_checkpoints.value, "auto · miss (0 reused, 2 recomputed)");
+  assert.match(rows.prefix_checkpoints.detail, /1 captured \(2\.0 KB\)/);
+  assert.match(rows.prefix_checkpoints.detail, /restore 0\.25 ms · capture 0\.50 ms/);
   assert.equal(rows.fallbacks.value, "none");
   assert.equal(rows.cuda_graphs.value, "eager");
   assert.equal(rows.cuda_graphs.detail, "0 captured · fallback: deltanet_state_unstable");
@@ -671,4 +675,51 @@ test("SW-7199 AC3: a block-draft decode names the proposer, the draft that ran a
   assert.equal(refusedRows.load_fallbacks.value, refusal);
   assert.equal(refusedRows.proposer.value, "none (token-at-a-time)");
   assert.ok(!("decode_draft" in refusedRows));
+});
+
+test("SW-7236 AC3: prefix checkpoint diagnostics expose reuse, recomputed tokens, snapshot overhead, and fallbacks", () => {
+  const hitStatus = status(MLX, {
+    quantize: null,
+    cuda_graphs: null,
+    last_decode: {
+      ...MLX_DECODE,
+      prefix_hit_tokens: 128,
+      prefix_cache: { path: "hit", reason: null },
+      prefix_checkpoints: {
+        policy: "auto+document",
+        reused_tokens: 128,
+        reread_tokens: 14,
+        matched_kind: "document",
+        checkpoints_captured: 2,
+        captured_bytes: 16384,
+        restore_ms: 1.25,
+        capture_ms: 12.4,
+        resident_bytes: 32768,
+        protected_bytes: 16384,
+        evicted_entries: 1,
+        fallbacks: ["prefix_checkpoints: lower-priority planned checkpoints trimmed to fit memory admission"],
+      },
+    },
+  });
+  const rows = Object.fromEntries(decodePathRows(hitStatus).map((row) => [row.key, row]));
+  assert.equal(rows.prefix_cache.value, "hit · 128 reused, 14 recomputed");
+  assert.equal(rows.prefix_cache.detail, "matched document");
+  assert.equal(rows.prefix_checkpoints.label, "Prefix checkpoints");
+  assert.equal(rows.prefix_checkpoints.section, LAST_GENERATION);
+  assert.equal(rows.prefix_checkpoints.value, "auto+document · document hit (128 reused, 14 recomputed)");
+  assert.match(rows.prefix_checkpoints.detail, /2 captured \(16 KB\)/);
+  assert.match(rows.prefix_checkpoints.detail, /restore 1\.25 ms · capture 12\.4 ms/);
+  assert.match(rows.prefix_checkpoints.detail, /cache 32 KB resident \(16 KB protected\)/);
+  assert.match(rows.prefix_checkpoints.detail, /1 evicted/);
+  assert.match(rows.prefix_checkpoints.detail, /trimmed to fit memory admission/);
+
+  const html = ReactDOMServer.renderToStaticMarkup(React.createElement(DecodePathStatus, { engineStatus: hitStatus }));
+  for (const text of [
+    'data-row="prefix_checkpoints"',
+    "Prefix checkpoints",
+    "document hit (128 reused, 14 recomputed)",
+    "restore 1.25 ms · capture 12.4 ms",
+  ]) {
+    assert.ok(html.includes(text), `missing ${text} in ${html}`);
+  }
 });

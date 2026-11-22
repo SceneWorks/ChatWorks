@@ -1,5 +1,5 @@
 import { parseNumber } from "../media/image.js";
-import { generationOverrides } from "../state/generation.js";
+import { generationOverrides, pinnedDocumentMessagesCount } from "../state/generation.js";
 
 export function buildLocalApiBase(serverStatus) {
   if (!serverStatus?.running) return "http://127.0.0.1:8000";
@@ -123,17 +123,32 @@ export function messageTextContent(message) {
   return "";
 }
 
-export function chatRequestBody({ engineStatus, messages, params, thinkingCapable, tools }) {
+export function chatRequestBody({
+  engineStatus,
+  messages,
+  params,
+  thinkingCapable,
+  tools,
+  pinnedDocumentIndex = null,
+}) {
   const requestMessages = [];
-  if (params.systemPrompt.trim()) {
+  const hasSystemPrompt = Boolean(params.systemPrompt.trim());
+  if (hasSystemPrompt) {
     requestMessages.push({ role: "system", content: params.systemPrompt.trim() });
   }
   requestMessages.push(...messages.map(toOpenAiMessage));
+  const documentMessagesCount = pinnedDocumentMessagesCount({
+    pinnedDocumentIndex,
+    messagesCount: messages.length,
+    hasSystemPrompt,
+  });
   const body = {
     model: engineStatus?.loaded?.name ?? "chatworks",
     messages: requestMessages,
     stream: true,
-    ...generationOverrides(params, engineStatus?.loaded?.provider?.capabilities),
+    ...generationOverrides(params, engineStatus?.loaded?.provider?.capabilities, {
+      documentMessagesCount,
+    }),
   };
   const temperature = parseNumber(params.temperature);
   const topP = parseNumber(params.topP);

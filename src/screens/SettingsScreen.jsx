@@ -310,7 +310,9 @@ export function SettingsScreen() {
         />
         <GenerationControls params={form} onChange={updateForm} prefix="default-generation"
           speculativeLimits={engineStatus?.loaded?.provider?.capabilities ?? null}
-          speculativeDefault={engineStatus?.speculative_default ?? null} />
+          speculativeDefault={engineStatus?.speculative_default ?? null}
+          prefixCheckpointsDefault={engineStatus?.prefix_checkpoints_default ?? null}
+          loaded={engineStatus?.loaded ?? null} />
 
         <div className="panel-head section-head">
           <p className="eyebrow">Runtime</p>

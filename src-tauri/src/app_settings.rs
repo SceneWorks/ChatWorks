@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 
-use crate::core_llm::{MtpMode, Speculative};
+use crate::core_llm::{MtpMode, PrefixCheckpointMode, Speculative};
 use crate::fsutil::write_json_atomic;
 use crate::server::{DEFAULT_OPENAI_HOST, DEFAULT_OPENAI_PORT};
 
@@ -219,6 +219,10 @@ pub struct SamplingDefaults {
     /// clamped by the runtime, which names the clamp in the decode report.
     #[serde(default)]
     pub speculative: Option<Speculative>,
+    /// Exact multi-boundary prefix-checkpoint mode (feature SW-F356): `"off"` or `"auto"`.
+    /// `None` (`null`) follows the runtime's default (`inference_runtime::prefix_checkpoints_default`).
+    #[serde(default)]
+    pub prefix_checkpoints: Option<PrefixCheckpointMode>,
     /// The pre-sc-24445 `mtpMode` (`off | auto | enabled`), read only to migrate it onto
     /// [`speculative`](Self::speculative); never written back.
     #[serde(default, rename = "mtpMode", skip_serializing)]
@@ -249,6 +253,7 @@ impl Default for SamplingDefaults {
             reasoning_effort: None,
             preserve_thinking: None,
             speculative: None,
+            prefix_checkpoints: None,
             legacy_mtp_mode: None,
             legacy_mtp_draft_tokens: None,
             top_k: None,
@@ -728,6 +733,38 @@ mod tests {
             ..AppSettings::default()
         };
         assert_eq!(ui.normalized().unwrap().runtime.cuda_graphs, Some(false));
+    }
+
+    #[test]
+    fn prefix_checkpoints_setting_round_trips_and_defaults_to_none() {
+        let legacy = AppSettings::from_stored_json(
+            r#"{"settingsVersion":3,"sampling":{"temperature":0.5}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.sampling.prefix_checkpoints, None);
+
+        for (wire, expected) in [
+            ("null", None),
+            (r#""off""#, Some(PrefixCheckpointMode::Off)),
+            (r#""auto""#, Some(PrefixCheckpointMode::Auto)),
+        ] {
+            let body =
+                format!(r#"{{"settingsVersion":3,"sampling":{{"prefixCheckpoints":{wire}}}}}"#);
+            let settings = AppSettings::from_stored_json(&body).unwrap();
+            assert_eq!(settings.sampling.prefix_checkpoints, expected, "{body}");
+            let saved = serde_json::to_value(&settings).unwrap();
+            assert_eq!(
+                saved["sampling"]["prefixCheckpoints"],
+                serde_json::from_str::<serde_json::Value>(wire).unwrap()
+            );
+            let reloaded = AppSettings::from_stored_json(&saved.to_string()).unwrap();
+            assert_eq!(reloaded.sampling.prefix_checkpoints, expected, "{body}");
+        }
+
+        assert!(
+            AppSettings::from_stored_json(r#"{"sampling":{"prefixCheckpoints":"always"}}"#)
+                .is_err()
+        );
     }
 
     #[test]

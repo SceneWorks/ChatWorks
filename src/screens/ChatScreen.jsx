@@ -23,7 +23,7 @@ import { DecodePathStatus } from "../components/DecodePathStatus.js";
 import { dismissSpeculativeNotice, enableSpeculativeAuto, lossyWeightsBadge } from "../state/decodePath.js";
 import { formatToolArguments, ToolCallList, ToolResult } from "../components/ToolCallList";
 import { appendAttachmentPlaceholders, settleAttachment, registerPreparation } from "../state/attachments.js";
-import { applySamplingPreset } from "../state/generation.js";
+import { applySamplingPreset, rewindPinnedDocumentIndex } from "../state/generation.js";
 import { prepareRemoteMedia } from "../state/media.js";
 
 /// The maximum number of model→tool→model round-trips in a single send, to bound runaway loops.
@@ -55,6 +55,8 @@ export function ChatScreen() {
     setParams,
     mediaAttachments,
     setMediaAttachments,
+    pinnedDocumentIndex,
+    setPinnedDocumentIndex,
   } = useChatState();
   const [serverStatus, setServerStatus] = useState(null);
   const [error, setError] = useState(null);
@@ -86,6 +88,10 @@ export function ChatScreen() {
   const visionCapable = supportsVision(engineStatus);
   const videoCapable = supportsVideo(engineStatus);
   const toolsCapable = supportsTools(engineStatus);
+  const effectivePrefixCheckpoints = params.prefixCheckpoints || appSettings?.sampling?.prefixCheckpoints || "";
+  const canPinDocument =
+    Boolean(engineStatus?.loaded?.provider?.capabilities?.prefix_checkpoints?.supports_document_span) &&
+    effectivePrefixCheckpoints !== "off";
   const apiBase = buildLocalApiBase(serverStatus);
   const canSend =
     Boolean(engineStatus?.loaded) &&
@@ -163,13 +169,22 @@ export function ChatScreen() {
       const trimmed = messages.slice(0, index);
       setMessages(trimmed);
       setDraft(text);
+      setPinnedDocumentIndex((current) => rewindPinnedDocumentIndex(current, index));
       if (activeConversationId !== null) {
         persistConversation({ messages: trimmed }).catch((err) => {
           setError(err instanceof Error ? err.message : String(err));
         });
       }
     },
-    [busy, messages, setMessages, setDraft, activeConversationId, persistConversation],
+    [busy, messages, setMessages, setDraft, setPinnedDocumentIndex, activeConversationId, persistConversation],
+  );
+
+  const handleTogglePinDocument = useCallback(
+    (index) => {
+      if (busy || !canPinDocument) return;
+      setPinnedDocumentIndex((current) => (current === index ? null : index));
+    },
+    [busy, canPinDocument, setPinnedDocumentIndex],
   );
 
   async function handleSubmit(eventArg) {
@@ -227,6 +242,13 @@ export function ChatScreen() {
         headers.Authorization = `Bearer ${apiAuthToken}`;
       }
       const offerTools = toolsEnabled && supportsTools(activeEngineStatus) && toolSpecs.length > 0;
+      const activeEffectivePrefixCheckpoints =
+        params.prefixCheckpoints || appSettings?.sampling?.prefixCheckpoints || "";
+      const activePinnedDocumentIndex =
+        Boolean(activeEngineStatus?.loaded?.provider?.capabilities?.prefix_checkpoints?.supports_document_span) &&
+        activeEffectivePrefixCheckpoints !== "off"
+          ? pinnedDocumentIndex
+          : null;
 
       let hitStepLimit = true;
       for (let step = 0; step < MAX_TOOL_STEPS; step += 1) {
@@ -243,6 +265,7 @@ export function ChatScreen() {
             params,
             thinkingCapable,
             tools: offerTools ? toolSpecs : null,
+            pinnedDocumentIndex: activePinnedDocumentIndex,
           }),
           onUpdate: ({ content, thinking }) =>
             setMessages([...committed, { ...assistantMessage, content, thinking }]),
@@ -436,9 +459,16 @@ export function ChatScreen() {
             messages.map((message, index) => {
               const hasToolCalls = Boolean(message.tool_calls && message.tool_calls.length);
               const media = messageMedia(message);
+              const isPinnedDocument = canPinDocument && pinnedDocumentIndex === index;
               return (
-                <article className={`message-bubble ${message.role}`} key={`${message.role}-${index}`}>
-                  <div className="message-role">{message.role}</div>
+                <article
+                  className={isPinnedDocument ? `message-bubble ${message.role} pinned-document` : `message-bubble ${message.role}`}
+                  key={`${message.role}-${index}`}
+                >
+                  <div className="message-role">
+                    <span>{message.role}</span>
+                    {isPinnedDocument ? <span className="message-pinned-badge">Document pinned</span> : null}
+                  </div>
                   {media.length ? (
                     <div className="message-images">
                       {media.map((item, mediaIndex) =>
@@ -475,7 +505,15 @@ export function ChatScreen() {
                       {hasToolCalls ? <ToolCallList calls={message.tool_calls} /> : null}
                     </>
                   )}
-                  <MessageActions message={message} index={index} onRewind={handleRewind} busy={busy} />
+                  <MessageActions
+                    message={message}
+                    index={index}
+                    onRewind={handleRewind}
+                    busy={busy}
+                    showPinDocument={canPinDocument}
+                    pinnedDocument={isPinnedDocument}
+                    onTogglePinDocument={handleTogglePinDocument}
+                  />
                 </article>
               );
             })
@@ -716,6 +754,8 @@ export function ChatScreen() {
         ) : null}
         <GenerationControls params={params} onChange={updateParam}
           capabilities={engineStatus?.loaded?.provider?.capabilities ?? {}}
+          prefixCheckpointsDefault={engineStatus?.prefix_checkpoints_default ?? null}
+          appPrefixCheckpoints={appSettings?.sampling?.prefixCheckpoints ?? null}
           loaded={engineStatus?.loaded ?? null} />
         <DecodePathStatus
           engineStatus={engineStatus}
