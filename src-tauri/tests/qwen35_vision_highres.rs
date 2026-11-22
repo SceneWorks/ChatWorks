@@ -74,6 +74,7 @@ fn qwen35_vision_high_resolution_prefill_does_not_crash() {
             reasoning_effort: None,
             preserve_thinking: None,
             speculative: None,
+            prefix_checkpoints: None,
             constraint: None,
             tools: vec![],
         };

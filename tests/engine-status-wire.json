@@ -9,6 +9,7 @@
     "cuda_graphs": { "supported": true, "reason": null }
   },
   "speculative_default": "off",
+  "prefix_checkpoints_default": "off",
   "loaded": {
     "source": "/models/qwen3.8-27b",
     "quantize": "nvfp4",
@@ -55,6 +56,20 @@
       "replay_forwards": 0,
       "prefix_hit_tokens": 0,
       "prefix_cache": { "path": "miss", "reason": null },
+      "prefix_checkpoints": {
+        "policy": "auto",
+        "reused_tokens": 0,
+        "reread_tokens": 2,
+        "matched_kind": null,
+        "checkpoints_captured": 1,
+        "captured_bytes": 2048,
+        "restore_ms": 0.25,
+        "capture_ms": 0.5,
+        "resident_bytes": 2048,
+        "protected_bytes": 0,
+        "evicted_entries": 0,
+        "fallbacks": []
+      },
       "speculative_demoted_at": null,
       "fallbacks": []
     },

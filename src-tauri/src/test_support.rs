@@ -11,9 +11,11 @@
 
 use crate::core_llm::{
     Channel, CudaGraphsReport, DecodeReport, DraftReport, FinishReason, GenerationTimings,
-    LoadReport, LoadSpec, MtpCapabilities, MtpStats, PathReport, ProjectionReport, ProposerKind,
-    Quantize, StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmOutput,
-    TextLlmRequest, ThinkingMode, Usage,
+    LoadReport, LoadSpec, MtpCapabilities, MtpStats, PathReport, PrefixCheckpointCapabilities,
+    PrefixCheckpointMode, PrefixCheckpointPolicy, PrefixCheckpointReport, PrefixDocumentSpan,
+    ProjectionReport, ProposerKind, Quantize, StreamEvent, TextLlm, TextLlmCapabilities,
+    TextLlmDescriptor, TextLlmOutput, TextLlmRequest, ThinkingMode, Usage,
+    MAX_CHECKPOINTS_PER_REQUEST,
 };
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -68,6 +70,20 @@ pub fn fake_decode_report() -> DecodeReport {
             path: "miss".to_string(),
             reason: None,
         },
+        prefix_checkpoints: Some(PrefixCheckpointReport {
+            policy: "auto".to_string(),
+            reused_tokens: 0,
+            reread_tokens: 2,
+            matched_kind: None,
+            checkpoints_captured: 1,
+            captured_bytes: 2048,
+            restore_time: Duration::from_micros(250),
+            capture_time: Duration::from_micros(500),
+            resident_bytes: 2048,
+            protected_bytes: 0,
+            evicted_entries: 0,
+            fallbacks: Vec::new(),
+        }),
         fallbacks: Vec::new(),
         ..DecodeReport::default()
     }
@@ -229,6 +245,11 @@ fn telemetry_provider() -> FakeProvider {
     descriptor.capabilities.mtp = Some(MtpCapabilities {
         max_draft_tokens: 4,
         recommended_draft_tokens: 2,
+    });
+    descriptor.capabilities.prefix_checkpoints = Some(PrefixCheckpointCapabilities {
+        max_checkpoints_per_request: MAX_CHECKPOINTS_PER_REQUEST as u32,
+        supports_document_span: true,
+        supports_hybrid_boundaries: true,
     });
     FakeProvider {
         descriptor,
@@ -576,5 +597,223 @@ impl TextLlm for BlockDraftFake {
             });
         }
         Ok(output)
+    }
+}
+
+/// Recorded request metadata from [`prefix_checkpoint_loader`], keyed by model source.
+#[derive(Clone, Debug)]
+pub struct RecordedCheckpointRequest {
+    pub messages: Vec<(String, String)>,
+    pub prefix_checkpoints: Option<PrefixCheckpointPolicy>,
+}
+
+pub fn recorded_checkpoint_requests(
+) -> &'static Mutex<HashMap<String, Vec<RecordedCheckpointRequest>>> {
+    static REQUESTS: OnceLock<Mutex<HashMap<String, Vec<RecordedCheckpointRequest>>>> =
+        OnceLock::new();
+    REQUESTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Clone)]
+struct StoredFakeCheckpoint {
+    key: Vec<(String, String)>,
+    tokens: u64,
+    kind: &'static str,
+    protected: bool,
+    bytes: u64,
+}
+
+#[derive(Default)]
+struct CheckpointFakeStore {
+    entries: Vec<StoredFakeCheckpoint>,
+}
+
+/// Multi-turn weightless fake that advertises `prefix_checkpoints`, records every request's
+/// messages and policy, and simulates message/document checkpoint hits vs ordinary `off` hits.
+pub struct PrefixCheckpointFake {
+    source: String,
+    descriptor: TextLlmDescriptor,
+    store: Mutex<CheckpointFakeStore>,
+}
+
+pub fn prefix_checkpoint_loader(spec: &LoadSpec) -> crate::core_llm::Result<Box<dyn TextLlm>> {
+    let mut descriptor = thinking_descriptor("fake-prefix-checkpoints", 64);
+    descriptor.capabilities.prefix_checkpoints = Some(PrefixCheckpointCapabilities {
+        max_checkpoints_per_request: MAX_CHECKPOINTS_PER_REQUEST as u32,
+        supports_document_span: true,
+        supports_hybrid_boundaries: true,
+    });
+    Ok(Box::new(PrefixCheckpointFake {
+        source: spec.source.clone(),
+        descriptor,
+        store: Mutex::new(CheckpointFakeStore::default()),
+    }))
+}
+
+impl TextLlm for PrefixCheckpointFake {
+    fn descriptor(&self) -> &TextLlmDescriptor {
+        &self.descriptor
+    }
+
+    fn load_report(&self) -> Option<LoadReport> {
+        Some(LoadReport {
+            prefix_cache_bytes: Some(64 << 20),
+            ..LoadReport::default()
+        })
+    }
+
+    fn validate(&self, req: &TextLlmRequest) -> crate::core_llm::Result<()> {
+        self.descriptor
+            .capabilities
+            .validate_request(&self.descriptor.id, req)
+    }
+
+    fn generate(
+        &self,
+        req: &TextLlmRequest,
+        on_event: &mut dyn FnMut(StreamEvent),
+    ) -> crate::core_llm::Result<TextLlmOutput> {
+        self.validate(req)?;
+        let message_pairs: Vec<(String, String)> = req
+            .messages
+            .iter()
+            .map(|m| (format!("{:?}", m.role), m.text_content()))
+            .collect();
+        recorded_checkpoint_requests()
+            .lock()
+            .unwrap()
+            .entry(self.source.clone())
+            .or_default()
+            .push(RecordedCheckpointRequest {
+                messages: message_pairs.clone(),
+                prefix_checkpoints: req.prefix_checkpoints,
+            });
+
+        let policy = req.prefix_checkpoints_or(PrefixCheckpointMode::Off);
+        let msg_tokens = |pair: &(String, String)| -> u64 {
+            (pair.1.split_whitespace().count().max(1) as u64) + 2
+        };
+        let total_prompt_tokens: u64 = message_pairs.iter().map(msg_tokens).sum::<u64>() + 1;
+
+        let mut store = self.store.lock().unwrap();
+        // Match longest stored checkpoint that is a strict prefix of message_pairs.
+        let best = store
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.key.len() < message_pairs.len()
+                    && message_pairs.starts_with(entry.key.as_slice())
+            })
+            .max_by_key(|entry| (entry.tokens, entry.protected))
+            .cloned();
+
+        let (reused_tokens, matched_kind, restore_time) = match best {
+            Some(hit) => (
+                hit.tokens,
+                Some(hit.kind.to_string()),
+                Duration::from_micros(300),
+            ),
+            None => (0, None, Duration::ZERO),
+        };
+        let reread_tokens = total_prompt_tokens.saturating_sub(reused_tokens);
+
+        let mut captured = 0u32;
+        let mut captured_bytes = 0u64;
+        let mut push_entry = |len: usize, kind: &'static str, protected: bool| {
+            if len == 0 || len > message_pairs.len() {
+                return;
+            }
+            let key = message_pairs[..len].to_vec();
+            let tokens: u64 = key.iter().map(msg_tokens).sum();
+            let bytes = tokens * 256;
+            if let Some(existing) = store.entries.iter_mut().find(|e| e.key == key) {
+                if protected && !existing.protected {
+                    existing.protected = true;
+                    existing.kind = kind;
+                }
+                return;
+            }
+            store.entries.push(StoredFakeCheckpoint {
+                key,
+                tokens,
+                kind,
+                protected,
+                bytes,
+            });
+            captured += 1;
+            captured_bytes += bytes;
+        };
+
+        if policy.is_active() {
+            if let Some(PrefixDocumentSpan::Messages { count }) = policy.document {
+                push_entry(count, "document", true);
+            }
+            if message_pairs.len() >= 2 {
+                push_entry(1, "shared_root", true);
+                push_entry(message_pairs.len() - 1, "message_boundary", false);
+            }
+            push_entry(message_pairs.len(), "conversation", false);
+        } else {
+            push_entry(message_pairs.len(), "conversation", false);
+        }
+
+        let resident_bytes: u64 = store.entries.iter().map(|e| e.bytes).sum();
+        let protected_bytes: u64 = store
+            .entries
+            .iter()
+            .filter(|e| e.protected)
+            .map(|e| e.bytes)
+            .sum();
+
+        on_event(StreamEvent::Token {
+            id: 1,
+            text: "ok".to_string(),
+            index: 0,
+            channel: Channel::Content,
+        });
+        let usage = Usage {
+            prompt_tokens: total_prompt_tokens as u32,
+            generated_tokens: 1,
+        };
+        on_event(StreamEvent::Done {
+            finish_reason: FinishReason::Stop,
+            usage,
+        });
+        Ok(TextLlmOutput {
+            text: "ok".to_string(),
+            thinking: None,
+            tool_calls: Vec::new(),
+            usage,
+            mtp: None,
+            timings: None,
+            decode: Some(DecodeReport {
+                prefix_hit_tokens: reused_tokens,
+                prefix_cache: PathReport {
+                    path: if reused_tokens > 0 { "hit" } else { "miss" }.to_string(),
+                    reason: None,
+                },
+                prefix_checkpoints: Some(PrefixCheckpointReport {
+                    policy: policy.label().to_string(),
+                    reused_tokens,
+                    reread_tokens,
+                    matched_kind,
+                    checkpoints_captured: captured,
+                    captured_bytes,
+                    restore_time,
+                    capture_time: if captured > 0 {
+                        Duration::from_micros(400)
+                    } else {
+                        Duration::ZERO
+                    },
+                    resident_bytes,
+                    protected_bytes,
+                    evicted_entries: 0,
+                    fallbacks: Vec::new(),
+                }),
+                ..fake_decode_report()
+            }),
+            finish_reason: Some(FinishReason::Stop),
+            kv_cache: None,
+        })
     }
 }

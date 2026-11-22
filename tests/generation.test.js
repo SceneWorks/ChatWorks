@@ -4,7 +4,8 @@ import { chatRequestBody, toOpenAiMessage } from "../src/api/sse.js";
 import { paramsFromConversation, paramsToConversation } from "../src/state/conversations.js";
 import {
   applySamplingPreset, clampSpeculativeDepth, generationOverrides, generationParams, generationSettings,
-  proposerUnavailableNote, speculativeDepthNote, speculativeOptions,
+  pinnedDocumentMessagesCount, prefixCheckpointOptions, prefixCheckpointsControl, prefixCheckpointsRequest,
+  proposerUnavailableNote, rewindPinnedDocumentIndex, speculativeDepthNote, speculativeOptions,
 } from "../src/state/generation.js";
 import { appendAttachmentPlaceholders, settleAttachment, registerPreparation } from "../src/state/attachments.js";
 import { isExactGgufUrl, modelSubtitle, unloadServedModel } from "../src/state/models.js";
@@ -20,6 +21,11 @@ const capabilities = {
     { proposer: "mtp", max_depth: 7, recommended_depth: 3 },
     { proposer: "prompt_lookup", max_depth: 7, recommended_depth: 4 },
   ],
+  prefix_checkpoints: {
+    max_checkpoints_per_request: 4,
+    supports_document_span: true,
+    supports_hybrid_boundaries: true,
+  },
 };
 function request(params, caps = capabilities) {
   return chatRequestBody({
@@ -47,16 +53,19 @@ test("model defaults remain omitted and an unchosen speculative option is left t
 test("explicit native controls survive conversation persistence and request mapping", () => {
   const selected = { systemPrompt: "", temperature: "0.7", topP: "0.9", maxTokens: "16",
     disableThinking: false, reasoningEffort: "low", preserveThinking: "false",
-    speculativeMode: "mtp", speculativeDepth: "5", topK: "20", presencePenalty: "1.5", repetitionPenalty: "1.1",
+    speculativeMode: "mtp", speculativeDepth: "5", prefixCheckpoints: "auto",
+    topK: "20", presencePenalty: "1.5", repetitionPenalty: "1.1",
     repetitionContext: "64", seed: "42" };
   const saved = paramsToConversation(selected);
   assert.deepEqual(saved.speculative, { proposer: "mtp", depth: 5 });
+  assert.equal(saved.prefixCheckpoints, "auto");
   const restored = paramsFromConversation(saved);
   assert.deepEqual(restored, selected);
   const body = request(restored);
   assert.equal(body.reasoning_effort, "low");
   assert.equal(body.preserve_thinking, false);
   assert.deepEqual(body.speculative, { proposer: "mtp", depth: 5 });
+  assert.equal(body.prefix_checkpoints, "auto");
   assert.equal(body.top_k, 20);
   assert.equal(body.presence_penalty, 1.5);
   assert.equal(body.repetition_penalty, 1.1);
@@ -213,18 +222,21 @@ test("desktop wire fixture explicitly clears global controls and leaves an uncho
   const { readFile } = await import("node:fs/promises");
   const fixture = JSON.parse(await readFile(new URL("generation-wire.json", import.meta.url)));
   const saved = paramsToConversation({ ...generationParams(), disableThinking: true });
-  // Nothing pins a speculative option the user never chose: the inherited default fills it in.
+  // Nothing pins a speculative or prefix-checkpoint option the user never chose: the inherited default fills it in.
   const savedWire = JSON.parse(JSON.stringify(saved));
   assert.equal(Object.hasOwn(savedWire, "speculative"), false);
+  assert.equal(Object.hasOwn(savedWire, "prefixCheckpoints"), false);
   assert.equal(Object.hasOwn(savedWire, "mtpMode"), false);
   const restored = paramsFromConversation(saved);
   const body = request(restored);
+  assert.equal(Object.hasOwn(body, "prefix_checkpoints"), false);
   const { model_defaults: modelDefaults, ...rest } = body;
   assert.deepEqual({ model_defaults: modelDefaults, ...(Object.hasOwn(rest, "speculative") ? { speculative: rest.speculative } : {}) }, fixture);
   assert.equal(body.disable_thinking, true);
   // An explicit Off survives persistence.
-  const off = paramsFromConversation(paramsToConversation({ ...generationParams(), speculativeMode: "off" }));
+  const off = paramsFromConversation(paramsToConversation({ ...generationParams(), speculativeMode: "off", prefixCheckpoints: "off" }));
   assert.equal(request(off).speculative, "off");
+  assert.equal(request(off).prefix_checkpoints, "off");
 });
 
 test("cancel before native registration finishes never starts preparation", async () => {
@@ -357,4 +369,95 @@ test("SW-7199 AC1: a chosen draft proposer the model cannot run is explained fro
   assert.match(proposerUnavailableNote("block_draft", loaded({ source: "/m/qwen3-0.6b", refusal: null })), /its draft is not a block draft/);
   assert.match(proposerUnavailableNote("draft_model", loaded(null)), /no draft model is loaded/);
   assert.match(proposerUnavailableNote("prompt_lookup", { provider: { capabilities: {} } }), /does not advertise it/);
+});
+
+test("SW-7236 AC2: prefix checkpoint options, capability gating, and policy requests", () => {
+  assert.deepEqual(prefixCheckpointOptions(true, "off", null), [
+    ["", "Runtime default (off)"],
+    ["off", "Off (ordinary prefix)"],
+    ["auto", "Auto (edits & documents)"],
+  ]);
+  assert.deepEqual(prefixCheckpointOptions(false, "off", "auto"), [
+    ["", "App setting (auto)"],
+    ["off", "Off (ordinary prefix)"],
+    ["auto", "Auto (edits & documents)"],
+  ]);
+  assert.deepEqual(prefixCheckpointOptions(false, "off", null), [
+    ["", "Runtime default (off)"],
+    ["off", "Off (ordinary prefix)"],
+    ["auto", "Auto (edits & documents)"],
+  ]);
+
+  const supportedControl = prefixCheckpointsControl(capabilities, { name: "tiny" }, false);
+  assert.equal(supportedControl.disabled, false);
+  assert.match(supportedControl.note, /Up to 4 boundaries/);
+  assert.match(supportedControl.note, /supports pinned documents/);
+
+  const unsupportedControl = prefixCheckpointsControl({}, { name: "joy" }, false);
+  assert.equal(unsupportedControl.disabled, true);
+  assert.match(unsupportedControl.reason, /does not advertise exact prefix checkpoints/);
+  assert.equal(prefixCheckpointsControl({}, null, false).disabled, true);
+
+  const settingsControl = prefixCheckpointsControl(null, { provider: { capabilities: {} } }, true);
+  assert.equal(settingsControl.disabled, false);
+  assert.match(settingsControl.note, /applies to models that support them/);
+
+  // Request emission: supported vs unsupported, off vs pinned document.
+  assert.equal(prefixCheckpointsRequest(undefined, capabilities, null), undefined);
+  assert.equal(prefixCheckpointsRequest("auto", capabilities, null), "auto");
+  assert.equal(prefixCheckpointsRequest("off", capabilities, 2), "off");
+  assert.deepEqual(prefixCheckpointsRequest(undefined, capabilities, 2), {
+    mode: "auto",
+    document: { messages: { count: 2 } },
+  });
+  assert.equal(prefixCheckpointsRequest("auto", {}, 2), undefined);
+});
+
+test("SW-7236 AC1/AC2: pinned document span tracks system prompt and desktop rewind", () => {
+  assert.equal(pinnedDocumentMessagesCount({ pinnedDocumentIndex: 0, messagesCount: 3, hasSystemPrompt: false }), 1);
+  assert.equal(pinnedDocumentMessagesCount({ pinnedDocumentIndex: 1, messagesCount: 3, hasSystemPrompt: true }), 3);
+  assert.equal(pinnedDocumentMessagesCount({ pinnedDocumentIndex: 4, messagesCount: 3, hasSystemPrompt: false }), null);
+
+  assert.equal(rewindPinnedDocumentIndex(1, 2), 1);
+  assert.equal(rewindPinnedDocumentIndex(1, 1), null);
+  assert.equal(rewindPinnedDocumentIndex(2, 0), null);
+  assert.equal(rewindPinnedDocumentIndex(null, 1), null);
+
+  const messages = [
+    { role: "user", content: "Long contract text..." },
+    { role: "assistant", content: "Read the contract." },
+    { role: "user", content: "What is clause 4?" },
+  ];
+  const withPin = chatRequestBody({
+    engineStatus: { loaded: { name: "tiny", provider: { capabilities } } },
+    messages,
+    params: { systemPrompt: "You are concise.", temperature: "0.7", topP: "0.9", maxTokens: "32",
+      disableThinking: false, ...generationParams() },
+    thinkingCapable: true,
+    pinnedDocumentIndex: 0,
+  });
+  // System prompt occupies index 0 on the wire, so user message 0 covers leading count = 2.
+  assert.deepEqual(withPin.prefix_checkpoints, { mode: "auto", document: { messages: { count: 2 } } });
+
+  // Disabling prefix checkpoints preserves ordinary exact-prefix behavior and omits document spans.
+  const disabledPin = chatRequestBody({
+    engineStatus: { loaded: { name: "tiny", provider: { capabilities } } },
+    messages,
+    params: { systemPrompt: "You are concise.", temperature: "0.7", topP: "0.9", maxTokens: "32",
+      disableThinking: false, ...generationParams(), prefixCheckpoints: "off" },
+    thinkingCapable: true,
+    pinnedDocumentIndex: 0,
+  });
+  assert.equal(disabledPin.prefix_checkpoints, "off");
+
+  // Unsupported model omits prefix_checkpoints even with a stale pinnedDocumentIndex.
+  const unsupported = chatRequestBody({
+    engineStatus: { loaded: { name: "joy", provider: { capabilities: { supports_thinking: false } } } },
+    messages,
+    params: { systemPrompt: "", temperature: "0.7", topP: "0.9", maxTokens: "32",
+      disableThinking: false, ...generationParams(), prefixCheckpoints: "auto" },
+    thinkingCapable: false,
+    pinnedDocumentIndex: 0,
+  });
+  assert.equal(Object.hasOwn(unsupported, "prefix_checkpoints"), false);
 });

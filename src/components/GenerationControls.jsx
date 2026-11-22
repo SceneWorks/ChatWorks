@@ -1,14 +1,17 @@
 import {
+  prefixCheckpointOptions, prefixCheckpointsControl,
   proposerCapability, proposerUnavailableNote, speculativeDepthNote, speculativeOptions,
 } from "../state/generation.js";
 
 /// `speculativeLimits`: the capabilities whose per-proposer `max_depth` bounds the depth control
 /// when `capabilities` is null (Settings shows every control, bounded by the served model).
 /// `speculativeDefault`: the runtime's own default (`engine_status.speculative_default`), named
-/// beside "Runtime default". `loaded`: the served model's status, which says why a chosen proposer
-/// does not run on it (a refused or missing draft).
+/// beside "Runtime default". `prefixCheckpointsDefault`: `engine_status.prefix_checkpoints_default`.
+/// `loaded`: the served model's status, which says why a chosen proposer does not run on it (a
+/// refused or missing draft) and whether exact prefix checkpoints are supported.
 export function GenerationControls({
-  params, onChange, capabilities, speculativeLimits = null, speculativeDefault = null, loaded = null,
+  params, onChange, capabilities, speculativeLimits = null, speculativeDefault = null,
+  prefixCheckpointsDefault = null, appPrefixCheckpoints = null, loaded = null,
   prefix = "generation",
 }) {
   const defaults = capabilities == null;
@@ -19,6 +22,8 @@ export function GenerationControls({
   // the chosen proposer, a note says what it runs at (the request is clamped, sc-24445).
   const depthNote = speculativeDepthNote(params.speculativeDepth, depthCapability);
   const unavailableNote = defaults ? null : proposerUnavailableNote(proposer, loaded);
+  const checkpointControl = prefixCheckpointsControl(capabilities, loaded, defaults);
+  const checkpointOptions = prefixCheckpointOptions(defaults, prefixCheckpointsDefault, appPrefixCheckpoints);
   const recommendedEfforts = capabilities?.reasoning_efforts ?? ["low", "medium", "xhigh"];
   // A saved/API-supplied compatibility alias must remain visible and pass through unchanged even
   // when a model deliberately omits it from its recommended distinct levels.
@@ -46,6 +51,16 @@ export function GenerationControls({
         [["", "Model default"], ["true", "Keep in conversation"], ["false", "Omit from future prompts"]])}
       {field("speculativeMode", "Speculative decoding",
         speculativeOptions(capabilities, params.speculativeMode, defaults, speculativeDefault))}
+      <div className="field" key="prefixCheckpoints">
+        <label htmlFor={`${prefix}-prefixCheckpoints`}>Prefix checkpoints</label>
+        <select id={`${prefix}-prefixCheckpoints`} value={params.prefixCheckpoints ?? ""}
+          disabled={checkpointControl.disabled}
+          onChange={(event) => onChange("prefixCheckpoints", event.target.value)}>
+          {checkpointOptions.map(([value, text]) => <option value={value} key={value}>{text}</option>)}
+        </select>
+        {checkpointControl.reason && <small className="field-note" role="status">{checkpointControl.reason}</small>}
+        {!checkpointControl.reason && checkpointControl.note && <small className="field-note">{checkpointControl.note}</small>}
+      </div>
       {proposer && (
         <div className="field">
           <label htmlFor={`${prefix}-speculative-depth`}>Draft depth</label>

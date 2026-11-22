@@ -3,8 +3,8 @@
 use std::sync::OnceLock;
 
 use crate::core_llm::{
-    BackendCapabilities, DecodeBackend, FeatureSupport, LoadSpec, Speculative, TextLlm,
-    TextLlmRegistration, TextLlmRegistry,
+    BackendCapabilities, DecodeBackend, FeatureSupport, LoadSpec, PrefixCheckpointMode,
+    Speculative, TextLlm, TextLlmRegistration, TextLlmRegistry,
 };
 
 #[cfg(all(
@@ -82,6 +82,13 @@ fn decode_backend_for(capabilities: &BackendCapabilities) -> DecodeBackend {
 /// [`decode_backend`]. The one place ChatWorks reads the default; it keeps no copy of its own.
 pub(crate) fn speculative_default() -> Speculative {
     crate::core_llm::speculative_default(decode_backend())
+}
+
+/// The exact multi-boundary prefix-checkpoint mode a request that names none runs under on this
+/// host (feature SW-F356), read from the runtime's per-backend defaults table
+/// (`core_llm::DecodeBackend::defaults`).
+pub(crate) fn prefix_checkpoints_default() -> PrefixCheckpointMode {
+    decode_backend().defaults().prefix_checkpoints
 }
 
 /// Whether a load that leaves `LoadSpec::cuda_graphs` unset captures CUDA graphs on this host
@@ -245,6 +252,10 @@ mod tests {
         assert_eq!(
             super::speculative_default(),
             crate::core_llm::speculative_default(super::decode_backend())
+        );
+        assert_eq!(
+            super::prefix_checkpoints_default(),
+            super::decode_backend().defaults().prefix_checkpoints
         );
         assert_eq!(
             super::cuda_graphs_default(),

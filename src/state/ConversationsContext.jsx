@@ -35,6 +35,7 @@ export function ConversationsProvider({ children }) {
   const [draft, setDraft] = useState("");
   const [params, setParams] = useState(defaultParams);
   const [mediaAttachments, setMediaAttachments] = useState([]);
+  const [pinnedDocumentIndex, setPinnedDocumentIndex] = useState(null);
   // `busy` is the active-stream flag. It lives here (not in ChatScreen) so the history nav — a
   // sibling of ChatScreen in the shell — can read it and hard-block conversation switching while a
   // response is streaming (story C). It only flips at stream boundaries, so exposing it through
@@ -124,6 +125,7 @@ export function ConversationsProvider({ children }) {
     setMessages([]);
     setDraft("");
     setMediaAttachments([]);
+    setPinnedDocumentIndex(null);
     setParams(paramsFromSettings(appSettings.sampling));
   }, [appSettings]);
 
@@ -139,6 +141,7 @@ export function ConversationsProvider({ children }) {
     setMessages(Array.isArray(conversation.messages) ? conversation.messages : []);
     setDraft("");
     setMediaAttachments([]);
+    setPinnedDocumentIndex(null);
     setParams(paramsFromConversation(conversation.params));
     return conversation;
   }, []);
@@ -229,8 +232,10 @@ export function ConversationsProvider({ children }) {
       setParams,
       mediaAttachments,
       setMediaAttachments,
+      pinnedDocumentIndex,
+      setPinnedDocumentIndex,
     }),
-    [messages, draft, params, mediaAttachments],
+    [messages, draft, params, mediaAttachments, pinnedDocumentIndex],
   );
 
   return (

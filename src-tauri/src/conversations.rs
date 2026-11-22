@@ -41,6 +41,10 @@ pub struct ConversationParams {
     /// hard-coded mode the user did not choose.
     #[serde(default)]
     pub speculative: Option<crate::core_llm::Speculative>,
+    /// The conversation's exact multi-boundary prefix-checkpoint mode (`"off"`, `"auto"`, or
+    /// `None` to inherit the app setting).
+    #[serde(default)]
+    pub prefix_checkpoints: Option<crate::core_llm::PrefixCheckpointMode>,
     /// The pre-sc-24445 `mtpMode`, read only to migrate it onto [`speculative`](Self::speculative)
     /// ([`crate::app_settings::legacy_speculative`]); never written back.
     #[serde(default, rename = "mtpMode", skip_serializing)]
@@ -71,6 +75,7 @@ impl Default for ConversationParams {
             reasoning_effort: None,
             preserve_thinking: None,
             speculative: None,
+            prefix_checkpoints: None,
             legacy_mtp_mode: None,
             legacy_mtp_draft_tokens: None,
             top_k: None,
@@ -578,6 +583,7 @@ mod tests {
             top_p: 0.8,
             max_tokens: 128,
             disable_thinking: false,
+            prefix_checkpoints: Some(crate::core_llm::PrefixCheckpointMode::Auto),
             ..Default::default()
         };
         let conversation = Conversation {
@@ -598,6 +604,10 @@ mod tests {
         assert_eq!(got.messages, messages);
         assert_eq!(got.params.temperature, params.temperature);
         assert_eq!(got.params.max_tokens, params.max_tokens);
+        assert_eq!(
+            got.params.prefix_checkpoints,
+            Some(crate::core_llm::PrefixCheckpointMode::Auto)
+        );
         assert_eq!(got.created_at, saved.created_at);
         assert_eq!(got.updated_at, saved.updated_at);
     }

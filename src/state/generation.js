@@ -105,11 +105,74 @@ export function describeSpeculative(speculative) {
   return "unknown";
 }
 
+/// Exact prefix-checkpoint choices: `""` (stored as `null`) follows the inherited default,
+/// `"off"` preserves ordinary exact-prefix behavior, and `"auto"` captures multi-boundary and
+/// document checkpoints.
+export function prefixCheckpointOptions(
+  defaults = false,
+  runtimeDefault = null,
+  appSetting = null,
+) {
+  const inherited = defaults
+    ? `Runtime default${runtimeDefault == null ? "" : ` (${runtimeDefault})`}`
+    : appSetting
+      ? `App setting (${appSetting})`
+      : `Runtime default${runtimeDefault == null ? "" : ` (${runtimeDefault})`}`;
+  return [
+    ["", inherited],
+    ["off", "Off (ordinary prefix)"],
+    ["auto", "Auto (edits & documents)"],
+  ];
+}
+
+/// Availability and reason for the prefix-checkpoints policy control, capability-gated on
+/// `loaded.provider.capabilities.prefix_checkpoints`.
+export function prefixCheckpointsControl(capabilities, loaded = null, defaults = false) {
+  if (defaults) {
+    const supported = loaded?.provider?.capabilities?.prefix_checkpoints != null;
+    if (loaded && !supported) {
+      return {
+        disabled: false,
+        reason: null,
+        note: "The served model does not advertise exact prefix checkpoints; this default applies to models that support them.",
+      };
+    }
+    return {
+      disabled: false,
+      reason: null,
+      note: "Reuses exact prefix checkpoints across edited turns, branches, and pinned documents.",
+    };
+  }
+  if (!loaded) {
+    return {
+      disabled: true,
+      reason: "Unavailable: load a model that supports exact prefix checkpoints.",
+      note: null,
+    };
+  }
+  const support = capabilities?.prefix_checkpoints;
+  if (!support) {
+    return {
+      disabled: true,
+      reason: "Unavailable: the loaded model does not advertise exact prefix checkpoints.",
+      note: null,
+    };
+  }
+  const docNote = support.supports_document_span ? "; supports pinned documents" : "";
+  return {
+    disabled: false,
+    reason: null,
+    note: `Up to ${support.max_checkpoints_per_request} boundaries per request${docNote}.`,
+  };
+}
+
 export function generationParams(value = {}) {
   return {
     reasoningEffort: value.reasoningEffort ?? "",
     preserveThinking: value.preserveThinking == null ? "" : String(value.preserveThinking),
     ...speculativeForm(value.speculative),
+    prefixCheckpoints: value.prefixCheckpoints === "off" || value.prefixCheckpoints === "auto"
+      ? value.prefixCheckpoints : "",
     topK: String(value.topK ?? ""),
     presencePenalty: String(value.presencePenalty ?? ""),
     repetitionPenalty: String(value.repetitionPenalty ?? ""),
@@ -149,12 +212,19 @@ export function generationSettings(params) {
       ? null : params.preserveThinking === true || params.preserveThinking === "true",
     // Omitted (undefined) when unchosen, so the inherited default applies instead of a UI guess.
     speculative: speculativeSetting(params),
+    prefixCheckpoints: prefixCheckpointSetting(params),
     topK: optionalNumber(params.topK),
     presencePenalty: optionalNumber(params.presencePenalty),
     repetitionPenalty: optionalNumber(params.repetitionPenalty),
     repetitionContext: optionalNumber(params.repetitionContext),
     seed,
   };
+}
+
+function prefixCheckpointSetting(params) {
+  const mode = params.prefixCheckpoints;
+  if (mode === "off" || mode === "auto") return mode;
+  return undefined;
 }
 
 function speculativeSetting(params) {
@@ -179,7 +249,40 @@ export function speculativeRequest(speculative, capabilities) {
   return { proposer: speculative.proposer, depth: clampSpeculativeDepth(speculative.depth, capability) };
 }
 
-export function generationOverrides(params, capabilities = {}) {
+/// Leading `messages` count sent on `/v1/chat/completions` covered by a pinned conversation
+/// message (`0..=pinnedDocumentIndex`), accounting for any prepended system prompt message.
+export function pinnedDocumentMessagesCount({
+  pinnedDocumentIndex,
+  messagesCount,
+  hasSystemPrompt = false,
+}) {
+  if (!Number.isInteger(pinnedDocumentIndex) || pinnedDocumentIndex < 0 || pinnedDocumentIndex >= messagesCount) {
+    return null;
+  }
+  return (hasSystemPrompt ? 1 : 0) + pinnedDocumentIndex + 1;
+}
+
+/// Update a pinned document message index after `handleRewind(rewindIndex)` slices the transcript
+/// to `messages.slice(0, rewindIndex)`: clears the pin when truncated at or before it.
+export function rewindPinnedDocumentIndex(pinnedDocumentIndex, rewindIndex) {
+  if (!Number.isInteger(pinnedDocumentIndex) || pinnedDocumentIndex < 0) return null;
+  return rewindIndex <= pinnedDocumentIndex ? null : pinnedDocumentIndex;
+}
+
+/// Build the request's `prefix_checkpoints` field against `capabilities`. Disabled (`"off"`)
+/// always omits any document span so ordinary exact-prefix behavior is preserved.
+export function prefixCheckpointsRequest(mode, capabilities, documentMessagesCount = null) {
+  const support = capabilities?.prefix_checkpoints;
+  if (!support) return undefined;
+  if (mode === "off") return "off";
+  if (Number.isInteger(documentMessagesCount) && documentMessagesCount > 0 && support.supports_document_span !== false) {
+    return { mode: "auto", document: { messages: { count: documentMessagesCount } } };
+  }
+  if (mode === "auto") return "auto";
+  return undefined;
+}
+
+export function generationOverrides(params, capabilities = {}, options = {}) {
   const values = generationSettings(params);
   const body = { model_defaults: ["reasoning_effort", "preserve_thinking"] };
   for (const [key, wire] of [["topK", "top_k"], ["presencePenalty", "presence_penalty"], ["repetitionPenalty", "repetition_penalty"],
@@ -194,5 +297,11 @@ export function generationOverrides(params, capabilities = {}) {
   }
   const speculative = speculativeRequest(values.speculative, capabilities);
   if (speculative !== undefined) body.speculative = speculative;
+  const prefixCheckpoints = prefixCheckpointsRequest(
+    values.prefixCheckpoints,
+    capabilities,
+    options.documentMessagesCount,
+  );
+  if (prefixCheckpoints !== undefined) body.prefix_checkpoints = prefixCheckpoints;
   return body;
 }

@@ -210,8 +210,41 @@ function acceptedLengthValue(decode) {
 
 function prefixCacheValue(decode) {
   const cache = decode.prefix_cache;
-  const value = cache.path === "hit" ? `hit · ${decode.prefix_hit_tokens} prompt tokens reused` : cache.path || "none";
-  return { value, detail: cache.reason ?? null };
+  const pc = decode.prefix_checkpoints;
+  if (cache.path === "hit") {
+    const tokens = pc
+      ? `${pc.reused_tokens} reused, ${pc.reread_tokens} recomputed`
+      : `${decode.prefix_hit_tokens} prompt tokens reused`;
+    const detail = [
+      pc?.matched_kind ? `matched ${pc.matched_kind}` : null,
+      cache.reason ?? null,
+    ].filter(Boolean).join(" · ") || null;
+    return { value: `hit · ${tokens}`, detail };
+  }
+  const detail = [
+    pc && pc.reread_tokens > 0 ? `${pc.reread_tokens} recomputed` : null,
+    cache.reason ?? null,
+  ].filter(Boolean).join(" · ") || null;
+  return { value: cache.path || "none", detail };
+}
+
+function formatMs(ms) {
+  const value = Number(ms);
+  return Number.isFinite(value) ? `${value.toFixed(value >= 10 ? 1 : 2)} ms` : "0.00 ms";
+}
+
+function prefixCheckpointsValue(pc) {
+  const match = pc.matched_kind
+    ? `${pc.matched_kind} hit (${pc.reused_tokens} reused, ${pc.reread_tokens} recomputed)`
+    : `miss (${pc.reused_tokens} reused, ${pc.reread_tokens} recomputed)`;
+  const parts = [
+    `${pc.checkpoints_captured} captured (${formatBytes(pc.captured_bytes)})`,
+    `restore ${formatMs(pc.restore_ms)} · capture ${formatMs(pc.capture_ms)}`,
+    `cache ${formatBytes(pc.resident_bytes)} resident (${formatBytes(pc.protected_bytes)} protected)`,
+  ];
+  if (pc.evicted_entries > 0) parts.push(`${pc.evicted_entries} evicted`);
+  if (Array.isArray(pc.fallbacks) && pc.fallbacks.length) parts.push(`fallbacks: ${pc.fallbacks.join("; ")}`);
+  return { value: `${pc.policy} · ${match}`, detail: parts.join(" · ") };
 }
 
 function graphsValue(graphs) {
@@ -315,6 +348,9 @@ export function decodePathRows(engineStatus) {
   last({ key: "sampler", label: "Sampler", value: decode.sampler, detail: null });
   last({ key: "kv_cache", label: "KV cache", value: `${decode.kv_cache} · ${attentionLabel(decode.attention)}`, detail: null });
   if (decode.prefix_cache) last({ key: "prefix_cache", label: "Prefix cache", ...prefixCacheValue(decode) });
+  if (decode.prefix_checkpoints) {
+    last({ key: "prefix_checkpoints", label: "Prefix checkpoints", ...prefixCheckpointsValue(decode.prefix_checkpoints) });
+  }
   if (Array.isArray(decode.fallbacks)) {
     last({
       key: "fallbacks",

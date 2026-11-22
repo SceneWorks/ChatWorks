@@ -11,10 +11,11 @@ use std::time::{Duration, Instant};
 use crate::core_llm::{
     BackendCapabilities, CancelFlag, Channel, Constraint, Content, CudaGraphsReport, DecodeDraft,
     DecodeReport, DraftReport, FeatureSupport, FinishReason, GenerationTimings, ImageRef,
-    LoadReport, LoadSpec, Message, MtpStats, PathReport, ProjectionReport, ProposerCapabilities,
-    Quantize, ReasoningEffort, Role, Sampling, Speculative, StreamEvent, TextLlm,
-    TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest, ThinkingMode, ToolCall, ToolSpec,
-    Usage, VideoRef,
+    LoadReport, LoadSpec, Message, MtpStats, PathReport, PrefixCheckpointCapabilities,
+    PrefixCheckpointMode, PrefixCheckpointPolicy, PrefixCheckpointReport, PrefixDocumentSpan,
+    ProjectionReport, ProposerCapabilities, Quantize, ReasoningEffort, Role, Sampling, Speculative,
+    StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest, ThinkingMode,
+    ToolCall, ToolSpec, Usage, VideoRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -374,6 +375,7 @@ impl EngineActor {
                 crate::inference_runtime::backend_capabilities(),
             ),
             speculative_default: crate::inference_runtime::speculative_default(),
+            prefix_checkpoints_default: crate::inference_runtime::prefix_checkpoints_default(),
             cuda_graphs_default: crate::inference_runtime::cuda_graphs_default(),
             providers: crate::inference_runtime::textllms()
                 .map(|registration| ProviderSummary::from((registration.descriptor)()))
@@ -612,6 +614,14 @@ pub struct GenerateRequest {
     /// "draft_tokens": N}`) still deserializes into it; sending both is refused.
     #[serde(default, alias = "mtp", skip_serializing_if = "Option::is_none")]
     pub speculative: Option<Speculative>,
+    /// Exact multi-boundary prefix-checkpoint policy (feature SW-F356). `None` defers to the
+    /// runtime's default (`DecodeDefaults::prefix_checkpoints`).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_prefix_checkpoints",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub prefix_checkpoints: Option<PrefixCheckpointPolicy>,
     #[serde(default)]
     pub constraint: Option<ConstraintRequest>,
     /// Tools / functions offered to the model. Rendered into the prompt by the chat template and used
@@ -646,6 +656,7 @@ impl GenerateRequest {
             reasoning_effort: self.reasoning_effort.map(ReasoningEffortRequest::into_core),
             preserve_thinking: self.preserve_thinking,
             speculative: self.speculative,
+            prefix_checkpoints: self.prefix_checkpoints,
             tools: self
                 .tools
                 .into_iter()
@@ -655,6 +666,140 @@ impl GenerateRequest {
             cancel,
             ..TextLlmRequest::default()
         })
+    }
+}
+
+pub(crate) fn deserialize_optional_prefix_checkpoints<'de, D>(
+    deserializer: D,
+) -> Result<Option<PrefixCheckpointPolicy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    value
+        .map(|v| parse_prefix_checkpoint_policy(&v))
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
+pub(crate) fn parse_prefix_checkpoint_policy(
+    value: &Value,
+) -> Result<PrefixCheckpointPolicy, String> {
+    const EXPECTED: &str = "expected \"off\", \"auto\", or {\"mode\": \"off\" | \"auto\", \
+                            \"document\": {\"messages\": {\"count\": N}} | \
+                            {\"message_chars\": {\"message\": I, \"chars\": N}} | \
+                            {\"tokens\": N | {\"count\": N}}}";
+    let parse_mode = |v: &Value| -> Result<PrefixCheckpointMode, String> {
+        match v.as_str() {
+            Some("off") => Ok(PrefixCheckpointMode::Off),
+            Some("auto") => Ok(PrefixCheckpointMode::Auto),
+            Some(other) => Err(format!(
+                "unknown prefix_checkpoints mode `{other}`; {EXPECTED}"
+            )),
+            None => Err(format!(
+                "prefix_checkpoints `mode` must be \"off\" or \"auto\"; {EXPECTED}"
+            )),
+        }
+    };
+    let parse_usize = |v: &Value, label: &str| -> Result<usize, String> {
+        v.as_u64()
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| format!("prefix_checkpoints `{label}` must be an unsigned integer"))
+    };
+    let only_keys =
+        |map: &Map<String, Value>, allowed: &[&str], context: &str| -> Result<(), String> {
+            if let Some(extra) = map.keys().find(|k| !allowed.contains(&k.as_str())) {
+                return Err(format!(
+                    "unexpected field `{extra}` in {context}; {EXPECTED}"
+                ));
+            }
+            Ok(())
+        };
+    let parse_document = |v: &Value| -> Result<PrefixDocumentSpan, String> {
+        let map = v.as_object().ok_or_else(|| {
+            format!("prefix_checkpoints `document` must be an object; {EXPECTED}")
+        })?;
+        if map.len() != 1 {
+            return Err(format!(
+                "prefix_checkpoints `document` must specify exactly one of `messages`, \
+                 `message_chars`, or `tokens`; {EXPECTED}"
+            ));
+        }
+        if let Some(inner) = map.get("messages") {
+            let count = if let Some(obj) = inner.as_object() {
+                only_keys(obj, &["count"], "prefix_checkpoints.document.messages")?;
+                let count = obj.get("count").ok_or_else(|| {
+                    "prefix_checkpoints.document.messages `count` is missing".to_string()
+                })?;
+                parse_usize(count, "document.messages.count")?
+            } else {
+                parse_usize(inner, "document.messages")?
+            };
+            Ok(PrefixDocumentSpan::Messages { count })
+        } else if let Some(inner) = map.get("message_chars") {
+            let obj = inner.as_object().ok_or_else(|| {
+                "prefix_checkpoints.document.message_chars must be an object with `message` and `chars`"
+                    .to_string()
+            })?;
+            only_keys(
+                obj,
+                &["message", "chars"],
+                "prefix_checkpoints.document.message_chars",
+            )?;
+            let message = parse_usize(
+                obj.get("message").ok_or_else(|| {
+                    "prefix_checkpoints.document.message_chars `message` is missing".to_string()
+                })?,
+                "document.message_chars.message",
+            )?;
+            let chars = parse_usize(
+                obj.get("chars").ok_or_else(|| {
+                    "prefix_checkpoints.document.message_chars `chars` is missing".to_string()
+                })?,
+                "document.message_chars.chars",
+            )?;
+            Ok(PrefixDocumentSpan::MessageChars { message, chars })
+        } else if let Some(inner) = map.get("tokens") {
+            let count = if let Some(obj) = inner.as_object() {
+                only_keys(obj, &["count"], "prefix_checkpoints.document.tokens")?;
+                let count = obj.get("count").ok_or_else(|| {
+                    "prefix_checkpoints.document.tokens `count` is missing".to_string()
+                })?;
+                parse_usize(count, "document.tokens.count")?
+            } else {
+                parse_usize(inner, "document.tokens")?
+            };
+            Ok(PrefixDocumentSpan::Tokens { count })
+        } else {
+            let key = map.keys().next().map(String::as_str).unwrap_or("");
+            Err(format!(
+                "unknown prefix_checkpoints `document` variant `{key}`; {EXPECTED}"
+            ))
+        }
+    };
+
+    match value {
+        Value::String(s) => match s.as_str() {
+            "off" => Ok(PrefixCheckpointPolicy::off()),
+            "auto" => Ok(PrefixCheckpointPolicy::auto()),
+            other => Err(format!(
+                "unknown prefix_checkpoints mode `{other}`; {EXPECTED}"
+            )),
+        },
+        Value::Object(map) => {
+            only_keys(map, &["mode", "document"], "prefix_checkpoints")?;
+            let document = match map.get("document") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(parse_document(v)?),
+            };
+            let mode = match map.get("mode") {
+                Some(v) => parse_mode(v)?,
+                None if document.is_some() => PrefixCheckpointMode::Auto,
+                None => PrefixCheckpointMode::Off,
+            };
+            Ok(PrefixCheckpointPolicy { mode, document })
+        }
+        _ => Err(format!("invalid prefix_checkpoints option; {EXPECTED}")),
     }
 }
 
@@ -1672,6 +1817,9 @@ pub struct EngineStatus {
     /// The speculative option a request that names none runs under, as the linked runtime
     /// resolves it (epic sc-24432 E5, sc-24445) — what "Runtime default" means in the UI.
     pub speculative_default: Speculative,
+    /// The exact prefix-checkpoint mode a request that names none runs under, as the linked
+    /// runtime resolves it (`core_llm::DecodeBackend::defaults`, feature SW-F356).
+    pub prefix_checkpoints_default: PrefixCheckpointMode,
     /// Whether a load with no saved CUDA-graph choice captures graphs on this host — the
     /// runtime's per-backend default (sc-24446), what an unset CUDA-graph toggle shows.
     pub cuda_graphs_default: bool,
@@ -1921,6 +2069,8 @@ pub struct DecodeReportPayload {
     pub prefix_hit_tokens: u64,
     /// The prefix cache's part: `hit` | `miss` | `off` | `bypassed` | `none`, with the reason.
     pub prefix_cache: PathReportPayload,
+    /// Exact multi-boundary prefix-checkpoint accounting (feature SW-F356).
+    pub prefix_checkpoints: Option<PrefixCheckpointReportPayload>,
     /// The decoded token at which the runtime's acceptance monitor demoted an `auto` proposer to
     /// plain decoding (sc-24446), or `None` when nothing was demoted.
     pub speculative_demoted_at: Option<u64>,
@@ -1950,7 +2100,46 @@ impl From<DecodeReport> for DecodeReportPayload {
             replay_forwards: value.replay_forwards,
             prefix_hit_tokens: value.prefix_hit_tokens,
             prefix_cache: PathReportPayload::from(value.prefix_cache),
+            prefix_checkpoints: value
+                .prefix_checkpoints
+                .map(PrefixCheckpointReportPayload::from),
             speculative_demoted_at: value.speculative_demoted_at,
+            fallbacks: value.fallbacks,
+        }
+    }
+}
+
+/// Exact multi-boundary prefix-checkpoint accounting (feature SW-F356).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct PrefixCheckpointReportPayload {
+    pub policy: String,
+    pub reused_tokens: u64,
+    pub reread_tokens: u64,
+    pub matched_kind: Option<String>,
+    pub checkpoints_captured: u32,
+    pub captured_bytes: u64,
+    pub restore_ms: f64,
+    pub capture_ms: f64,
+    pub resident_bytes: u64,
+    pub protected_bytes: u64,
+    pub evicted_entries: u32,
+    pub fallbacks: Vec<String>,
+}
+
+impl From<PrefixCheckpointReport> for PrefixCheckpointReportPayload {
+    fn from(value: PrefixCheckpointReport) -> Self {
+        Self {
+            policy: value.policy,
+            reused_tokens: value.reused_tokens,
+            reread_tokens: value.reread_tokens,
+            matched_kind: value.matched_kind,
+            checkpoints_captured: value.checkpoints_captured,
+            captured_bytes: value.captured_bytes,
+            restore_ms: value.restore_time.as_secs_f64() * 1000.0,
+            capture_ms: value.capture_time.as_secs_f64() * 1000.0,
+            resident_bytes: value.resident_bytes,
+            protected_bytes: value.protected_bytes,
+            evicted_entries: value.evicted_entries,
             fallbacks: value.fallbacks,
         }
     }
@@ -2014,7 +2203,26 @@ pub struct CapabilitySummary {
     /// The speculative proposers this model runs and their per-proposer depth limits (the legacy
     /// MTP advertisement included), as the runtime advertises them.
     pub speculative: Vec<ProposerCapabilities>,
+    /// Exact multi-boundary prefix-checkpoint capabilities, when the provider advertises them.
+    pub prefix_checkpoints: Option<PrefixCheckpointCapabilitiesPayload>,
     pub supported_constraints: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct PrefixCheckpointCapabilitiesPayload {
+    pub max_checkpoints_per_request: u32,
+    pub supports_document_span: bool,
+    pub supports_hybrid_boundaries: bool,
+}
+
+impl From<PrefixCheckpointCapabilities> for PrefixCheckpointCapabilitiesPayload {
+    fn from(value: PrefixCheckpointCapabilities) -> Self {
+        Self {
+            max_checkpoints_per_request: value.max_checkpoints_per_request,
+            supports_document_span: value.supports_document_span,
+            supports_hybrid_boundaries: value.supports_hybrid_boundaries,
+        }
+    }
 }
 
 impl From<TextLlmCapabilities> for CapabilitySummary {
@@ -2039,6 +2247,9 @@ impl From<TextLlmCapabilities> for CapabilitySummary {
             supports_preserve_thinking: value.supports_preserve_thinking,
             supports_tools: value.supports_tools,
             speculative,
+            prefix_checkpoints: value
+                .prefix_checkpoints
+                .map(PrefixCheckpointCapabilitiesPayload::from),
             supported_constraints: value
                 .supported_constraints
                 .into_iter()
@@ -2272,6 +2483,7 @@ mod tests {
                     reasoning_effort: None,
                     preserve_thinking: None,
                     speculative: None,
+                    prefix_checkpoints: None,
                     constraint: None,
                     tools: Vec::new(),
                 },
@@ -2457,6 +2669,7 @@ mod tests {
                 reasoning_effort: None,
                 preserve_thinking: None,
                 speculative: None,
+                prefix_checkpoints: None,
                 constraint: None,
                 tools: Vec::new(),
             },
@@ -2495,6 +2708,7 @@ mod tests {
             reasoning_effort: None,
             preserve_thinking: None,
             speculative: None,
+            prefix_checkpoints: None,
             constraint: None,
             tools: Vec::new(),
         };
@@ -2733,6 +2947,7 @@ mod tests {
             reasoning_effort: None,
             preserve_thinking: None,
             speculative: Some(Speculative::Auto),
+            prefix_checkpoints: None,
             constraint: None,
             tools: Vec::new(),
         }
@@ -3151,6 +3366,7 @@ mod tests {
                 cuda_graphs: FeatureSupport::available(),
             }),
             speculative_default: Speculative::Off,
+            prefix_checkpoints_default: PrefixCheckpointMode::Off,
             cuda_graphs_default: true,
             providers: Vec::new(),
         };
@@ -3161,6 +3377,7 @@ mod tests {
             "execution_backend": wire["execution_backend"],
             "backend_capabilities": wire["backend_capabilities"],
             "speculative_default": wire["speculative_default"],
+            "prefix_checkpoints_default": wire["prefix_checkpoints_default"],
             "cuda_graphs_default": wire["cuda_graphs_default"],
             "loaded": {
                 "source": loaded["source"],
@@ -3254,6 +3471,7 @@ mod tests {
                     reasoning_effort: None,
                     preserve_thinking: None,
                     speculative: None,
+                    prefix_checkpoints: None,
                     constraint: None,
                     tools: Vec::new(),
                 },
@@ -3262,6 +3480,131 @@ mod tests {
             .unwrap();
         // Generation finished: the flag is cleared, so cancel is again a no-op.
         assert!(!engine.cancel());
+    }
+
+    #[test]
+    fn prefix_checkpoints_policy_parses_wire_variants_and_surfaces_telemetry() {
+        use crate::core_llm::{PrefixCheckpointPolicy, PrefixDocumentSpan};
+
+        let parse = |value: Value| -> GenerateRequest {
+            serde_json::from_value(serde_json::json!({
+                "messages": [{"role": "user", "content": "hello"}],
+                "prefix_checkpoints": value
+            }))
+            .expect("valid request")
+        };
+
+        assert_eq!(
+            parse(serde_json::json!("off")).prefix_checkpoints,
+            Some(PrefixCheckpointPolicy::off())
+        );
+        assert_eq!(
+            parse(serde_json::json!("auto")).prefix_checkpoints,
+            Some(PrefixCheckpointPolicy::auto())
+        );
+        assert_eq!(
+            parse(serde_json::json!({"mode": "auto", "document": {"messages": {"count": 2}}}))
+                .prefix_checkpoints,
+            Some(PrefixCheckpointPolicy::with_document(
+                PrefixDocumentSpan::Messages { count: 2 }
+            ))
+        );
+        assert_eq!(
+            parse(serde_json::json!({"document": {"messages": 3}})).prefix_checkpoints,
+            Some(PrefixCheckpointPolicy::with_document(
+                PrefixDocumentSpan::Messages { count: 3 }
+            ))
+        );
+        assert_eq!(
+            parse(serde_json::json!({"document": {"message_chars": {"message": 1, "chars": 12}}}))
+                .prefix_checkpoints,
+            Some(PrefixCheckpointPolicy::with_document(
+                PrefixDocumentSpan::MessageChars {
+                    message: 1,
+                    chars: 12
+                }
+            ))
+        );
+        assert_eq!(
+            parse(serde_json::json!({"mode": "off", "document": {"tokens": 16}}))
+                .prefix_checkpoints,
+            Some(PrefixCheckpointPolicy {
+                mode: PrefixCheckpointMode::Off,
+                document: Some(PrefixDocumentSpan::Tokens { count: 16 }),
+            })
+        );
+        assert_eq!(
+            parse(serde_json::json!({"document": {"tokens": {"count": 24}}})).prefix_checkpoints,
+            Some(PrefixCheckpointPolicy::with_document(
+                PrefixDocumentSpan::Tokens { count: 24 }
+            ))
+        );
+
+        for invalid in [
+            serde_json::json!("enabled"),
+            serde_json::json!(123),
+            serde_json::json!({"mode": "auto", "unexpected": true}),
+            serde_json::json!({"document": {}}),
+            serde_json::json!({"document": {"messages": {"count": 1, "extra": 2}}}),
+            serde_json::json!({"document": {"unknown": 1}}),
+        ] {
+            assert!(
+                parse_prefix_checkpoint_policy(&invalid).is_err(),
+                "expected invalid prefix_checkpoints error for {invalid}"
+            );
+        }
+
+        // `GenerateRequest::into_core` threads `prefix_checkpoints` through intact.
+        let req = parse(serde_json::json!({"mode": "auto", "document": {"tokens": 8}}));
+        let core_req = req.into_core(CancelFlag::new()).unwrap();
+        assert_eq!(
+            core_req.prefix_checkpoints,
+            Some(PrefixCheckpointPolicy::with_document(
+                PrefixDocumentSpan::Tokens { count: 8 }
+            ))
+        );
+
+        // CapabilitySummary, EngineStatus default, and DecodeReportPayload telemetry surface cleanly.
+        let engine = EngineHandle::spawn_with_loader(crate::test_support::recording_loader);
+        let status = engine
+            .load_model(LoadModelRequest {
+                source: "/tmp/sw-7236-telemetry".to_string(),
+                display_name: None,
+                quantize: None,
+                projector_source: None,
+                cuda_graphs: None,
+                draft_source: None,
+                prefix_cache_bytes: None,
+                mtp_head_source: None,
+                draft_quantize: None,
+            })
+            .unwrap();
+        assert_eq!(
+            status.prefix_checkpoints_default,
+            crate::inference_runtime::prefix_checkpoints_default()
+        );
+        let caps = status
+            .loaded
+            .unwrap()
+            .provider
+            .capabilities
+            .prefix_checkpoints
+            .expect("telemetry provider advertises prefix_checkpoints");
+        assert!(caps.supports_document_span);
+        assert!(caps.max_checkpoints_per_request >= 1);
+
+        let output = engine.generate(hello_request(), |_| {}).unwrap();
+        let pc = output
+            .decode
+            .expect("decode report")
+            .prefix_checkpoints
+            .expect("prefix checkpoint report");
+        assert_eq!(pc.policy, "auto");
+        assert_eq!(pc.reread_tokens, 2);
+        assert_eq!(pc.checkpoints_captured, 1);
+        assert_eq!(pc.captured_bytes, 2048);
+        assert!((pc.restore_ms - 0.25).abs() < 1e-6);
+        assert!((pc.capture_ms - 0.5).abs() < 1e-6);
     }
 }
 

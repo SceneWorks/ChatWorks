@@ -16,7 +16,9 @@ use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::app_settings::SamplingDefaults;
-use crate::core_llm::{CancelFlag, Speculative};
+use crate::core_llm::{
+    CancelFlag, PrefixCheckpointMode, PrefixCheckpointPolicy, PrefixDocumentSpan, Speculative,
+};
 use crate::engine::{
     ConstraintRequest, EngineHandle, GenerateMedia, GenerateMessage, GenerateRequest,
     GenerateResponse, GenerateTool, GenerateToolCall, GenerateVideo, LoadedModelStatus,
@@ -757,6 +759,14 @@ struct OpenAiChatRequest {
     /// `mtp` request field (`{"mode": …}`) still deserializes into it (sc-24445).
     #[serde(default, alias = "mtp")]
     speculative: Option<Speculative>,
+    /// Exact multi-boundary prefix-checkpoint policy (feature SW-F356): `"off"`, `"auto"`, or
+    /// `{"mode": "off" | "auto", "document": {"messages": {"count": N}} |
+    /// {"message_chars": {"message": I, "chars": N}} | {"tokens": N | {"count": N}}}`.
+    #[serde(
+        default,
+        deserialize_with = "crate::engine::deserialize_optional_prefix_checkpoints"
+    )]
+    prefix_checkpoints: Option<PrefixCheckpointPolicy>,
     #[serde(default)]
     response_format: Option<OpenAiResponseFormat>,
     /// Tools / functions offered to the model, in the OpenAI function-tool shape
@@ -775,6 +785,8 @@ enum ModelDefaultControl {
     /// pre-sc-24445 spelling).
     #[serde(alias = "mtp")]
     Speculative,
+    /// Run the runtime's prefix-checkpoint default instead of the saved setting.
+    PrefixCheckpoints,
 }
 
 impl OpenAiChatRequest {
@@ -815,6 +827,13 @@ impl OpenAiChatRequest {
             if !caps.speculative.iter().any(|cap| cap.proposer == proposer) {
                 resolved.speculative = Some(Speculative::Off);
             }
+        }
+        if caps.prefix_checkpoints.is_none()
+            || self
+                .model_defaults
+                .contains(&ModelDefaultControl::PrefixCheckpoints)
+        {
+            resolved.prefix_checkpoints = None;
         }
         resolved
     }
@@ -865,8 +884,9 @@ impl OpenAiChatRequest {
             .messages
             .iter()
             .any(|message| matches!(message.role.as_str(), "system" | "developer"));
+        let prepended_system = !has_system && !defaults.system_prompt.trim().is_empty();
         let mut messages = Vec::new();
-        if !has_system && !defaults.system_prompt.trim().is_empty() {
+        if prepended_system {
             messages.push(GenerateMessage {
                 role: "system".to_string(),
                 content: defaults.system_prompt.clone(),
@@ -942,10 +962,47 @@ impl OpenAiChatRequest {
                     defaults.speculative
                 },
             ),
+            prefix_checkpoints: resolve_request_prefix_checkpoints(
+                self.prefix_checkpoints,
+                defaults.prefix_checkpoints,
+                self.model_defaults
+                    .contains(&ModelDefaultControl::PrefixCheckpoints),
+                prepended_system,
+            ),
             constraint: response_format_constraint(self.response_format)?,
             tools,
         })
     }
+}
+
+fn resolve_request_prefix_checkpoints(
+    explicit: Option<PrefixCheckpointPolicy>,
+    inherited: Option<PrefixCheckpointMode>,
+    use_model_default: bool,
+    prepended_system: bool,
+) -> Option<PrefixCheckpointPolicy> {
+    let mut policy = match explicit {
+        Some(policy) => policy,
+        None if use_model_default => return None,
+        None => PrefixCheckpointPolicy {
+            mode: inherited?,
+            document: None,
+        },
+    };
+    if prepended_system {
+        if let Some(span) = &mut policy.document {
+            match span {
+                PrefixDocumentSpan::Messages { count } if *count > 0 => {
+                    *count = count.saturating_add(1);
+                }
+                PrefixDocumentSpan::MessageChars { message, .. } => {
+                    *message = message.saturating_add(1);
+                }
+                PrefixDocumentSpan::Messages { .. } | PrefixDocumentSpan::Tokens { .. } => {}
+            }
+        }
+    }
+    Some(policy)
 }
 
 fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffortRequest> {
@@ -3151,6 +3208,375 @@ mod tests {
         assert!(
             message.contains("tool"),
             "expected a tool-support error, got: {message}"
+        );
+        server.stop().unwrap();
+    }
+
+    #[test]
+    fn prefix_checkpoints_api_contract_capability_gating_and_system_prompt_index_shift() {
+        use crate::core_llm::{PrefixCheckpointMode, PrefixCheckpointPolicy, PrefixDocumentSpan};
+
+        let mut defaults = SamplingDefaults {
+            system_prompt: "You are concise.".to_string(),
+            prefix_checkpoints: Some(PrefixCheckpointMode::Auto),
+            ..test_sampling_defaults()
+        };
+
+        // Capability gating: unsupported models clear inherited `prefix_checkpoints` rather than failing.
+        let unsupported_caps =
+            crate::engine::CapabilitySummary::from(crate::core_llm::TextLlmCapabilities::default());
+        let req_inherited: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let resolved_unsupported =
+            req_inherited.resolve_inherited_defaults(&defaults, &unsupported_caps);
+        assert_eq!(resolved_unsupported.prefix_checkpoints, None);
+
+        // Supported models keep saved defaults unless `model_defaults` asks to reset to runtime default.
+        let supported_llm_caps = crate::core_llm::TextLlmCapabilities {
+            prefix_checkpoints: Some(crate::core_llm::PrefixCheckpointCapabilities {
+                max_checkpoints_per_request: 4,
+                supports_document_span: true,
+                supports_hybrid_boundaries: true,
+            }),
+            ..Default::default()
+        };
+        let supported_caps = crate::engine::CapabilitySummary::from(supported_llm_caps);
+        assert_eq!(
+            req_inherited
+                .resolve_inherited_defaults(&defaults, &supported_caps)
+                .prefix_checkpoints,
+            Some(PrefixCheckpointMode::Auto)
+        );
+
+        let reset_req: OpenAiChatRequest = serde_json::from_value(json!({
+            "model_defaults": ["prefix_checkpoints"],
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let resolved_reset = reset_req.resolve_inherited_defaults(&defaults, &supported_caps);
+        assert_eq!(resolved_reset.prefix_checkpoints, None);
+        assert_eq!(
+            reset_req
+                .into_generate(&resolved_reset)
+                .unwrap()
+                .prefix_checkpoints,
+            None
+        );
+
+        // Saved `Off` sends `Some(PrefixCheckpointPolicy::off())`; explicit `"off"` overrides saved `Auto`.
+        defaults.prefix_checkpoints = Some(PrefixCheckpointMode::Off);
+        let inherit_off: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            inherit_off
+                .into_generate(&defaults)
+                .unwrap()
+                .prefix_checkpoints,
+            Some(PrefixCheckpointPolicy::off())
+        );
+
+        // Prepended system prompt shifts caller `Messages` (count > 0) and `MessageChars` by +1,
+        // leaves `Tokens` and `count == 0` untouched, and does not shift when a system msg exists.
+        let shift_msgs: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [
+                {"role": "user", "content": "Long doc"},
+                {"role": "user", "content": "Question"}
+            ],
+            "prefix_checkpoints": {
+                "mode": "auto",
+                "document": { "messages": { "count": 1 } }
+            }
+        }))
+        .unwrap();
+        let gen_msgs = shift_msgs.into_generate(&defaults).unwrap();
+        assert_eq!(gen_msgs.messages[0].role, "system");
+        assert_eq!(
+            gen_msgs.prefix_checkpoints,
+            Some(PrefixCheckpointPolicy::with_document(
+                PrefixDocumentSpan::Messages { count: 2 }
+            ))
+        );
+
+        let shift_chars: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [
+                {"role": "user", "content": "Long doc"},
+                {"role": "user", "content": "Question"}
+            ],
+            "prefix_checkpoints": {
+                "document": { "message_chars": { "message": 0, "chars": 4 } }
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            shift_chars
+                .into_generate(&defaults)
+                .unwrap()
+                .prefix_checkpoints,
+            Some(PrefixCheckpointPolicy::with_document(
+                PrefixDocumentSpan::MessageChars {
+                    message: 1,
+                    chars: 4
+                }
+            ))
+        );
+
+        let tokens_unchanged: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "Long doc"}],
+            "prefix_checkpoints": { "document": { "tokens": 12 } }
+        }))
+        .unwrap();
+        assert_eq!(
+            tokens_unchanged
+                .into_generate(&defaults)
+                .unwrap()
+                .prefix_checkpoints,
+            Some(PrefixCheckpointPolicy::with_document(
+                PrefixDocumentSpan::Tokens { count: 12 }
+            ))
+        );
+
+        let zero_count_unshifted: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [{"role": "user", "content": "Long doc"}],
+            "prefix_checkpoints": { "document": { "messages": { "count": 0 } } }
+        }))
+        .unwrap();
+        assert_eq!(
+            zero_count_unshifted
+                .into_generate(&defaults)
+                .unwrap()
+                .prefix_checkpoints,
+            Some(PrefixCheckpointPolicy::with_document(
+                PrefixDocumentSpan::Messages { count: 0 }
+            ))
+        );
+
+        let has_system: OpenAiChatRequest = serde_json::from_value(json!({
+            "messages": [
+                {"role": "system", "content": "Caller system"},
+                {"role": "user", "content": "Long doc"}
+            ],
+            "prefix_checkpoints": { "document": { "messages": { "count": 2 } } }
+        }))
+        .unwrap();
+        assert_eq!(
+            has_system
+                .into_generate(&defaults)
+                .unwrap()
+                .prefix_checkpoints,
+            Some(PrefixCheckpointPolicy::with_document(
+                PrefixDocumentSpan::Messages { count: 2 }
+            ))
+        );
+    }
+
+    #[test]
+    fn prefix_checkpoints_http_branch_repeated_document_off_and_telemetry() {
+        use crate::core_llm::{PrefixCheckpointPolicy, PrefixDocumentSpan};
+        use crate::test_support::{prefix_checkpoint_loader, recorded_checkpoint_requests};
+
+        const SOURCE: &str = "/tmp/sw-7236-http-checkpoints";
+        let engine = EngineHandle::spawn_with_loader(prefix_checkpoint_loader);
+        engine
+            .load_model(crate::engine::LoadModelRequest {
+                source: SOURCE.to_string(),
+                display_name: Some("fake-prefix-checkpoints".to_string()),
+                quantize: None,
+                projector_source: None,
+                cuda_graphs: None,
+                draft_source: None,
+                prefix_cache_bytes: None,
+                mtp_head_source: None,
+                draft_quantize: None,
+            })
+            .unwrap();
+
+        let server = OpenAiServerHandle::new();
+        let status = server
+            .start(
+                OpenAiServerConfig {
+                    port: 0,
+                    sampling_defaults: SamplingDefaults {
+                        system_prompt: "Server system prompt".to_string(),
+                        ..test_sampling_defaults()
+                    },
+                    ..Default::default()
+                },
+                engine,
+            )
+            .unwrap();
+        let addr = status.bound_addr.unwrap();
+        let post_ok = |payload: Value| -> Value {
+            let raw = http_post_json(&addr, "/v1/chat/completions", payload, None);
+            assert!(raw.starts_with("HTTP/1.1 200 OK"), "{raw}");
+            serde_json::from_str(response_body(&raw)).unwrap()
+        };
+
+        // 1. Multi-turn conversation + branch under `auto` reuses `message_boundary`.
+        let r1 = post_ok(json!({
+            "model": "fake-prefix-checkpoints",
+            "max_tokens": 8,
+            "prefix_checkpoints": "auto",
+            "messages": [
+                {"role": "user", "content": "Initial doc text here"},
+                {"role": "assistant", "content": "Understood."},
+                {"role": "user", "content": "First question?"}
+            ]
+        }));
+        assert_eq!(
+            r1["chatworks_decode"]["prefix_checkpoints"]["policy"],
+            "auto"
+        );
+        assert_eq!(
+            r1["chatworks_decode"]["prefix_checkpoints"]["reused_tokens"],
+            0
+        );
+        assert!(
+            r1["chatworks_decode"]["prefix_checkpoints"]["protected_bytes"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+
+        let r2_branch = post_ok(json!({
+            "model": "fake-prefix-checkpoints",
+            "max_tokens": 8,
+            "prefix_checkpoints": "auto",
+            "messages": [
+                {"role": "user", "content": "Initial doc text here"},
+                {"role": "assistant", "content": "Understood."},
+                {"role": "user", "content": "Branched alternate question?"}
+            ]
+        }));
+        assert_eq!(
+            r2_branch["chatworks_decode"]["prefix_checkpoints"]["matched_kind"],
+            "message_boundary"
+        );
+        assert!(
+            r2_branch["chatworks_decode"]["prefix_checkpoints"]["reused_tokens"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+        assert!(
+            r2_branch["chatworks_decode"]["prefix_checkpoints"]["reread_tokens"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+
+        // 2. Pinned document span + repeated question across branches (`messages.count = 1` shifted
+        // to `2` because `system_prompt` is prepended).
+        let _r3_doc = post_ok(json!({
+            "model": "fake-prefix-checkpoints",
+            "max_tokens": 8,
+            "prefix_checkpoints": {"mode": "auto", "document": {"messages": {"count": 1}}},
+            "messages": [
+                {"role": "user", "content": "Reusable contract appendix alpha beta"},
+                {"role": "assistant", "content": "Ready."},
+                {"role": "user", "content": "What is section 1?"}
+            ]
+        }));
+
+        let r4_repeat = post_ok(json!({
+            "model": "fake-prefix-checkpoints",
+            "max_tokens": 8,
+            "prefix_checkpoints": {"mode": "auto", "document": {"messages": {"count": 1}}},
+            "messages": [
+                {"role": "user", "content": "Reusable contract appendix alpha beta"},
+                {"role": "user", "content": "What is section 2?"}
+            ]
+        }));
+        assert_eq!(
+            r4_repeat["chatworks_decode"]["prefix_checkpoints"]["matched_kind"],
+            "document"
+        );
+        assert!(
+            r4_repeat["chatworks_decode"]["prefix_checkpoints"]["reused_tokens"]
+                .as_u64()
+                .unwrap()
+                > 0
+        );
+
+        // 3. Streaming terminal SSE chunk also carries `chatworks_decode.prefix_checkpoints`.
+        let sse = http_post_json(
+            &addr,
+            "/v1/chat/completions",
+            json!({
+                "model": "fake-prefix-checkpoints",
+                "max_tokens": 8,
+                "stream": true,
+                "prefix_checkpoints": {"mode": "auto", "document": {"messages": {"count": 1}}},
+                "messages": [
+                    {"role": "user", "content": "Reusable contract appendix alpha beta"},
+                    {"role": "user", "content": "What is section 3?"}
+                ]
+            }),
+            None,
+        );
+        let last_data = sse
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .rfind(|d| *d != "[DONE]")
+            .expect("terminal SSE JSON");
+        let chunk: Value = serde_json::from_str(last_data).unwrap();
+        assert_eq!(
+            chunk["chatworks_decode"]["prefix_checkpoints"]["matched_kind"],
+            "document"
+        );
+        assert!(
+            chunk["chatworks_decode"]["prefix_checkpoints"]["restore_ms"]
+                .as_f64()
+                .unwrap()
+                > 0.0
+        );
+
+        // 4. `prefix_checkpoints: "off"` preserves ordinary exact-prefix behavior (no boundary reuse on branch).
+        let _off_first = post_ok(json!({
+            "model": "fake-prefix-checkpoints",
+            "max_tokens": 8,
+            "prefix_checkpoints": "off",
+            "messages": [
+                {"role": "system", "content": "Isolated off system"},
+                {"role": "user", "content": "Isolated off doc"},
+                {"role": "assistant", "content": "Acknowledged."},
+                {"role": "user", "content": "Off turn one"}
+            ]
+        }));
+        let off_branch = post_ok(json!({
+            "model": "fake-prefix-checkpoints",
+            "max_tokens": 8,
+            "prefix_checkpoints": "off",
+            "messages": [
+                {"role": "system", "content": "Isolated off system"},
+                {"role": "user", "content": "Isolated off doc"},
+                {"role": "assistant", "content": "Acknowledged."},
+                {"role": "user", "content": "Off branched turn"}
+            ]
+        }));
+        assert_eq!(
+            off_branch["chatworks_decode"]["prefix_checkpoints"]["policy"],
+            "off"
+        );
+        assert_eq!(
+            off_branch["chatworks_decode"]["prefix_checkpoints"]["reused_tokens"],
+            0
+        );
+        assert_eq!(
+            off_branch["chatworks_decode"]["prefix_checkpoints"]["matched_kind"],
+            Value::Null
+        );
+
+        let recorded = recorded_checkpoint_requests().lock().unwrap();
+        let seen = &recorded[SOURCE];
+        assert_eq!(
+            seen[2].prefix_checkpoints,
+            Some(PrefixCheckpointPolicy::with_document(
+                PrefixDocumentSpan::Messages { count: 2 }
+            ))
         );
         server.stop().unwrap();
     }
