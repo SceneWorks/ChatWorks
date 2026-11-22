@@ -71,6 +71,40 @@
         "fallbacks": []
       },
       "speculative_demoted_at": null,
+      "speculative_monitor": null,
+      "adaptive_speculative": {
+        "adaptive": true,
+        "candidates": ["mtp", "prompt_lookup", "none"],
+        "initial_proposer": "mtp",
+        "initial_depth": 2,
+        "final_proposer": "mtp",
+        "final_depth": 2,
+        "depth_changes": 0,
+        "proposer_switches": 0,
+        "events": [
+          {
+            "token_offset": 0,
+            "verify_step": 0,
+            "kind": "selected",
+            "from_proposer": "mtp",
+            "from_depth": 2,
+            "to_proposer": "mtp",
+            "to_depth": 2,
+            "reason": "auto selected `mtp` at depth 2"
+          }
+        ],
+        "plain_reason": null,
+        "cost": {
+          "proposal_ms": 1.5,
+          "verify_ms": 6.0,
+          "rollback_ms": 0.0,
+          "sync_ms": 0.5,
+          "total_ms": 8.0,
+          "ms_per_committed_token": 2.0,
+          "host_syncs": 2,
+          "committed_tokens": 4
+        }
+      },
       "fallbacks": []
     },
     "decode_reported": true

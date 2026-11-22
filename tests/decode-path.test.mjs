@@ -305,6 +305,10 @@ test("the Rust wire shape renders: the view reads tests/engine-status-wire.json 
   assert.equal(rows.implementation.value, "mtp");
   assert.equal(rows.proposer.value, "mtp · 2 drafts");
   assert.equal(rows.proposer.detail, "Accepted 3 of 4 drafts in 3 forwards");
+  assert.equal(rows.speculative_decision.label, "Speculative decision");
+  assert.equal(rows.speculative_decision.value, "auto (adaptive) · mtp · 2 drafts (steady)");
+  assert.match(rows.speculative_decision.detail, /Candidates: mtp, prompt_lookup, none/);
+  assert.match(rows.speculative_decision.detail, /Cost: 8\.00 ms total \(2\.00 ms\/tok/);
   assert.equal(rows.accepted_length.value, "1.50 drafts per verify step");
   assert.equal(rows.prefix_cache.value, "miss");
   assert.equal(rows.prefix_cache.detail, "2 recomputed");
@@ -722,4 +726,286 @@ test("SW-7236 AC3: prefix checkpoint diagnostics expose reuse, recomputed tokens
   ]) {
     assert.ok(html.includes(text), `missing ${text} in ${html}`);
   }
+});
+
+test("SW-7238 AC2: adaptive depth changes, mid-generation proposer switches, and cost breakdown render clearly", () => {
+  const switchedStatus = status(MLX, {
+    quantize: null,
+    cuda_graphs: null,
+    last_decode: {
+      ...MLX_DECODE,
+      path: "prompt_lookup",
+      proposer: "prompt_lookup",
+      draft_tokens: 4,
+      proposed_tokens: 36,
+      accepted_tokens: 24,
+      target_forwards: 11,
+      verify_steps: 10,
+      mean_accepted_length: 2.4,
+      speculative_demoted_at: null,
+      speculative_monitor: {
+        window: 1,
+        verifies: 10,
+        accepted: 24,
+        observed_mean_accepted: 2.4,
+        timed_steps: 8,
+        timed_tokens: 32,
+        timed_ms: 64.0,
+        plain_step_ms: 4.0,
+        speculative_step_ms: 8.0,
+        verify_cost_ratio: 2.0,
+        measured_gain: 2.0,
+        basis: "measured",
+        demoted: false,
+      },
+      adaptive_speculative: {
+        adaptive: true,
+        candidates: ["mtp", "prompt_lookup", "none"],
+        initial_proposer: "mtp",
+        initial_depth: 3,
+        final_proposer: "prompt_lookup",
+        final_depth: 4,
+        depth_changes: 1,
+        proposer_switches: 1,
+        events: [
+          {
+            token_offset: 0,
+            verify_step: 0,
+            kind: "selected",
+            from_proposer: "mtp",
+            from_depth: 3,
+            to_proposer: "mtp",
+            to_depth: 3,
+            reason: "auto selected `mtp` at depth 3",
+          },
+          {
+            token_offset: 16,
+            verify_step: 5,
+            kind: "depth_increased",
+            from_proposer: "mtp",
+            from_depth: 3,
+            to_proposer: "mtp",
+            to_depth: 4,
+            reason: "acceptance 0.85 >= 0.75",
+          },
+          {
+            token_offset: 32,
+            verify_step: 9,
+            kind: "proposer_switched",
+            from_proposer: "mtp",
+            from_depth: 4,
+            to_proposer: "prompt_lookup",
+            to_depth: 4,
+            reason: "probe `prompt_lookup` beat incumbent by 22%",
+          },
+        ],
+        plain_reason: null,
+        cost: {
+          proposal_ms: 4.0,
+          verify_ms: 52.0,
+          rollback_ms: 2.0,
+          sync_ms: 6.0,
+          total_ms: 64.0,
+          ms_per_committed_token: 1.88,
+          host_syncs: 10,
+          committed_tokens: 34,
+        },
+      },
+    },
+  });
+  const rows = Object.fromEntries(decodePathRows(switchedStatus).map((row) => [row.key, row]));
+  assert.equal(rows.proposer.value, "mtp · 3 drafts → prompt_lookup · 4 drafts");
+  assert.equal(
+    rows.proposer.detail,
+    "Accepted 24 of 36 drafts in 11 forwards · 1 depth change · 1 proposer switch",
+  );
+  assert.equal(rows.speculative_decision.section, LAST_GENERATION);
+  assert.equal(
+    rows.speculative_decision.value,
+    "auto (adaptive) · mtp · 3 drafts → prompt_lookup · 4 drafts (1 depth change, 1 proposer switch)",
+  );
+  assert.match(rows.speculative_decision.detail, /Candidates: mtp, prompt_lookup, none/);
+  assert.match(rows.speculative_decision.detail, /t=16: depth 3→4 \(acceptance 0\.85 >= 0\.75\)/);
+  assert.match(
+    rows.speculative_decision.detail,
+    /t=32: switch mtp · 4 drafts→prompt_lookup · 4 drafts \(probe `prompt_lookup` beat incumbent by 22%\)/,
+  );
+  assert.match(rows.speculative_decision.detail, /Cost: 64\.0 ms total/);
+  assert.match(rows.speculative_decision.detail, /Monitor: window 1 \(measured\) · gain 2\.00×/);
+
+  const html = ReactDOMServer.renderToStaticMarkup(React.createElement(DecodePathStatus, { engineStatus: switchedStatus }));
+  for (const text of [
+    'data-row="speculative_decision"',
+    "Speculative decision",
+    "mtp · 3 drafts → prompt_lookup · 4 drafts",
+    "t=16: depth 3→4",
+  ]) {
+    assert.ok(html.includes(text), `missing ${text} in ${html}`);
+  }
+});
+
+test("SW-7238 AC2: Auto staying plain or falling back always surfaces the reason on proposer and decision rows", () => {
+  const stayedPlainReason =
+    "speculative: auto found no proposer this model can run (it advertises none; decoded without a proposer)";
+  const stayedPlain = status(MLX, {
+    quantize: null,
+    cuda_graphs: null,
+    last_decode: {
+      ...MLX_DECODE,
+      path: "reference",
+      proposer: "none",
+      draft_tokens: null,
+      proposed_tokens: 0,
+      accepted_tokens: 0,
+      mean_accepted_length: null,
+      fallbacks: [stayedPlainReason],
+      adaptive_speculative: {
+        adaptive: true,
+        candidates: ["none"],
+        initial_proposer: "none",
+        initial_depth: 0,
+        final_proposer: "none",
+        final_depth: 0,
+        depth_changes: 0,
+        proposer_switches: 0,
+        events: [
+          {
+            token_offset: 0,
+            verify_step: 0,
+            kind: "stayed_plain",
+            from_proposer: "none",
+            from_depth: 0,
+            to_proposer: "none",
+            to_depth: 0,
+            reason: stayedPlainReason,
+          },
+        ],
+        plain_reason: stayedPlainReason,
+        cost: null,
+      },
+    },
+  });
+  const plainRows = Object.fromEntries(decodePathRows(stayedPlain).map((row) => [row.key, row]));
+  assert.equal(plainRows.proposer.value, "none (token-at-a-time)");
+  assert.equal(plainRows.proposer.detail, stayedPlainReason);
+  assert.equal(plainRows.speculative_decision.value, "auto (adaptive) · stayed plain");
+  assert.match(plainRows.speculative_decision.detail, /Reason: speculative: auto found no proposer/);
+
+  // Auto demoted / fell back to plain mid-generation.
+  const fellBack = status(MLX, {
+    quantize: null,
+    cuda_graphs: null,
+    last_decode: {
+      ...MLX_DECODE,
+      proposer: "prompt_lookup",
+      draft_tokens: 4,
+      proposed_tokens: 16,
+      accepted_tokens: 1,
+      target_forwards: 9,
+      verify_steps: 8,
+      mean_accepted_length: 0.125,
+      speculative_demoted_at: 24,
+      speculative_monitor: {
+        window: 1,
+        verifies: 8,
+        accepted: 1,
+        observed_mean_accepted: 0.125,
+        timed_steps: 8,
+        timed_tokens: 9,
+        timed_ms: 100.0,
+        plain_step_ms: 8.0,
+        speculative_step_ms: 12.5,
+        verify_cost_ratio: 1.5625,
+        measured_gain: 0.72,
+        basis: "measured",
+        demoted: true,
+      },
+      adaptive_speculative: {
+        adaptive: true,
+        candidates: ["prompt_lookup", "none"],
+        initial_proposer: "prompt_lookup",
+        initial_depth: 4,
+        final_proposer: "none",
+        final_depth: 0,
+        depth_changes: 0,
+        proposer_switches: 1,
+        events: [
+          {
+            token_offset: 0,
+            verify_step: 0,
+            kind: "selected",
+            from_proposer: "prompt_lookup",
+            from_depth: 4,
+            to_proposer: "prompt_lookup",
+            to_depth: 4,
+            reason: "auto selected `prompt_lookup` at depth 4",
+          },
+          {
+            token_offset: 24,
+            verify_step: 8,
+            kind: "fallback_to_plain",
+            from_proposer: "prompt_lookup",
+            from_depth: 4,
+            to_proposer: "none",
+            to_depth: 0,
+            reason: "measured gain 0.72 below break-even",
+          },
+        ],
+        plain_reason: "measured gain 0.72 below break-even",
+        cost: null,
+      },
+    },
+  });
+  const fbRows = Object.fromEntries(decodePathRows(fellBack).map((row) => [row.key, row]));
+  assert.equal(fbRows.proposer.value, "prompt_lookup · 4 drafts → plain");
+  assert.match(fbRows.proposer.detail, /Demoted to plain decoding at token 24/);
+  assert.match(fbRows.proposer.detail, /measured gain 0\.72 below break-even/);
+  assert.equal(fbRows.speculative_decision.value, "auto (adaptive) · prompt_lookup · 4 drafts → plain (fell back)");
+  assert.match(fbRows.speculative_decision.detail, /Reason: measured gain 0\.72 below break-even/);
+  assert.match(fbRows.speculative_decision.detail, /t=24: fallback→plain/);
+  assert.match(fbRows.speculative_decision.detail, /Monitor: window 1 \(measured\) · gain 0\.72×/);
+
+  // Explicit off still names why it ran plain and marks the decision as explicit.
+  const explicitOff = status(MLX, {
+    quantize: null,
+    cuda_graphs: null,
+    last_decode: {
+      ...MLX_DECODE,
+      path: "reference",
+      proposer: "none",
+      draft_tokens: null,
+      proposed_tokens: 0,
+      accepted_tokens: 0,
+      mean_accepted_length: null,
+      adaptive_speculative: {
+        adaptive: false,
+        candidates: ["none"],
+        initial_proposer: "none",
+        initial_depth: 0,
+        final_proposer: "none",
+        final_depth: 0,
+        depth_changes: 0,
+        proposer_switches: 0,
+        events: [
+          {
+            token_offset: 0,
+            verify_step: 0,
+            kind: "stayed_plain",
+            from_proposer: "none",
+            from_depth: 0,
+            to_proposer: "none",
+            to_depth: 0,
+            reason: "explicitly decoded without a proposer",
+          },
+        ],
+        plain_reason: "speculative: off",
+        cost: null,
+      },
+    },
+  });
+  const offRows = Object.fromEntries(decodePathRows(explicitOff).map((row) => [row.key, row]));
+  assert.equal(offRows.proposer.value, "none (token-at-a-time)");
+  assert.equal(offRows.proposer.detail, "speculative: off");
+  assert.equal(offRows.speculative_decision.value, "explicit · plain");
+  assert.equal(offRows.speculative_decision.detail, "Reason: speculative: off");
 });

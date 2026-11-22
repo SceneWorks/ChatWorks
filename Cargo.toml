@@ -20,7 +20,7 @@ all = "warn"
 # CUDA build needs, and the runtime's vendored candle-core carries its own kernel and op changes. Every rev here equals the runtime-* pin in src-tauri/Cargo.toml (lockstep), so
 # Cargo.lock resolves one inference commit (scripts/check-git-deps.sh).
 [patch."https://github.com/huggingface/candle"]
-candle-core = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.11.1" }
-candle-nn = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.11.1" }
-candle-kernels = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.11.1" }
-candle-metal-kernels = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.11.1" }
+candle-core = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.11.2" }
+candle-nn = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.11.2" }
+candle-kernels = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.11.2" }
+candle-metal-kernels = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.11.2" }

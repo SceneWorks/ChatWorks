@@ -11,8 +11,7 @@ export const SPECULATIVE_PROPOSERS = [
   ["mtp", "MTP head"],
   ["prompt_lookup", "Prompt lookup"],
   ["draft_model", "Draft model"],
-  // A DSpine / DFlash2 block draft installed beside a Qwen3.8-27B model (SW-F360). `auto` never
-  // picks it; the user chooses it.
+  // A DSpine / DFlash2 block draft installed beside a compatible target model (SW-F360 / SW-F357).
   ["block_draft", "Block draft"],
 ];
 
@@ -64,10 +63,13 @@ export function speculativeOptions(capabilities, selected = "", defaults = false
   const inherited = defaults
     ? `Runtime default${runtimeDefault == null ? "" : ` (${describeSpeculative(runtimeDefault)})`}`
     : "App setting";
+  const autoLabel = !defaults && advertised.length
+    ? `Auto (adaptive: ${advertised.map(([, label]) => label).join(", ")})`
+    : "Auto (adaptive)";
   const options = [
     ["", inherited],
     ["off", "Off"],
-    ["auto", "Auto (MTP head, else prompt lookup)"],
+    ["auto", autoLabel],
     ...advertised,
   ];
   if (selected && !options.some(([value]) => value === selected)) {

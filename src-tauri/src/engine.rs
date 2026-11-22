@@ -9,9 +9,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::core_llm::{
-    BackendCapabilities, CancelFlag, Channel, Constraint, Content, CudaGraphsReport, DecodeDraft,
-    DecodeReport, DraftReport, FeatureSupport, FinishReason, GenerationTimings, ImageRef,
-    LoadReport, LoadSpec, Message, MtpStats, PathReport, PrefixCheckpointCapabilities,
+    AdaptiveCostSummary, AdaptiveSpeculativeEvent, AdaptiveSpeculativeReport, BackendCapabilities,
+    CancelFlag, Channel, Constraint, Content, CudaGraphsReport, DecodeDraft, DecodeReport,
+    DraftReport, FeatureSupport, FinishReason, GenerationTimings, ImageRef, LoadReport, LoadSpec,
+    Message, MonitorDecision, MtpStats, PathReport, PrefixCheckpointCapabilities,
     PrefixCheckpointMode, PrefixCheckpointPolicy, PrefixCheckpointReport, PrefixDocumentSpan,
     ProjectionReport, ProposerCapabilities, Quantize, ReasoningEffort, Role, Sampling, Speculative,
     StreamEvent, TextLlm, TextLlmCapabilities, TextLlmDescriptor, TextLlmRequest, ThinkingMode,
@@ -2074,6 +2075,12 @@ pub struct DecodeReportPayload {
     /// The decoded token at which the runtime's acceptance monitor demoted an `auto` proposer to
     /// plain decoding (sc-24446), or `None` when nothing was demoted.
     pub speculative_demoted_at: Option<u64>,
+    /// The last acceptance-monitor window decision (`auto` mode; sc-24446 / SW-F357), or `None`
+    /// when no monitor window closed.
+    pub speculative_monitor: Option<SpeculativeMonitorPayload>,
+    /// Adaptive speculative decoding decisions, transitions, and cost summary (feature SW-F357),
+    /// populated for both `auto` and explicit requests when reported by the runtime.
+    pub adaptive_speculative: Option<AdaptiveSpeculativeReportPayload>,
     /// Every fallback the request took that no field above names (`speculative: …`).
     pub fallbacks: Vec<String>,
 }
@@ -2104,7 +2111,156 @@ impl From<DecodeReport> for DecodeReportPayload {
                 .prefix_checkpoints
                 .map(PrefixCheckpointReportPayload::from),
             speculative_demoted_at: value.speculative_demoted_at,
+            speculative_monitor: value
+                .speculative_monitor
+                .map(SpeculativeMonitorPayload::from),
+            adaptive_speculative: value
+                .adaptive_speculative
+                .map(AdaptiveSpeculativeReportPayload::from),
             fallbacks: value.fallbacks,
+        }
+    }
+}
+
+/// The last acceptance-monitor window decision carried on `DecodeReport::speculative_monitor`
+/// (sc-24446 / feature SW-F357).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SpeculativeMonitorPayload {
+    pub window: u32,
+    pub verifies: u32,
+    pub accepted: u64,
+    pub observed_mean_accepted: f64,
+    pub timed_steps: u32,
+    pub timed_tokens: u64,
+    pub timed_ms: f64,
+    pub plain_step_ms: Option<f64>,
+    pub speculative_step_ms: Option<f64>,
+    pub verify_cost_ratio: Option<f64>,
+    pub measured_gain: Option<f64>,
+    /// `measured` | `static`.
+    pub basis: String,
+    pub demoted: bool,
+}
+
+impl From<MonitorDecision> for SpeculativeMonitorPayload {
+    fn from(value: MonitorDecision) -> Self {
+        let timed_ms = value.timed_ns as f64 / 1e6;
+        Self {
+            window: value.window,
+            verifies: value.verifies,
+            accepted: value.accepted,
+            observed_mean_accepted: value.mean_accepted_length(),
+            timed_steps: value.timed_steps,
+            timed_tokens: value.timed_tokens,
+            timed_ms,
+            plain_step_ms: value.plain_step_ns.map(|ns| ns as f64 / 1e6),
+            speculative_step_ms: (value.timed_steps > 0)
+                .then(|| timed_ms / f64::from(value.timed_steps)),
+            verify_cost_ratio: value.verify_cost_ratio(),
+            measured_gain: value.gain(),
+            basis: value.basis.label().to_string(),
+            demoted: value.demoted,
+        }
+    }
+}
+
+/// Aggregate step cost breakdown across measured decode steps (feature SW-F357).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AdaptiveCostSummaryPayload {
+    pub proposal_ms: f64,
+    pub verify_ms: f64,
+    pub rollback_ms: f64,
+    pub sync_ms: f64,
+    pub total_ms: f64,
+    pub ms_per_committed_token: Option<f64>,
+    pub host_syncs: u64,
+    pub committed_tokens: u64,
+}
+
+impl From<AdaptiveCostSummary> for AdaptiveCostSummaryPayload {
+    fn from(value: AdaptiveCostSummary) -> Self {
+        Self {
+            proposal_ms: value.proposal_ms(),
+            verify_ms: value.verify_ms(),
+            rollback_ms: value.rollback_ms(),
+            sync_ms: value.sync_ms(),
+            total_ms: value.total_ms(),
+            ms_per_committed_token: value.ms_per_committed_token(),
+            host_syncs: value.host_syncs,
+            committed_tokens: value.committed_tokens,
+        }
+    }
+}
+
+/// One measured adaptive decision during a generation request (feature SW-F357).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AdaptiveSpeculativeEventPayload {
+    pub token_offset: u64,
+    pub verify_step: u64,
+    /// `selected` | `stayed_plain` | `probe_started` | `proposer_switched` | `probe_reverted` |
+    /// `depth_increased` | `depth_decreased` | `fallback_to_plain`.
+    pub kind: String,
+    pub from_proposer: String,
+    pub from_depth: u32,
+    pub to_proposer: String,
+    pub to_depth: u32,
+    pub reason: String,
+}
+
+impl From<AdaptiveSpeculativeEvent> for AdaptiveSpeculativeEventPayload {
+    fn from(value: AdaptiveSpeculativeEvent) -> Self {
+        Self {
+            token_offset: value.token_offset,
+            verify_step: value.verify_step,
+            kind: value.kind.label().to_string(),
+            from_proposer: value.from_proposer.label().to_string(),
+            from_depth: value.from_depth,
+            to_proposer: value.to_proposer.label().to_string(),
+            to_depth: value.to_depth,
+            reason: value.reason,
+        }
+    }
+}
+
+/// Per-request adaptive speculative telemetry carried on `DecodeReport::adaptive_speculative`
+/// (feature SW-F357).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct AdaptiveSpeculativeReportPayload {
+    pub adaptive: bool,
+    pub candidates: Vec<String>,
+    pub initial_proposer: String,
+    pub initial_depth: u32,
+    pub final_proposer: String,
+    pub final_depth: u32,
+    pub depth_changes: u32,
+    pub proposer_switches: u32,
+    pub events: Vec<AdaptiveSpeculativeEventPayload>,
+    pub plain_reason: Option<String>,
+    pub cost: Option<AdaptiveCostSummaryPayload>,
+}
+
+impl From<AdaptiveSpeculativeReport> for AdaptiveSpeculativeReportPayload {
+    fn from(value: AdaptiveSpeculativeReport) -> Self {
+        Self {
+            adaptive: value.adaptive,
+            candidates: value
+                .candidates
+                .into_iter()
+                .map(|proposer| proposer.label().to_string())
+                .collect(),
+            initial_proposer: value.initial_proposer.label().to_string(),
+            initial_depth: value.initial_depth,
+            final_proposer: value.final_proposer.label().to_string(),
+            final_depth: value.final_depth,
+            depth_changes: value.depth_changes,
+            proposer_switches: value.proposer_switches,
+            events: value
+                .events
+                .into_iter()
+                .map(AdaptiveSpeculativeEventPayload::from)
+                .collect(),
+            plain_reason: value.plain_reason,
+            cost: value.cost.map(AdaptiveCostSummaryPayload::from),
         }
     }
 }
@@ -3605,6 +3761,198 @@ mod tests {
         assert_eq!(pc.captured_bytes, 2048);
         assert!((pc.restore_ms - 0.25).abs() < 1e-6);
         assert!((pc.capture_ms - 0.5).abs() < 1e-6);
+    }
+
+    /// SW-7238 AC1/AC2: desktop IPC preserves explicit `off`, `{proposer, depth}` and `auto`,
+    /// and exposes `adaptive_speculative` (initial/final proposer & depth, mid-generation depth
+    /// changes, proposer switches, events, plain_reason, cost) and `speculative_monitor` on both
+    /// `GenerateResponse::decode` and pushed `engine://decode` status events.
+    #[test]
+    fn adaptive_speculative_decisions_and_explicit_controls_reach_desktop_status() {
+        use crate::core_llm::SpeculativeProposer;
+        use crate::test_support::adaptive_speculative_loader;
+
+        let engine = EngineHandle::spawn_with_loader(adaptive_speculative_loader);
+        let pushed: Arc<Mutex<Vec<DecodeStatusPayload>>> = Arc::default();
+        let observed = Arc::clone(&pushed);
+        engine.observe_generations(move |status| observed.lock().unwrap().push(status));
+
+        engine
+            .load_model(resident_request("/tmp/sw-7238-adaptive"))
+            .unwrap();
+
+        let make_req = |prompt: &str, speculative: Option<Speculative>| {
+            let mut req = hello_request();
+            req.messages[0].content = prompt.to_string();
+            req.speculative = speculative;
+            req
+        };
+
+        // 1. Explicit Off stays plain and non-adaptive.
+        let off = engine
+            .generate(make_req("hello", Some(Speculative::Off)), |_| {})
+            .unwrap();
+        let off_decode = off.decode.expect("decode report");
+        assert_eq!(off_decode.proposer, "none");
+        assert_eq!(off_decode.draft_tokens, None);
+        let off_adaptive = off_decode
+            .adaptive_speculative
+            .as_ref()
+            .expect("adaptive report");
+        assert!(!off_adaptive.adaptive);
+        assert_eq!(off_adaptive.initial_proposer, "none");
+        assert_eq!(off_adaptive.final_proposer, "none");
+        assert_eq!(off_adaptive.depth_changes, 0);
+        assert_eq!(off_adaptive.proposer_switches, 0);
+        assert_eq!(
+            off_adaptive.plain_reason.as_deref(),
+            Some("speculative: off")
+        );
+
+        // 2. Explicit {proposer, depth} preserves exact proposer and depth without adapting.
+        let explicit = engine
+            .generate(
+                make_req(
+                    "hello",
+                    Some(Speculative::proposer(SpeculativeProposer::Mtp, 5)),
+                ),
+                |_| {},
+            )
+            .unwrap();
+        let explicit_decode = explicit.decode.expect("decode report");
+        assert_eq!(explicit_decode.proposer, "mtp");
+        assert_eq!(explicit_decode.draft_tokens, Some(5));
+        let explicit_adaptive = explicit_decode
+            .adaptive_speculative
+            .as_ref()
+            .expect("adaptive report");
+        assert!(!explicit_adaptive.adaptive);
+        assert_eq!(explicit_adaptive.initial_proposer, "mtp");
+        assert_eq!(explicit_adaptive.initial_depth, 5);
+        assert_eq!(explicit_adaptive.final_proposer, "mtp");
+        assert_eq!(explicit_adaptive.final_depth, 5);
+        assert_eq!(explicit_adaptive.depth_changes, 0);
+        assert_eq!(explicit_adaptive.proposer_switches, 0);
+        assert!(explicit_adaptive.plain_reason.is_none());
+
+        // 3. Explicit unadvertised proposer never silently enables; falls back to plain with reason.
+        let unsupported = engine
+            .generate(
+                make_req(
+                    "hello",
+                    Some(Speculative::proposer(SpeculativeProposer::DraftModel, 3)),
+                ),
+                |_| {},
+            )
+            .unwrap();
+        let unsupported_decode = unsupported.decode.expect("decode report");
+        assert_eq!(unsupported_decode.proposer, "none");
+        assert!(unsupported_decode
+            .fallbacks
+            .iter()
+            .any(|f| f.contains("draft_model")));
+        let unsupported_adaptive = unsupported_decode
+            .adaptive_speculative
+            .as_ref()
+            .expect("adaptive report");
+        assert!(!unsupported_adaptive.adaptive);
+        assert!(unsupported_adaptive
+            .plain_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("draft_model")));
+
+        // 4. Auto with mid-generation depth increase + proposer switch + cost + monitor.
+        let switched = engine
+            .generate(make_req("adaptive-switch", Some(Speculative::Auto)), |_| {})
+            .unwrap();
+        let switched_decode = switched.decode.expect("decode report");
+        let switched_adaptive = switched_decode
+            .adaptive_speculative
+            .as_ref()
+            .expect("adaptive report");
+        assert!(switched_adaptive.adaptive);
+        assert_eq!(
+            switched_adaptive.candidates,
+            vec!["mtp", "prompt_lookup", "none"]
+        );
+        assert_eq!(switched_adaptive.initial_proposer, "mtp");
+        assert_eq!(switched_adaptive.initial_depth, 3);
+        assert_eq!(switched_adaptive.final_proposer, "prompt_lookup");
+        assert_eq!(switched_adaptive.final_depth, 4);
+        assert_eq!(switched_adaptive.depth_changes, 1);
+        assert_eq!(switched_adaptive.proposer_switches, 1);
+        assert_eq!(switched_adaptive.events.len(), 3);
+        assert_eq!(switched_adaptive.events[1].kind, "depth_increased");
+        assert_eq!(switched_adaptive.events[2].kind, "proposer_switched");
+        let cost = switched_adaptive.cost.as_ref().expect("cost summary");
+        assert!((cost.total_ms - 64.0).abs() < 1e-6);
+        assert!((cost.proposal_ms - 4.0).abs() < 1e-6);
+        assert!((cost.verify_ms - 52.0).abs() < 1e-6);
+        assert!((cost.rollback_ms - 2.0).abs() < 1e-6);
+        assert!((cost.sync_ms - 6.0).abs() < 1e-6);
+        assert_eq!(cost.host_syncs, 10);
+        assert_eq!(cost.committed_tokens, 34);
+        let monitor = switched_decode
+            .speculative_monitor
+            .as_ref()
+            .expect("monitor decision");
+        assert_eq!(monitor.basis, "measured");
+        assert!(!monitor.demoted);
+        assert_eq!(monitor.plain_step_ms, Some(4.0));
+        assert_eq!(monitor.speculative_step_ms, Some(8.0));
+        assert!((monitor.measured_gain.unwrap() - 2.0).abs() < 1e-6);
+        assert!((monitor.observed_mean_accepted - 2.4).abs() < 1e-6);
+
+        // 5. Auto fallback to plain carries demotion offset, plain_reason, and monitor decision.
+        let fallback = engine
+            .generate(
+                make_req("adaptive-fallback", Some(Speculative::Auto)),
+                |_| {},
+            )
+            .unwrap();
+        let fallback_decode = fallback.decode.expect("decode report");
+        assert_eq!(fallback_decode.speculative_demoted_at, Some(24));
+        let fb_monitor = fallback_decode
+            .speculative_monitor
+            .as_ref()
+            .expect("monitor");
+        assert!(fb_monitor.demoted);
+        assert!((fb_monitor.measured_gain.unwrap() - 0.72).abs() < 1e-6);
+        let fb_adaptive = fallback_decode
+            .adaptive_speculative
+            .as_ref()
+            .expect("adaptive");
+        assert_eq!(fb_adaptive.final_proposer, "none");
+        assert_eq!(fb_adaptive.final_depth, 0);
+        assert_eq!(
+            fb_adaptive.plain_reason.as_deref(),
+            Some("measured gain 0.72 below break-even")
+        );
+
+        // 6. Auto stayed plain names the reason clearly.
+        let plain = engine
+            .generate(make_req("adaptive-plain", Some(Speculative::Auto)), |_| {})
+            .unwrap();
+        let plain_decode = plain.decode.expect("decode report");
+        assert_eq!(plain_decode.proposer, "none");
+        let plain_adaptive = plain_decode
+            .adaptive_speculative
+            .as_ref()
+            .expect("adaptive");
+        assert!(plain_adaptive.adaptive);
+        assert!(plain_adaptive
+            .plain_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("auto found no proposer")));
+        // Pushed status matches the latest decode report verbatim.
+        assert_eq!(
+            pushed
+                .lock()
+                .unwrap()
+                .last()
+                .and_then(|s| s.last_decode.as_ref()),
+            Some(&plain_decode)
+        );
     }
 }
 

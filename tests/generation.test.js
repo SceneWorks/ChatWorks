@@ -116,6 +116,36 @@ test("sc-24445: the control offers the inherited default, off, auto and only the
   assert.equal(generationParams({ speculative: null }).speculativeMode, "");
 });
 
+test("SW-7238 AC1: Auto label reflects adaptive multi-proposer selection while explicit controls stay authoritative", () => {
+  const autoLabel = (options) => options.find(([value]) => value === "auto")?.[1];
+  assert.equal(autoLabel(speculativeOptions(capabilities)), "Auto (adaptive: MTP head, Prompt lookup)");
+  const withDrafts = {
+    ...capabilities,
+    speculative: [
+      ...capabilities.speculative,
+      { proposer: "draft_model", max_depth: 7, recommended_depth: 4 },
+      { proposer: "block_draft", max_depth: 15, recommended_depth: 4 },
+    ],
+  };
+  assert.equal(
+    autoLabel(speculativeOptions(withDrafts)),
+    "Auto (adaptive: MTP head, Prompt lookup, Draft model, Block draft)",
+  );
+  assert.equal(autoLabel(speculativeOptions({})), "Auto (adaptive)");
+  assert.equal(autoLabel(speculativeOptions(null, "", true, "auto")), "Auto (adaptive)");
+  // Explicit Off, proposer, and depth controls remain preserved verbatim.
+  assert.equal(request({ speculativeMode: "off" }, withDrafts).speculative, "off");
+  assert.deepEqual(
+    request({ speculativeMode: "block_draft", speculativeDepth: "6" }, withDrafts).speculative,
+    { proposer: "block_draft", depth: 6 },
+  );
+  assert.deepEqual(
+    request({ speculativeMode: "draft_model", speculativeDepth: "3" }, withDrafts).speculative,
+    { proposer: "draft_model", depth: 3 },
+  );
+  assert.equal(request({ speculativeMode: "auto" }, withDrafts).speculative, "auto");
+});
+
 test("off and auto reach any model; effort and preservation stay capability-gated", () => {
   const selected = { reasoningEffort: "xhigh", preserveThinking: "true", speculativeMode: "auto" };
   const unsupported = request(selected, { supports_thinking: true });

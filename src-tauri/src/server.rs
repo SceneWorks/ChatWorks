@@ -3580,4 +3580,172 @@ mod tests {
         );
         server.stop().unwrap();
     }
+
+    /// SW-7238 AC1/AC2: `/v1/chat/completions` (non-streaming and streaming SSE) preserves
+    /// explicit `off`, `{proposer, depth}`, and `auto` controls and emits `chatworks_decode`
+    /// carrying `adaptive_speculative` (initial/final proposer & depth, transitions, cost,
+    /// `plain_reason`) and `speculative_monitor`.
+    #[test]
+    fn openai_chat_completions_preserves_speculative_controls_and_reports_adaptive_decisions() {
+        use crate::test_support::adaptive_speculative_loader;
+
+        let engine = EngineHandle::spawn_with_loader(adaptive_speculative_loader);
+        engine
+            .load_model(crate::engine::LoadModelRequest {
+                source: "/tmp/sw-7238-server-adaptive".to_string(),
+                display_name: Some("fake-adaptive-speculative".to_string()),
+                quantize: None,
+                projector_source: None,
+                cuda_graphs: None,
+                draft_source: None,
+                prefix_cache_bytes: None,
+                mtp_head_source: None,
+                draft_quantize: None,
+            })
+            .unwrap();
+
+        let server = OpenAiServerHandle::new();
+        let status = server
+            .start(
+                OpenAiServerConfig {
+                    host: "127.0.0.1".to_string(),
+                    port: 0,
+                    sampling_defaults: SamplingDefaults {
+                        system_prompt: String::new(),
+                        max_tokens: 16,
+                        speculative: Some(Speculative::Auto),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                engine,
+            )
+            .unwrap();
+        let addr = status.bound_addr.unwrap();
+
+        let post_json = |payload: Value| -> Value {
+            let raw = http_post_json(&addr, "/v1/chat/completions", payload, None);
+            assert!(raw.starts_with("HTTP/1.1 200 OK"), "{raw}");
+            let (_, body) = raw
+                .split_once("\r\n\r\n")
+                .unwrap_or_else(|| panic!("missing HTTP body separator: {raw}"));
+            serde_json::from_str(body).unwrap_or_else(|e| panic!("invalid JSON ({e}): {body}"))
+        };
+
+        // 1. Explicit `off` overrides saved `auto`.
+        let off = post_json(json!({
+            "model": "fake-adaptive-speculative",
+            "speculative": "off",
+            "messages": [{"role": "user", "content": "adaptive-switch"}]
+        }));
+        assert_eq!(off["chatworks_decode"]["proposer"], "none");
+        assert_eq!(
+            off["chatworks_decode"]["adaptive_speculative"]["adaptive"],
+            false
+        );
+        assert_eq!(
+            off["chatworks_decode"]["adaptive_speculative"]["plain_reason"],
+            "speculative: off"
+        );
+
+        // 2. Explicit `{proposer, depth}` overrides saved `auto` and stays non-adaptive.
+        let explicit = post_json(json!({
+            "model": "fake-adaptive-speculative",
+            "speculative": {"proposer": "prompt_lookup", "depth": 5},
+            "messages": [{"role": "user", "content": "adaptive-switch"}]
+        }));
+        assert_eq!(explicit["chatworks_decode"]["proposer"], "prompt_lookup");
+        assert_eq!(explicit["chatworks_decode"]["draft_tokens"], 5);
+        assert_eq!(
+            explicit["chatworks_decode"]["adaptive_speculative"]["adaptive"],
+            false
+        );
+        assert_eq!(
+            explicit["chatworks_decode"]["adaptive_speculative"]["initial_depth"],
+            5
+        );
+        assert_eq!(
+            explicit["chatworks_decode"]["adaptive_speculative"]["final_depth"],
+            5
+        );
+        assert_eq!(
+            explicit["chatworks_decode"]["adaptive_speculative"]["depth_changes"],
+            0
+        );
+
+        // 3. Explicit `auto` (non-streaming) exposes mid-generation depth change, proposer switch,
+        // events, cost, and monitor decision.
+        let switched = post_json(json!({
+            "model": "fake-adaptive-speculative",
+            "speculative": "auto",
+            "messages": [{"role": "user", "content": "adaptive-switch"}]
+        }));
+        let adaptive = &switched["chatworks_decode"]["adaptive_speculative"];
+        assert_eq!(adaptive["adaptive"], true);
+        assert_eq!(adaptive["initial_proposer"], "mtp");
+        assert_eq!(adaptive["initial_depth"], 3);
+        assert_eq!(adaptive["final_proposer"], "prompt_lookup");
+        assert_eq!(adaptive["final_depth"], 4);
+        assert_eq!(adaptive["depth_changes"], 1);
+        assert_eq!(adaptive["proposer_switches"], 1);
+        assert_eq!(adaptive["events"][1]["kind"], "depth_increased");
+        assert_eq!(adaptive["events"][2]["kind"], "proposer_switched");
+        assert_eq!(adaptive["cost"]["total_ms"], 64.0);
+        assert_eq!(
+            switched["chatworks_decode"]["speculative_monitor"]["basis"],
+            "measured"
+        );
+        assert_eq!(
+            switched["chatworks_decode"]["speculative_monitor"]["demoted"],
+            false
+        );
+
+        // 4. Streaming SSE terminal chunk carries `adaptive_speculative` + `speculative_monitor`
+        // for Auto fallback to plain.
+        let sse = http_post_json(
+            &addr,
+            "/v1/chat/completions",
+            json!({
+                "model": "fake-adaptive-speculative",
+                "stream": true,
+                "speculative": "auto",
+                "messages": [{"role": "user", "content": "adaptive-fallback"}]
+            }),
+            None,
+        );
+        let last_data = sse
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .rfind(|data| *data != "[DONE]")
+            .expect("terminal SSE JSON");
+        let chunk: Value = serde_json::from_str(last_data).unwrap();
+        assert_eq!(chunk["chatworks_decode"]["speculative_demoted_at"], 24);
+        assert_eq!(
+            chunk["chatworks_decode"]["speculative_monitor"]["demoted"],
+            true
+        );
+        assert_eq!(
+            chunk["chatworks_decode"]["adaptive_speculative"]["final_proposer"],
+            "none"
+        );
+        assert_eq!(
+            chunk["chatworks_decode"]["adaptive_speculative"]["plain_reason"],
+            "measured gain 0.72 below break-even"
+        );
+
+        // 5. Auto stayed plain reports reason on `chatworks_decode`.
+        let plain = post_json(json!({
+            "model": "fake-adaptive-speculative",
+            "speculative": "auto",
+            "messages": [{"role": "user", "content": "adaptive-plain"}]
+        }));
+        assert_eq!(plain["chatworks_decode"]["proposer"], "none");
+        assert!(
+            plain["chatworks_decode"]["adaptive_speculative"]["plain_reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("auto found no proposer"))
+        );
+
+        server.stop().unwrap();
+    }
 }
