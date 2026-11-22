@@ -21,4 +21,6 @@ all = "warn"
 # Cargo.lock resolves one inference commit (scripts/check-git-deps.sh).
 [patch."https://github.com/huggingface/candle"]
 candle-core = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.11.1" }
+candle-nn = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.11.1" }
 candle-kernels = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.11.1" }
+candle-metal-kernels = { git = "https://github.com/SceneWorks/inference", tag = "runtime-2026.11.1" }

@@ -452,7 +452,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.10.2"
-source = "git+https://github.com/huggingface/candle?rev=1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d#1e6aa85e867eb007cba1b8bae517a10d1aaf0c0d"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
 dependencies = [
  "candle-core",
  "half",
@@ -6658,3 +6658,8 @@ checksum = "27bc9d5b815bc103f142aa054f561d9187d191692ec7c2d1e2b4737f8dbd7296"
 dependencies = [
  "zune-core",
 ]
+
+[[patch.unused]]
+name = "candle-metal-kernels"
+version = "0.10.2"
+source = "git+https://github.com/SceneWorks/inference?tag=runtime-2026.11.1#3681ddc42d6e82cfcdcb5253e89226e25a73cc08"
